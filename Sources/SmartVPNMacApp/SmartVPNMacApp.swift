@@ -183,18 +183,24 @@ struct MenuBarIcon: View {
 
 struct ActiveMenuBarShieldIcon: View {
     var body: some View {
-        ZStack {
+        ZStack(alignment: .center) {
             Image(systemName: "shield.fill")
                 .resizable()
                 .scaledToFit()
                 .foregroundStyle(.primary)
 
             Text("A")
-                .font(.system(size: 10, weight: .heavy, design: .rounded))
-                .offset(y: -0.5)
+                .font(.system(size: 8.5, weight: .black, design: .rounded))
+                .frame(width: 10, height: 10, alignment: .center)
+                .offset(y: -1.1)
                 .blendMode(.destinationOut)
         }
         .compositingGroup()
+        .mask(
+            Image(systemName: "shield.fill")
+                .resizable()
+                .scaledToFit()
+        )
         .accessibilityLabel("Real Ai VPN connected")
     }
 }
