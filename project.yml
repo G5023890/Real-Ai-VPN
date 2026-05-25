@@ -1,0 +1,106 @@
+name: RealAiVPN
+options:
+  createIntermediateGroups: true
+packages:
+  WireGuardKit:
+    path: third_party/amneziawg-apple
+configs:
+  Debug: debug
+  Release: release
+targets:
+  AmneziaConfig:
+    type: library.static
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources/AmneziaConfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.AmneziaConfig
+        PRODUCT_NAME: AmneziaConfig
+        SWIFT_VERSION: 5.0
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 9FP39GTDT5
+        MACOSX_DEPLOYMENT_TARGET: 14.0
+  SmartServerSelection:
+    type: library.static
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources/SmartServerSelection
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.SmartServerSelection
+        PRODUCT_NAME: SmartServerSelection
+        SWIFT_VERSION: 5.0
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 9FP39GTDT5
+        MACOSX_DEPLOYMENT_TARGET: 14.0
+  RealVPNCore:
+    type: library.static
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources/RealVPNCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.RealVPNCore
+        PRODUCT_NAME: RealVPNCore
+        SWIFT_VERSION: 5.0
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 9FP39GTDT5
+        MACOSX_DEPLOYMENT_TARGET: 14.0
+  RealAiVPNPacketTunnel:
+    type: app-extension
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources/PacketTunnelProvider
+      - path: Resources/Routing
+        buildPhase: resources
+    dependencies:
+      - target: AmneziaConfig
+      - target: RealVPNCore
+      - package: WireGuardKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.PacketTunnel
+        PRODUCT_NAME: RealAiVPNPacketTunnel
+        INFOPLIST_FILE: Config/PacketTunnel-Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: Config/PacketTunnel.entitlements
+        SWIFT_VERSION: 5.0
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 9FP39GTDT5
+        MACOSX_DEPLOYMENT_TARGET: 14.0
+        MARKETING_VERSION: 0.75
+        CURRENT_PROJECT_VERSION: 75
+  RealAiVPN:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources/SmartVPNMacApp
+      - path: Resources/Icons/RealAiVPN.icns
+        buildPhase: resources
+      - path: Resources/MenuBarIcons
+        buildPhase: resources
+    dependencies:
+      - target: AmneziaConfig
+      - target: SmartServerSelection
+      - target: RealVPNCore
+      - target: RealAiVPNPacketTunnel
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN
+        PRODUCT_NAME: Real Ai VPN
+        INFOPLIST_FILE: Config/RealAiVPN-Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: Config/RealAiVPN.entitlements
+        SWIFT_VERSION: 5.0
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 9FP39GTDT5
+        MACOSX_DEPLOYMENT_TARGET: 14.0
+        MARKETING_VERSION: 0.75
+        CURRENT_PROJECT_VERSION: 75
+        ENABLE_HARDENED_RUNTIME: YES
