@@ -6,16 +6,70 @@ import SwiftUI
 import SmartServerSelection
 import UniformTypeIdentifiers
 
+private enum AppVisibilityMode: String, CaseIterable, Identifiable {
+    case menuBarOnly
+    case dockOnly
+    case dockAndMenuBar
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .menuBarOnly:
+            return "Menu Bar only"
+        case .dockOnly:
+            return "Dock only"
+        case .dockAndMenuBar:
+            return "Dock and Menu Bar"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .menuBarOnly:
+            return "Hide the Dock icon and keep quick controls in the menu bar."
+        case .dockOnly:
+            return "Show the app in Dock without the menu bar controller."
+        case .dockAndMenuBar:
+            return "Show the main app in Dock and keep the menu bar controller."
+        }
+    }
+
+    var showsMenuBar: Bool {
+        self != .dockOnly
+    }
+
+    var activationPolicy: NSApplication.ActivationPolicy {
+        switch self {
+        case .menuBarOnly:
+            return .accessory
+        case .dockOnly, .dockAndMenuBar:
+            return .regular
+        }
+    }
+}
+
 @main
 struct SmartVPNMacApp: App {
     @Environment(\.openWindow) private var openWindow
+    @AppStorage("appVisibilityMode") private var appVisibilityModeRaw = AppVisibilityMode.dockAndMenuBar.rawValue
     @StateObject private var model = DashboardModel()
     @State private var showSettings = false
+
+    init() {
+        Self.applyActivationPolicy(for: Self.storedVisibilityMode())
+    }
 
     var body: some Scene {
         WindowGroup(id: "main") {
             DashboardView(model: model, showSettings: $showSettings)
                 .frame(minWidth: 1080, minHeight: 720)
+                .onAppear {
+                    applyCurrentActivationPolicy()
+                }
+                .onChange(of: appVisibilityModeRaw) { _, _ in
+                    applyCurrentActivationPolicy()
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
@@ -29,52 +83,91 @@ struct SmartVPNMacApp: App {
             }
         }
 
-        MenuBarExtra {
-            Button("Open") {
-                openMainWindow()
-            }
+        menuBarScene
+    }
 
-            Divider()
-
-            Button("Connect") {
-                model.connectVPN()
-            }
-            .disabled(model.vpnStatus.isConnectedOrConnecting)
-
-            Button("Disconnect") {
-                model.disconnectVPN()
-            }
-            .disabled(!model.vpnStatus.isConnectedOrConnecting)
-
-            Divider()
-
-            Button("Settings") {
-                openMainWindow()
-                showSettings = true
-            }
-
-            Divider()
-
-            Button("Quit") {
-                model.disconnectVPN()
-                NSApplication.shared.terminate(nil)
-            }
-            .keyboardShortcut("q", modifiers: .command)
+    @SceneBuilder
+    private var menuBarScene: some Scene {
+        MenuBarExtra(isInserted: menuBarInserted) {
+            menuBarContent
         } label: {
-            MenuBarIcon()
+            MenuBarIcon(isConnected: model.vpnStatus == .connected)
         }
         .menuBarExtraStyle(.menu)
+    }
+
+    private var menuBarInserted: Binding<Bool> {
+        Binding(
+            get: { appVisibilityMode.showsMenuBar },
+            set: { _ in }
+        )
+    }
+
+    @ViewBuilder
+    private var menuBarContent: some View {
+        Button("Open") {
+            openMainWindow()
+        }
+
+        Divider()
+
+        Button("Connect") {
+            model.connectVPN()
+        }
+        .disabled(model.vpnStatus.isConnectedOrConnecting)
+
+        Button("Disconnect") {
+            model.disconnectVPN()
+        }
+        .disabled(!model.vpnStatus.isConnectedOrConnecting)
+
+        Divider()
+
+        Button("Settings") {
+            openMainWindow()
+            showSettings = true
+        }
+
+        Divider()
+
+        Button("Quit") {
+            model.disconnectVPN()
+            NSApplication.shared.terminate(nil)
+        }
+        .keyboardShortcut("q", modifiers: .command)
     }
 
     private func openMainWindow() {
         openWindow(id: "main")
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
+
+    private var appVisibilityMode: AppVisibilityMode {
+        AppVisibilityMode(rawValue: appVisibilityModeRaw) ?? .dockAndMenuBar
+    }
+
+    private func applyCurrentActivationPolicy() {
+        Self.applyActivationPolicy(for: appVisibilityMode)
+    }
+
+    private static func storedVisibilityMode() -> AppVisibilityMode {
+        let rawValue = UserDefaults.standard.string(forKey: "appVisibilityMode")
+        return rawValue.flatMap(AppVisibilityMode.init(rawValue:)) ?? .dockAndMenuBar
+    }
+
+    private static func applyActivationPolicy(for mode: AppVisibilityMode) {
+        NSApplication.shared.setActivationPolicy(mode.activationPolicy)
+    }
 }
 
 struct MenuBarIcon: View {
+    var isConnected: Bool
+
     var body: some View {
-        if let image = NSImage(named: "real-ai-vpn-menubar-template") {
+        if isConnected {
+            ActiveMenuBarShieldIcon()
+                .frame(width: 18, height: 18)
+        } else if let image = NSImage(named: "real-ai-vpn-menubar-template") {
             Image(nsImage: configuredTemplateImage(image))
         } else {
             Image(systemName: "lock.shield.fill")
@@ -85,6 +178,24 @@ struct MenuBarIcon: View {
         image.isTemplate = true
         image.size = NSSize(width: 18, height: 18)
         return image
+    }
+}
+
+struct ActiveMenuBarShieldIcon: View {
+    var body: some View {
+        ZStack {
+            Image(systemName: "shield.fill")
+                .resizable()
+                .scaledToFit()
+                .foregroundStyle(.primary)
+
+            Text("A")
+                .font(.system(size: 10, weight: .heavy, design: .rounded))
+                .offset(y: -0.5)
+                .blendMode(.destinationOut)
+        }
+        .compositingGroup()
+        .accessibilityLabel("Real Ai VPN connected")
     }
 }
 
@@ -950,6 +1061,7 @@ struct Panel<Content: View>: View {
 struct SettingsView: View {
     @ObservedObject var model: DashboardModel
     @Environment(\.dismiss) private var dismiss
+    @AppStorage("appVisibilityMode") private var appVisibilityModeRaw = AppVisibilityMode.dockAndMenuBar.rawValue
     @State private var amneziaKey = ""
     @State private var message: String?
     @State private var selectedTab: SettingsTab = .connection
@@ -992,6 +1104,7 @@ struct SettingsView: View {
 
                 Picker("", selection: $selectedTab) {
                     Text("Connection").tag(SettingsTab.connection)
+                    Text("App").tag(SettingsTab.app)
                     Text("Regions").tag(SettingsTab.regions)
                     Text("Signing").tag(SettingsTab.signing)
                 }
@@ -1003,6 +1116,8 @@ struct SettingsView: View {
                         switch selectedTab {
                         case .connection:
                             connectionSettings
+                        case .app:
+                            appSettings
                         case .regions:
                             regionSettings
                         case .signing:
@@ -1149,6 +1264,46 @@ struct SettingsView: View {
         }
     }
 
+    private var appSettings: some View {
+        SettingsCard(title: "App Display") {
+            VStack(alignment: .leading, spacing: 14) {
+                Picker("Show Real Ai VPN", selection: Binding(
+                    get: { appVisibilityMode },
+                    set: { appVisibilityModeRaw = $0.rawValue }
+                )) {
+                    ForEach(AppVisibilityMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+
+                Text(appVisibilityMode.detail)
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.62))
+
+                Divider()
+                    .overlay(.white.opacity(0.16))
+
+                HStack(alignment: .top, spacing: 10) {
+                    ActiveMenuBarShieldIcon()
+                        .frame(width: 20, height: 20)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Connected menu bar icon")
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(.white.opacity(0.82))
+                        Text("When VPN is connected, the shield becomes filled and the A is cut out as transparent space.")
+                            .font(.footnote)
+                            .foregroundStyle(.white.opacity(0.58))
+                    }
+                }
+            }
+        }
+    }
+
+    private var appVisibilityMode: AppVisibilityMode {
+        AppVisibilityMode(rawValue: appVisibilityModeRaw) ?? .dockAndMenuBar
+    }
+
     private func profileRowTitle(_ profile: StoredAmneziaConfigProfile) -> String {
         var parts = [profile.displayName]
         if let regionCode = profile.regionCode {
@@ -1204,6 +1359,7 @@ struct SettingsView: View {
 
 private enum SettingsTab: Hashable {
     case connection
+    case app
     case regions
     case signing
 }
