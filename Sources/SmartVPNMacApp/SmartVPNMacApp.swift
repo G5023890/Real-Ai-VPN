@@ -164,9 +164,8 @@ struct MenuBarIcon: View {
     var isConnected: Bool
 
     var body: some View {
-        if isConnected {
-            ActiveMenuBarShieldIcon()
-                .frame(width: 18, height: 18)
+        if isConnected, let image = NSImage(named: "real-ai-vpn-menubar-active-template") {
+            Image(nsImage: configuredTemplateImage(image))
         } else if let image = NSImage(named: "real-ai-vpn-menubar-template") {
             Image(nsImage: configuredTemplateImage(image))
         } else {
@@ -183,25 +182,17 @@ struct MenuBarIcon: View {
 
 struct ActiveMenuBarShieldIcon: View {
     var body: some View {
-        ZStack(alignment: .center) {
+        if let image = NSImage(named: "real-ai-vpn-menubar-active-template") {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFit()
+                .accessibilityLabel("Real Ai VPN connected")
+        } else {
             Image(systemName: "shield.fill")
                 .resizable()
                 .scaledToFit()
-                .foregroundStyle(.primary)
-
-            Text("A")
-                .font(.system(size: 8.5, weight: .black, design: .rounded))
-                .frame(width: 10, height: 10, alignment: .center)
-                .offset(y: -1.1)
-                .blendMode(.destinationOut)
+                .accessibilityLabel("Real Ai VPN connected")
         }
-        .compositingGroup()
-        .mask(
-            Image(systemName: "shield.fill")
-                .resizable()
-                .scaledToFit()
-        )
-        .accessibilityLabel("Real Ai VPN connected")
     }
 }
 
