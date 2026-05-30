@@ -172,6 +172,67 @@ final class SmartServerSelectionTests: XCTestCase {
         XCTAssertEqual(assessment.directPath.state, .down)
         XCTAssertEqual(assessment.recommendedAction, .askUser(reason: "provider-path-down"))
     }
+
+    func testProbeReliabilityRanksStableTargetsFirst() {
+        let analyzer = ProbeReliabilityAnalyzer(minimumSamplesForFiltering: 4)
+        let stable = (0..<6).map {
+            ConnectivityProbeResult.probe(
+                targetID: "foreign-apple-success",
+                targetKind: .vpnProtectedEndpoint,
+                serverID: "ee-1",
+                method: .httpHead,
+                succeeded: true,
+                latency: 90 + Double($0)
+            )
+        }
+        let noisy = (0..<6).map {
+            ConnectivityProbeResult.probe(
+                targetID: "foreign-gstatic-204",
+                targetKind: .vpnProtectedEndpoint,
+                serverID: "ee-1",
+                method: .httpHead,
+                succeeded: $0 == 0,
+                latency: 500
+            )
+        }
+
+        let summaries = analyzer.summaries(from: stable + noisy, serverID: "ee-1", targetKind: .vpnProtectedEndpoint)
+
+        XCTAssertEqual(summaries.first?.targetID, "foreign-apple-success")
+        XCTAssertGreaterThan(summaries.first?.reliabilityScore ?? 0, summaries.last?.reliabilityScore ?? 0)
+    }
+
+    func testMonitorIgnoresHistoricallyUnreliableFailedProbe() {
+        let monitor = PreventiveVPNHealthMonitor(
+            reliabilityAnalyzer: ProbeReliabilityAnalyzer(minimumSamplesForFiltering: 4, minimumReliabilityScore: 0.45)
+        )
+        let unreliableHistory = (0..<6).map { _ in
+            ConnectivityProbeResult.probe(
+                targetID: "foreign-gstatic-204",
+                targetKind: .vpnProtectedEndpoint,
+                serverID: "ee-1",
+                method: .httpHead,
+                succeeded: false
+            )
+        }
+        let current = ConnectivityProbeResult.probe(
+            targetID: "foreign-gstatic-204",
+            targetKind: .vpnProtectedEndpoint,
+            serverID: "ee-1",
+            method: .httpHead,
+            succeeded: false
+        )
+
+        let assessment = monitor.assess(
+            probes: .healthyDirect + .healthyVPN(serverID: "ee-1") + [current],
+            activeServerID: "ee-1",
+            context: .ruInRussia,
+            servers: [.israelFast, .germanySlow],
+            probeHistory: unreliableHistory
+        )
+
+        XCTAssertEqual(assessment.vpnPath.state, .healthy)
+    }
 }
 
 private extension ServerSelectionContext {

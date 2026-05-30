@@ -1,10 +1,21 @@
 import AmneziaConfig
 import AppKit
 import Combine
+import Network
 import RealVPNCore
 import SwiftUI
 import SmartServerSelection
 import UniformTypeIdentifiers
+import UserNotifications
+
+private final class MacNotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .list, .sound]
+    }
+}
 
 private enum AppVisibilityMode: String, CaseIterable, Identifiable {
     case menuBarOnly
@@ -51,6 +62,7 @@ private enum AppVisibilityMode: String, CaseIterable, Identifiable {
 
 @main
 struct SmartVPNMacApp: App {
+    private static let notificationDelegate = MacNotificationDelegate()
     @Environment(\.openWindow) private var openWindow
     @AppStorage("appVisibilityMode") private var appVisibilityModeRaw = AppVisibilityMode.dockAndMenuBar.rawValue
     @StateObject private var model = DashboardModel()
@@ -58,10 +70,11 @@ struct SmartVPNMacApp: App {
 
     init() {
         Self.applyActivationPolicy(for: Self.storedVisibilityMode())
+        Self.configureNotifications()
     }
 
     var body: some Scene {
-        WindowGroup(id: "main") {
+        Window("Real Ai VPN", id: "main") {
             DashboardView(model: model, showSettings: $showSettings)
                 .frame(minWidth: 1080, minHeight: 720)
                 .onAppear {
@@ -158,6 +171,12 @@ struct SmartVPNMacApp: App {
     private static func applyActivationPolicy(for mode: AppVisibilityMode) {
         NSApplication.shared.setActivationPolicy(mode.activationPolicy)
     }
+
+    private static func configureNotifications() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = notificationDelegate
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
 }
 
 struct MenuBarIcon: View {
@@ -196,6 +215,160 @@ struct ActiveMenuBarShieldIcon: View {
     }
 }
 
+struct StoredProfileQualityHistory: Codable {
+    var samples: [ServerQualitySample]
+}
+
+struct StoredProbeReliabilityHistory: Codable {
+    var probes: [ConnectivityProbeResult]
+}
+
+struct LocalProfileQualityHistoryStore {
+    private let maxSamples = 240
+
+    func load() -> [ServerQualitySample] {
+        guard let data = try? Data(contentsOf: historyURL) else {
+            return []
+        }
+
+        return ((try? JSONDecoder().decode(StoredProfileQualityHistory.self, from: data))?.samples ?? [])
+            .suffix(maxSamples)
+    }
+
+    func save(_ samples: [ServerQualitySample]) {
+        let trimmed = Array(samples.suffix(maxSamples))
+        let payload = StoredProfileQualityHistory(samples: trimmed)
+        do {
+            try FileManager.default.createDirectory(
+                at: historyURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let data = try JSONEncoder().encode(payload)
+            try data.write(to: historyURL, options: [.atomic])
+        } catch {
+            NSLog("Real Ai VPN could not save quality history: \(error.localizedDescription)")
+        }
+    }
+
+    private var historyURL: URL {
+        let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return baseURL
+            .appendingPathComponent("Real Ai VPN", isDirectory: true)
+            .appendingPathComponent("profile-quality-history.json")
+    }
+}
+
+struct LocalProbeReliabilityHistoryStore {
+    private let maxSamples = 960
+
+    func load() -> [ConnectivityProbeResult] {
+        guard let data = try? Data(contentsOf: historyURL) else {
+            return []
+        }
+
+        return ((try? JSONDecoder().decode(StoredProbeReliabilityHistory.self, from: data))?.probes ?? [])
+            .suffix(maxSamples)
+    }
+
+    func save(_ probes: [ConnectivityProbeResult]) {
+        let trimmed = Array(probes.suffix(maxSamples))
+        let payload = StoredProbeReliabilityHistory(probes: trimmed)
+        do {
+            try FileManager.default.createDirectory(
+                at: historyURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let data = try JSONEncoder().encode(payload)
+            try data.write(to: historyURL, options: [.atomic])
+        } catch {
+            NSLog("Real Ai VPN could not save probe reliability history: \(error.localizedDescription)")
+        }
+    }
+
+    private var historyURL: URL {
+        let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return baseURL
+            .appendingPathComponent("Real Ai VPN", isDirectory: true)
+            .appendingPathComponent("probe-reliability-history.json")
+    }
+}
+
+struct ProfileEndpoint {
+    var host: String
+    var port: UInt16
+}
+
+private final class ProbeCompletionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didFinish = false
+
+    func runOnce(_ body: () -> Void) {
+        lock.lock()
+        guard !didFinish else {
+            lock.unlock()
+            return
+        }
+        didFinish = true
+        lock.unlock()
+        body()
+    }
+}
+
+enum ConnectivityProbeRunner {
+    static func tcpConnect(host: String, port: UInt16, timeout: TimeInterval = 4) async -> (succeeded: Bool, latency: Double?) {
+        await withCheckedContinuation { continuation in
+            let start = Date()
+            let connection = NWConnection(
+                host: NWEndpoint.Host(host),
+                port: NWEndpoint.Port(rawValue: port) ?? 443,
+                using: .tcp
+            )
+            let queue = DispatchQueue(label: "RealAiVPN.TCPProbe.\(host)")
+            let completionGate = ProbeCompletionGate()
+
+            @Sendable func finish(_ result: (Bool, Double?)) {
+                completionGate.runOnce {
+                    connection.cancel()
+                    continuation.resume(returning: result)
+                }
+            }
+
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    finish((true, Date().timeIntervalSince(start) * 1_000))
+                case .failed, .cancelled:
+                    finish((false, nil))
+                default:
+                    break
+                }
+            }
+            connection.start(queue: queue)
+            queue.asyncAfter(deadline: .now() + timeout) {
+                finish((false, nil))
+            }
+        }
+    }
+
+    static func httpHead(url: URL, timeout: TimeInterval = 5) async -> (succeeded: Bool, latency: Double?) {
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = timeout
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let start = Date()
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            return ((200..<400).contains(statusCode), Date().timeIntervalSince(start) * 1_000)
+        } catch {
+            return (false, nil)
+        }
+    }
+}
+
 @MainActor
 final class DashboardModel: ObservableObject {
     enum StoredConfigKind: String {
@@ -226,6 +399,14 @@ final class DashboardModel: ObservableObject {
     @Published private(set) var hasAmneziaPremiumKey = false
     @Published private(set) var storedConfigKind: StoredConfigKind = .none
     @Published private(set) var configProfiles: [StoredAmneziaConfigProfile] = []
+    @Published private(set) var monitorStatus = "Waiting for VPN connection"
+    @Published private(set) var lastProbeDate: Date?
+    @Published private(set) var routingExceptions = RoutingExceptionCollection()
+    @Published var automaticFailoverEnabled = UserDefaults.standard.object(forKey: "automaticFailoverEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(automaticFailoverEnabled, forKey: "automaticFailoverEnabled")
+        }
+    }
     @Published var activeConfigProfileID: String? {
         didSet {
             guard activeConfigProfileID != oldValue else {
@@ -246,8 +427,18 @@ final class DashboardModel: ObservableObject {
     private let vpnManager = RealVPNProfileManager()
     private let premiumKeyStore = AmneziaPremiumKeyStore(accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup)
     private let profileStore = AmneziaConfigProfileStore(accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup)
-    private lazy var monitor = PreventiveVPNHealthMonitor(selector: selector)
+    private let qualityHistoryStore = LocalProfileQualityHistoryStore()
+    private let probeReliabilityHistoryStore = LocalProbeReliabilityHistoryStore()
+    private let probeReliabilityAnalyzer = ProbeReliabilityAnalyzer()
+    private let routingExceptionStore = RoutingExceptionStore()
+    private lazy var monitor = PreventiveVPNHealthMonitor(selector: selector, reliabilityAnalyzer: probeReliabilityAnalyzer)
     private var cancellables: Set<AnyCancellable> = []
+    private var qualitySamples: [ServerQualitySample] = []
+    private var probeReliabilitySamples: [ConnectivityProbeResult] = []
+    private var liveProbeResults: [ConnectivityProbeResult] = []
+    private var monitoringTask: Task<Void, Never>?
+    private var lastAutomaticFailoverDate: Date?
+    private var suppressExpectedDisconnectNotification = false
 
     init() {
         let directReport = PathHealthReport(
@@ -275,12 +466,20 @@ final class DashboardModel: ObservableObject {
 
         seedHistory()
         migrateLegacySingleConfigIfNeeded()
+        routingExceptions = routingExceptionStore.load()
         bindVPNManagerState()
         refresh()
         refreshPremiumKeyState()
+        loadQualityHistory()
+        loadProbeReliabilityHistory()
+        startMonitoring()
         Task {
             await vpnManager.prepareProfile(configuration: vpnConfiguration)
         }
+    }
+
+    deinit {
+        monitoringTask?.cancel()
     }
 
     var activeConfigProfile: StoredAmneziaConfigProfile? {
@@ -303,6 +502,79 @@ final class DashboardModel: ObservableObject {
         return activeConfigProfile.displayName
     }
 
+    var activeRouteTitle: String {
+        if vpnStatus == .connected, let activeConfigProfile {
+            return "VPN \(activeConfigProfile.regionCode ?? activeConfigProfile.displayName)"
+        }
+
+        switch routeDecision.action {
+        case .directProviderDNS:
+            return "Direct Provider DNS"
+        case .vpn(_, let region):
+            return vpnStatus.isConnectedOrConnecting ? "VPN \(region.rawValue)" : "Planned VPN \(region.rawValue)"
+        case .ask:
+            return "Needs Attention"
+        }
+    }
+
+    var activeRouteSource: String {
+        if vpnStatus == .connected, let activeConfigProfile {
+            var parts = ["active profile", activeConfigProfile.displayName]
+            if let endpointHost = activeConfigProfile.endpointHost {
+                parts.append(endpointHost)
+            }
+            return parts.joined(separator: " · ")
+        }
+
+        return vpnStatus == .connected ? routeDecision.source : "\(routeDecision.source) · policy preview"
+    }
+
+    var routeConfidence: Double {
+        if let activeID = activeConfigProfile?.id,
+           let activeRank = rankedServers.first(where: { $0.server.id == activeID }) {
+            return activeRank.confidence
+        }
+
+        return routeDecision.rankedServers.first?.confidence ?? rankedServers.first?.confidence ?? 0
+    }
+
+    var routeConfidenceDetail: String {
+        guard let lastProbeDate else {
+            return "collecting"
+        }
+
+        let age = max(0, Int(Date().timeIntervalSince(lastProbeDate)))
+        let sampleCount = activeConfigProfile.map { profile in
+            qualitySamples.filter { $0.serverID == profile.id }.count
+        } ?? qualitySamples.count
+        return "\(sampleCount) samples · \(age)s ago"
+    }
+
+    var probeReliabilityDetail: String {
+        guard let activeID = activeConfigProfile?.id ?? (vpnStatus.isConnectedOrConnecting ? activeServerID : nil),
+              let best = probeReliabilityAnalyzer.bestSummary(
+                from: probeReliabilitySamples,
+                serverID: activeID,
+                targetKind: .vpnProtectedEndpoint
+              ) else {
+            return "Probe reliability is learning"
+        }
+
+        return "Best check \(best.targetID) · \(Int((best.reliabilityScore * 100).rounded()))% reliable"
+    }
+
+    var activeProfileDisplayName: String {
+        activeConfigProfile?.displayName ?? activeConfigSummary
+    }
+
+    func displayName(forServerID serverID: String) -> String {
+        if let profile = configProfiles.first(where: { $0.id == serverID }) {
+            return profile.displayName
+        }
+
+        return servers.first { $0.id == serverID }?.displayName ?? serverID
+    }
+
     var context: ServerSelectionContext {
         ServerSelectionContext(
             currentRegion: currentRegion,
@@ -310,11 +582,12 @@ final class DashboardModel: ObservableObject {
             networkKind: .wifi,
             providerASN: "AS12389",
             hourOfDay: Calendar.current.component(.hour, from: Date()),
-            previousServerID: activeServerID
+            previousServerID: activeConfigProfile?.id ?? activeServerID
         )
     }
 
     func refresh() {
+        let servers = effectiveServers
         routeDecision = selector.decideRoute(
             destinationRegion: selectedDestination,
             context: context,
@@ -322,25 +595,65 @@ final class DashboardModel: ObservableObject {
         )
         rankedServers = selector.rankedServers(context: context, servers: servers)
         healthAssessment = monitor.assess(
-            probes: probes(for: scenario),
-            activeServerID: activeServerID,
+            probes: liveProbeResults.isEmpty ? probes(for: scenario) : liveProbeResults,
+            activeServerID: activeConfigProfile?.id ?? activeServerID,
             context: context,
-            servers: servers
+            servers: servers,
+            probeHistory: probeReliabilitySamples
         )
     }
 
     func applyRecoveryAction() {
+        let wasConnected = vpnStatus.isConnectedOrConnecting
+
         switch healthAssessment.recommendedAction {
         case .switchServer(_, let to, _):
-            activeServerID = to
+            switchToProfileOrServer(id: to)
+            if wasConnected {
+                reconnectVPN()
+            }
         case .reconnect(let serverID, _), .adjustParameters(let serverID, _, _):
-            activeServerID = serverID
-        case .keepCurrent, .refreshDirectDNS, .askUser:
+            switchToProfileOrServer(id: serverID)
+            if wasConnected {
+                reconnectVPN()
+            }
+        case .refreshDirectDNS:
+            URLCache.shared.removeAllCachedResponses()
+            URLSession.shared.reset {}
+            monitorStatus = "DNS/session cache refreshed"
+        case .keepCurrent, .askUser:
             break
         }
 
         scenario = .healthy
         refresh()
+    }
+
+    func addRoutingException(value: String, mode: RoutingExceptionMode) {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            return
+        }
+
+        routingExceptions.rules.append(RoutingExceptionRule(value: normalized, mode: mode))
+        routingExceptionStore.save(routingExceptions)
+        monitorStatus = "Routing exceptions will apply on reconnect"
+    }
+
+    func deleteRoutingException(id: String) {
+        routingExceptions.rules.removeAll { $0.id == id }
+        routingExceptionStore.save(routingExceptions)
+        monitorStatus = "Routing exceptions will apply on reconnect"
+    }
+
+    func setRoutingExceptionEnabled(id: String, isEnabled: Bool) {
+        guard let index = routingExceptions.rules.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+
+        routingExceptions.rules[index].isEnabled = isEnabled
+        routingExceptionStore.save(routingExceptions)
+        monitorStatus = "Routing exceptions will apply on reconnect"
     }
 
     func connectVPN() {
@@ -366,7 +679,11 @@ final class DashboardModel: ObservableObject {
                 return
             }
 
-            await vpnManager.connect(configuration: vpnConfiguration, transientAmneziaKey: amneziaKey)
+            await vpnManager.connect(
+                configuration: vpnConfiguration,
+                transientAmneziaKey: nil,
+                routingExceptions: routingExceptions
+            )
         }
     }
 
@@ -375,8 +692,24 @@ final class DashboardModel: ObservableObject {
             return
         }
 
+        suppressExpectedDisconnectNotification = true
         vpnStatus = .disconnecting
         vpnManager.disconnect()
+    }
+
+    func reconnectVPN() {
+        guard vpnStatus.isConnectedOrConnecting else {
+            connectVPN()
+            return
+        }
+
+        vpnStatus = .disconnecting
+        suppressExpectedDisconnectNotification = true
+        vpnManager.disconnect()
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            connectVPN()
+        }
     }
 
     func toggleVPN() {
@@ -461,7 +794,7 @@ final class DashboardModel: ObservableObject {
         vpnManager.$status
             .receive(on: RunLoop.main)
             .sink { [weak self] status in
-                self?.vpnStatus = status
+                self?.handleVPNStatusChange(status)
             }
             .store(in: &cancellables)
 
@@ -471,6 +804,24 @@ final class DashboardModel: ObservableObject {
                 self?.vpnErrorMessage = self?.userFacingVPNError(message)
             }
             .store(in: &cancellables)
+    }
+
+    private func handleVPNStatusChange(_ status: VPNConnectionStatus) {
+        let previousStatus = vpnStatus
+        vpnStatus = status
+
+        guard status == .disconnected else {
+            return
+        }
+
+        if suppressExpectedDisconnectNotification {
+            suppressExpectedDisconnectNotification = false
+            return
+        }
+
+        if previousStatus == .connected || previousStatus == .reasserting {
+            notifyTunnelDropped(profile: activeProfileDisplayName)
+        }
     }
 
     private func userFacingVPNError(_ message: String?) -> String? {
@@ -523,6 +874,35 @@ final class DashboardModel: ObservableObject {
         )
     }
 
+    private var effectiveServers: [SmartVPNServer] {
+        guard !configProfiles.isEmpty else {
+            return servers
+        }
+
+        return configProfiles.map { profile in
+            SmartVPNServer(
+                id: profile.id,
+                region: RegionCode(profile.regionCode ?? "ZZ"),
+                displayName: profile.displayName,
+                protocolKind: .amneziaWG,
+                lastLatencyMilliseconds: lastLatency(for: profile.id),
+                healthState: .healthy
+            )
+        }
+    }
+
+    private func lastLatency(for profileID: String) -> Double? {
+        qualitySamples.last { $0.serverID == profileID }?.latencyMilliseconds
+    }
+
+    private func switchToProfileOrServer(id: String) {
+        if configProfiles.contains(where: { $0.id == id }) {
+            activeConfigProfileID = id
+        } else {
+            activeServerID = id
+        }
+    }
+
     private func makeProfile(name: String, rawConfig: String, decodedConfig: AmneziaWireGuardConfig) -> StoredAmneziaConfigProfile {
         let region = inferRegion(from: name) ?? inferRegion(from: decodedConfig.endpoint)
         let endpointHost = decodedConfig.endpoint.split(separator: ":").first.map(String.init)
@@ -553,6 +933,7 @@ final class DashboardModel: ObservableObject {
         do {
             try profileStore.setActiveProfile(id: activeConfigProfileID)
             refreshPremiumKeyState()
+            refresh()
         } catch {
             vpnErrorMessage = error.localizedDescription
         }
@@ -575,6 +956,228 @@ final class DashboardModel: ObservableObject {
         selector.record(.sample(serverID: "nl-1", region: "NL", latency: 96, handshake: 220, loss: 0.04, failures: 1))
     }
 
+    private func loadQualityHistory() {
+        qualitySamples = qualityHistoryStore.load()
+        qualitySamples.forEach { selector.record($0) }
+        refresh()
+    }
+
+    private func loadProbeReliabilityHistory() {
+        probeReliabilitySamples = probeReliabilityHistoryStore.load()
+        refresh()
+    }
+
+    private func startMonitoring() {
+        monitoringTask?.cancel()
+        monitoringTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.runMonitoringCycle()
+                try? await Task.sleep(for: .seconds(30))
+            }
+        }
+    }
+
+    private func runMonitoringCycle() async {
+        guard !configProfiles.isEmpty else {
+            monitorStatus = "Import profiles to enable live probes"
+            return
+        }
+
+        let profiles = configProfiles
+        let activeID = activeConfigProfile?.id
+        var assessmentProbes: [ConnectivityProbeResult] = []
+        monitorStatus = vpnStatus.isConnectedOrConnecting ? "Running live probes" : "VPN disconnected; probing standby endpoints"
+
+        assessmentProbes.append(contentsOf: await directProviderProbes())
+
+        for profile in profiles {
+            guard let endpoint = endpoint(for: profile) else {
+                continue
+            }
+
+            let tcp = await ConnectivityProbeRunner.tcpConnect(host: endpoint.host, port: endpoint.port)
+            let isActive = profile.id == activeID
+            let latency = tcp.latency ?? 3_000
+            let sample = ServerQualitySample(
+                serverID: profile.id,
+                region: RegionCode(profile.regionCode ?? "ZZ"),
+                networkKind: .wifi,
+                latencyMilliseconds: latency,
+                packetLoss: tcp.succeeded ? 0 : 1,
+                handshakeMilliseconds: latency,
+                recentFailureCount: tcp.succeeded ? 0 : 1
+            )
+            recordQualitySample(sample)
+
+            let probe = ConnectivityProbeResult(
+                targetID: isActive ? "active-endpoint" : "standby-endpoint",
+                targetKind: .vpnServer,
+                serverID: profile.id,
+                region: RegionCode(profile.regionCode ?? "ZZ"),
+                method: .tcpConnect,
+                succeeded: tcp.succeeded,
+                latencyMilliseconds: tcp.latency,
+                packetLoss: tcp.succeeded ? 0 : 1
+            )
+            if isActive {
+                assessmentProbes.append(probe)
+            }
+        }
+
+        if vpnStatus.isConnectedOrConnecting, let activeID {
+            assessmentProbes.append(contentsOf: await vpnProtectedProbes(serverID: activeID))
+        }
+
+        liveProbeResults = assessmentProbes
+        recordProbeReliabilitySamples(assessmentProbes)
+        lastProbeDate = Date()
+        refresh()
+        await applyAutomaticFailoverIfNeeded()
+    }
+
+    private func directProviderProbes() async -> [ConnectivityProbeResult] {
+        let targets: [(String, ProbeMethod, () async -> (succeeded: Bool, latency: Double?))] = [
+            ("ru-ya", .httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://ya.ru")!) }),
+            ("ru-mos", .httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.mos.ru")!) }),
+            ("provider-dns-tcp", .tcpConnect, { await ConnectivityProbeRunner.tcpConnect(host: "77.88.8.8", port: 53, timeout: 3) })
+        ]
+
+        var probes: [ConnectivityProbeResult] = []
+        for target in targets {
+            let result = await target.2()
+            probes.append(ConnectivityProbeResult(
+                targetID: target.0,
+                targetKind: target.0 == "provider-dns-tcp" ? .dnsResolver : .directEndpoint,
+                method: target.1,
+                succeeded: result.succeeded,
+                latencyMilliseconds: result.latency,
+                packetLoss: result.succeeded ? 0 : 1
+            ))
+        }
+
+        return probes
+    }
+
+    private func vpnProtectedProbes(serverID: String) async -> [ConnectivityProbeResult] {
+        let targets: [(String, ProbeMethod, () async -> (succeeded: Bool, latency: Double?))] = [
+            ("foreign-gstatic-204", .httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.gstatic.com/generate_204")!) }),
+            ("foreign-apple-success", .httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.apple.com/library/test/success.html")!) }),
+            ("foreign-cloudflare-tcp", .tcpConnect, { await ConnectivityProbeRunner.tcpConnect(host: "1.1.1.1", port: 443, timeout: 3) })
+        ]
+
+        var probes: [ConnectivityProbeResult] = []
+        for target in targets {
+            let result = await target.2()
+            probes.append(ConnectivityProbeResult(
+                targetID: target.0,
+                targetKind: .vpnProtectedEndpoint,
+                serverID: serverID,
+                method: target.1,
+                succeeded: result.succeeded,
+                latencyMilliseconds: result.latency,
+                packetLoss: result.succeeded ? 0 : 1
+            ))
+        }
+
+        return probes
+    }
+
+    private func endpoint(for profile: StoredAmneziaConfigProfile) -> ProfileEndpoint? {
+        guard let decoded = try? amneziaDecoder.decodeImportedWireGuardConfig(from: profile.config) else {
+            return profile.endpointHost.map { ProfileEndpoint(host: $0, port: 51820) }
+        }
+
+        return endpoint(from: decoded.endpoint)
+    }
+
+    private func endpoint(from rawEndpoint: String) -> ProfileEndpoint? {
+        let trimmed = rawEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("[") {
+            let parts = trimmed.split(separator: "]", maxSplits: 1).map(String.init)
+            guard let host = parts.first?.dropFirst(), let portPart = parts.last?.dropFirst().split(separator: ":").last,
+                  let port = UInt16(portPart) else {
+                return nil
+            }
+            return ProfileEndpoint(host: String(host), port: port)
+        }
+
+        let parts = trimmed.split(separator: ":")
+        guard let host = parts.first else {
+            return nil
+        }
+
+        let port = parts.dropFirst().last.flatMap { UInt16($0) } ?? 51820
+        return ProfileEndpoint(host: String(host), port: port)
+    }
+
+    private func recordQualitySample(_ sample: ServerQualitySample) {
+        selector.record(sample)
+        qualitySamples.append(sample)
+        qualitySamples = Array(qualitySamples.suffix(240))
+        qualityHistoryStore.save(qualitySamples)
+    }
+
+    private func recordProbeReliabilitySamples(_ probes: [ConnectivityProbeResult]) {
+        probeReliabilitySamples.append(contentsOf: probes)
+        probeReliabilitySamples = Array(probeReliabilitySamples.suffix(960))
+        probeReliabilityHistoryStore.save(probeReliabilitySamples)
+    }
+
+    private func applyAutomaticFailoverIfNeeded() async {
+        guard automaticFailoverEnabled, vpnStatus.isConnectedOrConnecting else {
+            return
+        }
+
+        if let lastAutomaticFailoverDate,
+           Date().timeIntervalSince(lastAutomaticFailoverDate) < 90 {
+            return
+        }
+
+        guard case .switchServer(_, let to, let reason) = healthAssessment.recommendedAction,
+              configProfiles.contains(where: { $0.id == to }),
+              to != activeConfigProfile?.id else {
+            return
+        }
+
+        let oldProfile = activeConfigSummary
+        switchToProfileOrServer(id: to)
+        lastAutomaticFailoverDate = Date()
+        notifyFailover(from: oldProfile, to: activeConfigSummary, reason: reason)
+
+        suppressExpectedDisconnectNotification = true
+        disconnectVPN()
+        try? await Task.sleep(for: .seconds(2))
+        connectVPN()
+    }
+
+    private func notifyTunnelDropped(profile: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Real Ai VPN disconnected"
+        content.body = "Tunnel dropped or reset for \(profile)."
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "real-ai-vpn-macos-disconnect-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    private func notifyFailover(from oldProfile: String, to newProfile: String, reason: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Real Ai VPN switched profile"
+        content.body = "\(oldProfile) → \(newProfile). \(reason)"
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "real-ai-vpn-macos-failover-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
     private func probes(for scenario: ProbeScenario) -> [ConnectivityProbeResult] {
         switch scenario {
         case .healthy:
@@ -590,6 +1193,12 @@ final class DashboardModel: ObservableObject {
 struct DashboardView: View {
     @ObservedObject var model: DashboardModel
     @Binding var showSettings: Bool
+
+    private var buildLabel: String {
+        Bundle.main.object(forInfoDictionaryKey: "RAIVPNBuildLabel") as? String
+            ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? "dev"
+    }
 
     var body: some View {
         ZStack {
@@ -611,9 +1220,6 @@ struct DashboardView: View {
             }
         }
         .foregroundStyle(.white)
-        .onChange(of: model.scenario) {
-            model.refresh()
-        }
         .onChange(of: model.selectedDestination) {
             model.refresh()
         }
@@ -629,7 +1235,7 @@ struct DashboardView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Real Ai VPN")
                     .font(.system(size: 18, weight: .semibold))
-                Text(titleSubtitle)
+                Text("\(titleSubtitle) · v\(buildLabel)")
                     .font(.system(size: 12))
                     .foregroundStyle(.white.opacity(0.62))
             }
@@ -644,29 +1250,24 @@ struct DashboardView: View {
             .pickerStyle(.segmented)
             .frame(width: 260)
 
-            Picker("", selection: $model.scenario) {
-                ForEach(DashboardModel.ProbeScenario.allCases) { scenario in
-                    Text(scenario.rawValue).tag(scenario)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(width: 260)
-
             Button {
                 showSettings = true
             } label: {
                 Image(systemName: "gearshape.fill")
-                    .frame(width: 28, height: 28)
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 42, height: 30)
             }
             .buttonStyle(.bordered)
+            .controlSize(.large)
 
             Button {
                 model.toggleVPN()
             } label: {
                 Label(connectButtonTitle, systemImage: connectButtonSymbol)
-                    .frame(width: 132)
+                    .frame(width: 132, height: 30)
             }
             .buttonStyle(.borderedProminent)
+            .controlSize(.large)
             .tint(model.vpnStatus.isConnectedOrConnecting ? .red : .teal)
         }
         .padding(.horizontal, 28)
@@ -724,12 +1325,12 @@ struct ConnectionPanel: View {
         Panel(title: "Route", symbol: "point.topleft.down.curvedto.point.bottomright.up") {
             HStack(alignment: .top, spacing: 22) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text(routeTitle)
+                    Text(model.activeRouteTitle)
                         .font(.system(size: 34, weight: .bold))
                         .minimumScaleFactor(0.75)
                         .lineLimit(1)
 
-                    Text(routeSource)
+                    Text(model.activeRouteSource)
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(.white.opacity(0.58))
 
@@ -770,28 +1371,18 @@ struct ConnectionPanel: View {
                     Text("\(Int(gaugeValue * 100))%")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.74))
+
+                    Text(model.routeConfidenceDetail)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.48))
+                        .lineLimit(1)
                 }
             }
         }
     }
 
-    private var routeTitle: String {
-        switch model.routeDecision.action {
-        case .directProviderDNS:
-            return "Direct Provider DNS"
-        case .vpn(_, let region):
-            return model.vpnStatus == .connected ? "VPN \(region.rawValue)" : "Planned VPN \(region.rawValue)"
-        case .ask:
-            return "Needs Attention"
-        }
-    }
-
-    private var routeSource: String {
-        model.vpnStatus == .connected ? model.routeDecision.source : "\(model.routeDecision.source) · policy preview"
-    }
-
     private var gaugeValue: Double {
-        model.routeDecision.rankedServers.first?.confidence ?? 1
+        model.routeConfidence
     }
 
     private var statusTint: Color {
@@ -827,9 +1418,15 @@ struct HealthPanel: View {
                     )
                 }
 
-                Text(model.vpnStatus.isConnectedOrConnecting ? "Live tunnel probes" : "Provider check is simulated until VPN connects")
+                Text(model.monitorStatus)
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.white.opacity(0.48))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                Text(model.probeReliabilityDetail)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.48))
+                    .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -956,6 +1553,23 @@ struct RecoveryPanel: View {
                     .foregroundStyle(.white.opacity(0.58))
                     .lineLimit(2)
 
+                Text(model.probeReliabilityDetail)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.48))
+                    .lineLimit(2)
+
+                if let lastProbeDate = model.lastProbeDate {
+                    Text("Last probe \(lastProbeDate.formatted(date: .omitted, time: .standard)) · \(model.monitorStatus)")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.48))
+                        .lineLimit(2)
+                } else {
+                    Text(model.monitorStatus)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.48))
+                        .lineLimit(2)
+                }
+
                 Spacer(minLength: 8)
 
                 Button {
@@ -973,13 +1587,13 @@ struct RecoveryPanel: View {
     private var actionTitle: String {
         switch model.healthAssessment.recommendedAction {
         case .keepCurrent:
-            return model.vpnStatus.isConnectedOrConnecting ? "Keep Current" : "Ready to Connect"
+            return model.vpnStatus.isConnectedOrConnecting ? "Keep \(model.activeProfileDisplayName)" : "Ready to Connect"
         case .refreshDirectDNS:
             return "Refresh DNS"
         case .reconnect:
-            return "Reconnect"
+            return "Reconnect \(model.activeProfileDisplayName)"
         case .switchServer(_, let to, _):
-            return "Switch to \(to)"
+            return "Switch to \(model.displayName(forServerID: to))"
         case .adjustParameters:
             return "Tune Tunnel"
         case .askUser:
@@ -991,7 +1605,22 @@ struct RecoveryPanel: View {
         switch model.healthAssessment.recommendedAction {
         case .keepCurrent(let reason), .refreshDirectDNS(let reason), .reconnect(_, let reason),
              .switchServer(_, _, let reason), .adjustParameters(_, _, let reason), .askUser(let reason):
-            return reason
+            return friendlyReason(reason)
+        }
+    }
+
+    private func friendlyReason(_ reason: String) -> String {
+        switch reason {
+        case "vpn-path-healthy":
+            return "Current tunnel probes are healthy."
+        case "provider-path-down":
+            return "Local provider path is not responding."
+        case "provider-dns-or-direct-path-degraded":
+            return "Local provider or DNS probes are degraded."
+        case "vpn-path-degraded":
+            return "Tunnel probes are degraded; refresh/rehandshake is recommended."
+        default:
+            return reason.replacingOccurrences(of: "-", with: " ")
         }
     }
 
@@ -1063,6 +1692,8 @@ struct SettingsView: View {
     @State private var message: String?
     @State private var selectedTab: SettingsTab = .connection
     @State private var showConfigImporter = false
+    @State private var forceVPNException = ""
+    @State private var bypassVPNException = ""
 
     var body: some View {
         ZStack {
@@ -1102,6 +1733,7 @@ struct SettingsView: View {
                 Picker("", selection: $selectedTab) {
                     Text("Connection").tag(SettingsTab.connection)
                     Text("App").tag(SettingsTab.app)
+                    Text("Routing").tag(SettingsTab.routing)
                     Text("Regions").tag(SettingsTab.regions)
                     Text("Signing").tag(SettingsTab.signing)
                 }
@@ -1115,6 +1747,8 @@ struct SettingsView: View {
                             connectionSettings
                         case .app:
                             appSettings
+                        case .routing:
+                            routingSettings
                         case .regions:
                             regionSettings
                         case .signing:
@@ -1281,6 +1915,16 @@ struct SettingsView: View {
                 Divider()
                     .overlay(.white.opacity(0.16))
 
+                Toggle("Auto-switch profile and show popup", isOn: $model.automaticFailoverEnabled)
+                    .toggleStyle(.switch)
+
+                Text("When the active VPN path stalls, Real Ai VPN switches to the best imported profile, reconnects, and shows a confirmation popup.")
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.58))
+
+                Divider()
+                    .overlay(.white.opacity(0.16))
+
                 HStack(alignment: .top, spacing: 10) {
                     ActiveMenuBarShieldIcon()
                         .frame(width: 20, height: 20)
@@ -1294,6 +1938,101 @@ struct SettingsView: View {
                     }
                 }
             }
+        }
+    }
+
+    private var routingSettings: some View {
+        SettingsCard(title: "Current Region Exceptions") {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Rules accept exact domains, IPs, or CIDR ranges. Changes are applied on the next reconnect so the current tunnel is not disturbed.")
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.62))
+
+                exceptionInput(
+                    title: "Через VPN",
+                    placeholder: "example.ru or 203.0.113.10",
+                    text: $forceVPNException,
+                    mode: .forceVPN
+                )
+
+                exceptionInput(
+                    title: "Без VPN",
+                    placeholder: "mos.ru or 203.0.113.0/24",
+                    text: $bypassVPNException,
+                    mode: .bypassVPN
+                )
+
+                Divider()
+                    .overlay(.white.opacity(0.16))
+
+                if model.routingExceptions.rules.isEmpty {
+                    Text("No routing exceptions yet.")
+                        .font(.callout)
+                        .foregroundStyle(.white.opacity(0.62))
+                } else {
+                    ForEach(model.routingExceptions.rules) { rule in
+                        HStack(spacing: 10) {
+                            Toggle("", isOn: Binding(
+                                get: { rule.isEnabled },
+                                set: { model.setRoutingExceptionEnabled(id: rule.id, isEnabled: $0) }
+                            ))
+                            .labelsHidden()
+
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(rule.value)
+                                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                Text(rule.mode.title)
+                                    .font(.caption)
+                                    .foregroundStyle(rule.mode == .forceVPN ? .cyan : .mint)
+                            }
+
+                            Spacer()
+
+                            Button(role: .destructive) {
+                                model.deleteRoutingException(id: rule.id)
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.orange)
+                        }
+                        .padding(10)
+                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                }
+            }
+        }
+    }
+
+    private func exceptionInput(
+        title: String,
+        placeholder: String,
+        text: Binding<String>,
+        mode: RoutingExceptionMode
+    ) -> some View {
+        HStack(spacing: 10) {
+            Text(title)
+                .font(.callout.weight(.semibold))
+                .frame(width: 82, alignment: .leading)
+            TextField(placeholder, text: text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13, design: .monospaced))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(.white.opacity(0.16), lineWidth: 1)
+                )
+            Button {
+                model.addRoutingException(value: text.wrappedValue, mode: mode)
+                text.wrappedValue = ""
+            } label: {
+                Image(systemName: "plus")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(mode == .forceVPN ? .cyan : .mint)
+            .disabled(text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
     }
 
@@ -1357,6 +2096,7 @@ struct SettingsView: View {
 private enum SettingsTab: Hashable {
     case connection
     case app
+    case routing
     case regions
     case signing
 }

@@ -98,7 +98,11 @@ public final class RealVPNProfileManager: ObservableObject {
         }
     }
 
-    public func connect(configuration: VPNProfileConfiguration, transientAmneziaKey: String? = nil) async {
+    public func connect(
+        configuration: VPNProfileConfiguration,
+        transientAmneziaKey: String? = nil,
+        routingExceptions: RoutingExceptionCollection = RoutingExceptionCollection()
+    ) async {
         do {
             let manager = try await loadOrCreateManager(configuration: configuration)
             self.manager = manager
@@ -106,6 +110,9 @@ public final class RealVPNProfileManager: ObservableObject {
             var options: [String: NSObject] = [:]
             if let transientAmneziaKey {
                 options["amneziaVPNURL"] = transientAmneziaKey as NSString
+            }
+            if let encodedExceptions = RoutingExceptionCodec.encode(routingExceptions) {
+                options["routingExceptions"] = encodedExceptions as NSString
             }
             try manager.connection.startVPNTunnel(options: options)
             refreshStatus()

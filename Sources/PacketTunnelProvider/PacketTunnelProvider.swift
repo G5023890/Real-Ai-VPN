@@ -1,7 +1,9 @@
 import AmneziaConfig
 import Foundation
+import Network
 import NetworkExtension
 import os
+import RealVPNCore
 import WireGuardKit
 
 private let packetTunnelLogger = Logger(
@@ -11,6 +13,14 @@ private let packetTunnelLogger = Logger(
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let decoder = AmneziaConfigDecoder()
+    private let profileStore = AmneziaConfigProfileStore(
+        accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup,
+        allowsAuthenticationUI: false
+    )
+    private let premiumKeyStore = AmneziaPremiumKeyStore(
+        accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup,
+        allowsAuthenticationUI: false
+    )
     private lazy var adapter = WireGuardAdapter(with: self) { logLevel, message in
         switch logLevel {
         case .verbose:
@@ -23,7 +33,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     override func startTunnel(options: [String: NSObject]?) async throws {
         packetTunnelLogger.info("Starting Amnezia packet tunnel")
 
-        let importedConfig = (options?["amneziaVPNURL"] as? String) ?? (options?["amneziaVPNURL"] as? NSString).map(String.init)
+        let importedConfig = ((options?["amneziaVPNURL"] as? String) ?? (options?["amneziaVPNURL"] as? NSString).map(String.init))
+            ?? storedAmneziaConfig()
+        let routingExceptions = RoutingExceptionCodec.decode(
+            (options?["routingExceptions"] as? String) ?? (options?["routingExceptions"] as? NSString).map(String.init)
+        )
 
         guard let importedConfig, !importedConfig.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             packetTunnelLogger.error("Missing transient Amnezia config")
@@ -39,11 +53,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             throw PacketTunnelProviderError.invalidAmneziaConfig
         }
 
-        try await startAmneziaWireGuardTunnel(with: config)
+        try await startAmneziaWireGuardTunnel(with: config, routingExceptions: routingExceptions)
     }
 
-    private func startAmneziaWireGuardTunnel(with config: AmneziaWireGuardConfig) async throws {
-        let tunnelConfiguration = try config.makeTunnelConfiguration(named: "Real Ai VPN")
+    private func storedAmneziaConfig() -> String? {
+        if let profile = try? profileStore.load().activeProfile {
+            return profile.config
+        }
+
+        return try? premiumKeyStore.read()
+    }
+
+    private func startAmneziaWireGuardTunnel(with config: AmneziaWireGuardConfig, routingExceptions: RoutingExceptionCollection) async throws {
+        let tunnelConfiguration = try config.makeTunnelConfiguration(named: "Real Ai VPN", routingExceptions: routingExceptions)
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             adapter.start(tunnelConfiguration: tunnelConfiguration) { error in
@@ -99,7 +121,7 @@ private enum PacketTunnelProviderError: LocalizedError {
 }
 
 private extension AmneziaWireGuardConfig {
-    func makeTunnelConfiguration(named name: String) throws -> TunnelConfiguration {
+    func makeTunnelConfiguration(named name: String, routingExceptions: RoutingExceptionCollection) throws -> TunnelConfiguration {
         guard let privateKey = PrivateKey(base64Key: privateKey) else {
             throw PacketTunnelProviderError.invalidWireGuardConfig("invalid private key")
         }
@@ -143,7 +165,11 @@ private extension AmneziaWireGuardConfig {
         peer.endpoint = endpoint
         peer.allowedIPs = parseCommaList(allowedIPs).compactMap(IPAddressRange.init(from:))
         if peer.allowedIPs.contains(where: \.isDefaultRoute) {
-            peer.excludeIPs = splitTunnelBypassRanges()
+            let compiledRules = RoutingExceptionCompiler.compile(routingExceptions.enabledRules)
+            let forceHostRoutes = compiledRules.forceVPN.filter(\.isHostRoute)
+            peer.allowedIPs.append(contentsOf: compiledRules.forceVPN)
+            peer.excludeIPs = splitTunnelBypassRanges(excludingForceHostRoutes: forceHostRoutes)
+            peer.excludeIPs.append(contentsOf: compiledRules.bypassVPN)
         }
         peer.persistentKeepAlive = persistentKeepalive.flatMap(UInt16.init(exactly:))
 
@@ -177,7 +203,7 @@ private extension AmneziaWireGuardConfig {
         return UInt16(value)
     }
 
-    private func splitTunnelBypassRanges() -> [IPAddressRange] {
+    private func splitTunnelBypassRanges(excludingForceHostRoutes forceHostRoutes: [IPAddressRange]) -> [IPAddressRange] {
         let localProviderRanges = [
             // Local/provider networks must never hairpin through the VPN tunnel.
             "10.0.0.0/8",
@@ -189,7 +215,7 @@ private extension AmneziaWireGuardConfig {
             "224.0.0.0/4"
         ]
 
-        let ruRanges = loadBundledCIDRs(resource: "ru-aggregated", extension: "zone")
+        let ruRanges = subtract(forceHostRoutes: forceHostRoutes, from: loadBundledCIDRs(resource: "ru-aggregated", extension: "zone"))
         packetTunnelLogger.info("Applying split tunnel bypass ranges: local=\(localProviderRanges.count, privacy: .public) ru=\(ruRanges.count, privacy: .public)")
 
         return (localProviderRanges + ruRanges).compactMap(IPAddressRange.init(from:))
@@ -213,10 +239,192 @@ private extension AmneziaWireGuardConfig {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
     }
+
+    private func subtract(forceHostRoutes: [IPAddressRange], from cidrs: [String]) -> [String] {
+        let forcedHosts = forceHostRoutes.compactMap(IPv4CIDR.init(hostRoute:))
+        guard !forcedHosts.isEmpty else {
+            return cidrs
+        }
+
+        return cidrs.flatMap { cidr -> [String] in
+            guard let range = IPv4CIDR(cidr) else {
+                return [cidr]
+            }
+
+            return forcedHosts.reduce([range]) { ranges, forcedHost in
+                ranges.flatMap { $0.subtracting(host: forcedHost) }
+            }.map(\.description)
+        }
+    }
 }
 
 private extension IPAddressRange {
     var isDefaultRoute: Bool {
         stringRepresentation == "0.0.0.0/0" || stringRepresentation == "::/0"
+    }
+
+    var isHostRoute: Bool {
+        stringRepresentation.hasSuffix("/32") || stringRepresentation.hasSuffix("/128")
+    }
+}
+
+private enum RoutingExceptionCompiler {
+    static func compile(_ rules: [RoutingExceptionRule]) -> (forceVPN: [IPAddressRange], bypassVPN: [IPAddressRange]) {
+        var forceVPN: [IPAddressRange] = []
+        var bypassVPN: [IPAddressRange] = []
+
+        for rule in rules {
+            let ranges = ranges(for: rule.value)
+            switch rule.mode {
+            case .forceVPN:
+                forceVPN.append(contentsOf: ranges)
+            case .bypassVPN:
+                bypassVPN.append(contentsOf: ranges)
+            }
+        }
+
+        return (forceVPN.uniqued(), bypassVPN.uniqued())
+    }
+
+    private static func ranges(for value: String) -> [IPAddressRange] {
+        let normalized = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "https://", with: "")
+            .replacingOccurrences(of: "http://", with: "")
+            .split(separator: "/")
+            .first
+            .map(String.init) ?? ""
+
+        guard !normalized.isEmpty else {
+            return []
+        }
+
+        if normalized.contains("/") || IPv4CIDR(normalized) != nil || IPv6Address(normalized) != nil {
+            return IPAddressRange(from: normalized).map { [$0] } ?? []
+        }
+
+        let host = normalized.hasPrefix("*.") ? String(normalized.dropFirst(2)) : normalized
+        return resolveHostRoutes(host: host)
+    }
+
+    private static func resolveHostRoutes(host: String) -> [IPAddressRange] {
+        var hints = addrinfo(
+            ai_flags: AI_ADDRCONFIG,
+            ai_family: AF_UNSPEC,
+            ai_socktype: SOCK_STREAM,
+            ai_protocol: IPPROTO_TCP,
+            ai_addrlen: 0,
+            ai_canonname: nil,
+            ai_addr: nil,
+            ai_next: nil
+        )
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &result) == 0, let result else {
+            return []
+        }
+        defer { freeaddrinfo(result) }
+
+        var ranges: [IPAddressRange] = []
+        var cursor: UnsafeMutablePointer<addrinfo>? = result
+        while let info = cursor {
+            if info.pointee.ai_family == AF_INET {
+                var address = info.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+                var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                if inet_ntop(AF_INET, &address, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil {
+                    ranges.append(contentsOf: IPAddressRange(from: "\(String(cString: buffer))/32").map { [$0] } ?? [])
+                }
+            } else if info.pointee.ai_family == AF_INET6 {
+                var address = info.pointee.ai_addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_addr }
+                var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+                if inet_ntop(AF_INET6, &address, &buffer, socklen_t(INET6_ADDRSTRLEN)) != nil {
+                    ranges.append(contentsOf: IPAddressRange(from: "\(String(cString: buffer))/128").map { [$0] } ?? [])
+                }
+            }
+            cursor = info.pointee.ai_next
+        }
+
+        return ranges.uniqued()
+    }
+}
+
+private extension Array where Element == IPAddressRange {
+    func uniqued() -> [IPAddressRange] {
+        var seen = Set<String>()
+        return filter { seen.insert($0.stringRepresentation).inserted }
+    }
+}
+
+private struct IPv4CIDR: CustomStringConvertible {
+    let base: UInt32
+    let prefix: UInt8
+
+    init?(_ raw: String) {
+        let parts = raw.split(separator: "/", maxSplits: 1).map(String.init)
+        guard let address = Self.parse(parts[0]) else {
+            return nil
+        }
+
+        let parsedPrefix = parts.dropFirst().first.flatMap(UInt8.init) ?? 32
+        prefix = min(parsedPrefix, 32)
+        base = address & Self.mask(prefix)
+    }
+
+    init?(hostRoute range: IPAddressRange) {
+        guard range.networkPrefixLength == 32,
+              let address = Self.parse(String(describing: range.address)) else {
+            return nil
+        }
+
+        base = address
+        prefix = 32
+    }
+
+    private init(base: UInt32, prefix: UInt8) {
+        self.base = base & Self.mask(prefix)
+        self.prefix = prefix
+    }
+
+    var description: String {
+        "\(Self.format(base))/\(prefix)"
+    }
+
+    func subtracting(host: IPv4CIDR) -> [IPv4CIDR] {
+        guard host.prefix == 32, contains(host.base), prefix < 32 else {
+            return host.prefix == 32 && host.base == base ? [] : [self]
+        }
+
+        let nextPrefix = prefix + 1
+        let halfSize = UInt32(1) << (32 - nextPrefix)
+        let lower = IPv4CIDR(base: base, prefix: nextPrefix)
+        let upper = IPv4CIDR(base: base + halfSize, prefix: nextPrefix)
+        return lower.subtracting(host: host) + upper.subtracting(host: host)
+    }
+
+    private func contains(_ address: UInt32) -> Bool {
+        (address & Self.mask(prefix)) == base
+    }
+
+    private static func mask(_ prefix: UInt8) -> UInt32 {
+        prefix == 0 ? 0 : UInt32.max << (32 - UInt32(prefix))
+    }
+
+    private static func parse(_ raw: String) -> UInt32? {
+        guard let address = IPv4Address(raw) else {
+            return nil
+        }
+
+        return address.rawValue.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+    }
+
+    private static func format(_ value: UInt32) -> String {
+        [
+            UInt8((value >> 24) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8(value & 0xff)
+        ]
+        .map(String.init)
+        .joined(separator: ".")
     }
 }

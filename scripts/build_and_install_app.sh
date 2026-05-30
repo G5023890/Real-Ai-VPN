@@ -16,6 +16,9 @@ TEAM_ID="${TEAM_ID:-9FP39GTDT5}"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 SKIP_SIGN="${SKIP_SIGN:-0}"
 LAUNCH_AFTER_INSTALL="${LAUNCH_AFTER_INSTALL:-1}"
+APP_VERSION="${APP_VERSION:-0.75}"
+BUILD_STAMP="${BUILD_STAMP:-$(date '+%H%M%S%d%m%Y')}"
+BUILD_LABEL="${BUILD_LABEL:-${APP_VERSION} (${BUILD_STAMP})}"
 RESOLVED_SIGN_IDENTITY=""
 DERIVED_DATA_ROOT="${DERIVED_DATA_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/real-ai-vpn-derived.XXXXXX")}"
 
@@ -90,6 +93,7 @@ resolve_sign_identity
 if [[ -n "$RESOLVED_SIGN_IDENTITY" ]]; then
   log "Resolved signing identity: $RESOLVED_SIGN_IDENTITY"
 fi
+log "Build label: $BUILD_LABEL"
 
 mkdir -p "$DIST_DIR"
 
@@ -117,6 +121,9 @@ xcodebuild \
   -derivedDataPath "$DERIVED_DATA_ROOT" \
   -allowProvisioningUpdates \
   DEVELOPMENT_TEAM="$TEAM_ID" \
+  MARKETING_VERSION="$APP_VERSION" \
+  CURRENT_PROJECT_VERSION="$BUILD_STAMP" \
+  REAL_AI_VPN_BUILD_LABEL="$BUILD_LABEL" \
   build
 
 BUILT_APP="$DERIVED_DATA_ROOT/Build/Products/$CONFIGURATION/${APP_NAME}.app"

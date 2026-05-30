@@ -170,6 +170,160 @@ public struct ConnectivityProbeResult: Hashable, Codable, Sendable {
     }
 }
 
+public struct ProbeReliabilitySummary: Hashable, Codable, Sendable {
+    public var targetID: String
+    public var targetKind: ProbeTargetKind
+    public var serverID: String?
+    public var method: ProbeMethod
+    public var sampleCount: Int
+    public var successRate: Double
+    public var averageLatencyMilliseconds: Double?
+    public var reliabilityScore: Double
+    public var lastSeen: Date?
+
+    public init(
+        targetID: String,
+        targetKind: ProbeTargetKind,
+        serverID: String?,
+        method: ProbeMethod,
+        sampleCount: Int,
+        successRate: Double,
+        averageLatencyMilliseconds: Double?,
+        reliabilityScore: Double,
+        lastSeen: Date?
+    ) {
+        self.targetID = targetID
+        self.targetKind = targetKind
+        self.serverID = serverID
+        self.method = method
+        self.sampleCount = max(0, sampleCount)
+        self.successRate = min(max(successRate, 0), 1)
+        self.averageLatencyMilliseconds = averageLatencyMilliseconds
+        self.reliabilityScore = min(max(reliabilityScore, 0), 1)
+        self.lastSeen = lastSeen
+    }
+}
+
+public struct ProbeReliabilityAnalyzer: Sendable {
+    public var minimumSamplesForFiltering: Int
+    public var minimumReliabilityScore: Double
+
+    public init(minimumSamplesForFiltering: Int = 6, minimumReliabilityScore: Double = 0.45) {
+        self.minimumSamplesForFiltering = max(1, minimumSamplesForFiltering)
+        self.minimumReliabilityScore = min(max(minimumReliabilityScore, 0), 1)
+    }
+
+    public func summaries(from history: [ConnectivityProbeResult]) -> [ProbeReliabilitySummary] {
+        Dictionary(grouping: history, by: ProbeReliabilityKey.init)
+            .map { key, samples in summary(for: key, samples: samples) }
+            .sorted {
+                if $0.reliabilityScore != $1.reliabilityScore {
+                    return $0.reliabilityScore > $1.reliabilityScore
+                }
+                return $0.targetID < $1.targetID
+            }
+    }
+
+    public func summaries(
+        from history: [ConnectivityProbeResult],
+        serverID: String?,
+        targetKind: ProbeTargetKind? = nil
+    ) -> [ProbeReliabilitySummary] {
+        summaries(from: history).filter { summary in
+            summary.serverID == serverID && (targetKind == nil || summary.targetKind == targetKind)
+        }
+    }
+
+    public func filteredCurrentProbes(
+        _ probes: [ConnectivityProbeResult],
+        using history: [ConnectivityProbeResult]
+    ) -> [ConnectivityProbeResult] {
+        guard !probes.isEmpty, !history.isEmpty else {
+            return probes
+        }
+
+        let summariesByKey = Dictionary(uniqueKeysWithValues: summaries(from: history).map { (ProbeReliabilityKey($0), $0) })
+        let filtered = probes.filter { probe in
+            guard let summary = summariesByKey[ProbeReliabilityKey(probe)] else {
+                return true
+            }
+
+            if probe.succeeded {
+                return true
+            }
+
+            return summary.sampleCount < minimumSamplesForFiltering || summary.reliabilityScore >= minimumReliabilityScore
+        }
+
+        return filtered.isEmpty ? probes : filtered
+    }
+
+    public func bestSummary(
+        from history: [ConnectivityProbeResult],
+        serverID: String?,
+        targetKind: ProbeTargetKind? = nil
+    ) -> ProbeReliabilitySummary? {
+        summaries(from: history, serverID: serverID, targetKind: targetKind).first
+    }
+
+    private func summary(for key: ProbeReliabilityKey, samples: [ConnectivityProbeResult]) -> ProbeReliabilitySummary {
+        let recent = Array(samples.sorted { $0.timestamp < $1.timestamp }.suffix(60))
+        let successes = recent.filter(\.succeeded)
+        let successRate = recent.isEmpty ? 0 : Double(successes.count) / Double(recent.count)
+        let averageLatency = average(successes.compactMap(\.latencyMilliseconds))
+        let latencyScore: Double
+        if let averageLatency {
+            latencyScore = max(0, min(1, 1 - (averageLatency / 3_000)))
+        } else {
+            latencyScore = successRate > 0 ? 0.5 : 0
+        }
+
+        let sampleConfidence = min(1, Double(recent.count) / Double(minimumSamplesForFiltering))
+        let reliabilityScore = ((successRate * 0.8) + (latencyScore * 0.2)) * sampleConfidence
+
+        return ProbeReliabilitySummary(
+            targetID: key.targetID,
+            targetKind: key.targetKind,
+            serverID: key.serverID,
+            method: key.method,
+            sampleCount: recent.count,
+            successRate: successRate,
+            averageLatencyMilliseconds: averageLatency,
+            reliabilityScore: reliabilityScore,
+            lastSeen: recent.last?.timestamp
+        )
+    }
+
+    private func average(_ values: [Double]) -> Double? {
+        guard !values.isEmpty else {
+            return nil
+        }
+
+        return values.reduce(0, +) / Double(values.count)
+    }
+}
+
+private struct ProbeReliabilityKey: Hashable {
+    var targetID: String
+    var targetKind: ProbeTargetKind
+    var serverID: String?
+    var method: ProbeMethod
+
+    init(_ probe: ConnectivityProbeResult) {
+        targetID = probe.targetID
+        targetKind = probe.targetKind
+        serverID = probe.serverID
+        method = probe.method
+    }
+
+    init(_ summary: ProbeReliabilitySummary) {
+        targetID = summary.targetID
+        targetKind = summary.targetKind
+        serverID = summary.serverID
+        method = summary.method
+    }
+}
+
 public enum PathHealthState: String, Codable, Sendable {
     case healthy
     case degraded
@@ -485,19 +639,27 @@ public struct SmartServerSelector {
 
 public struct PreventiveVPNHealthMonitor {
     private let selector: SmartServerSelector
+    private let reliabilityAnalyzer: ProbeReliabilityAnalyzer
 
-    public init(selector: SmartServerSelector = SmartServerSelector()) {
+    public init(
+        selector: SmartServerSelector = SmartServerSelector(),
+        reliabilityAnalyzer: ProbeReliabilityAnalyzer = ProbeReliabilityAnalyzer()
+    ) {
         self.selector = selector
+        self.reliabilityAnalyzer = reliabilityAnalyzer
     }
 
     public func assess(
         probes: [ConnectivityProbeResult],
         activeServerID: String?,
         context: ServerSelectionContext,
-        servers: [SmartVPNServer]
+        servers: [SmartVPNServer],
+        probeHistory: [ConnectivityProbeResult] = []
     ) -> PreventiveHealthAssessment {
-        let directReport = report(for: probes.filter { $0.targetKind == .directEndpoint || $0.targetKind == .dnsResolver })
-        let vpnReport = report(for: probes.filter { $0.targetKind == .vpnServer || $0.targetKind == .vpnProtectedEndpoint })
+        let directProbes = probes.filter { $0.targetKind == .directEndpoint || $0.targetKind == .dnsResolver }
+        let vpnProbes = probes.filter { $0.targetKind == .vpnServer || $0.targetKind == .vpnProtectedEndpoint }
+        let directReport = report(for: reliabilityAnalyzer.filteredCurrentProbes(directProbes, using: probeHistory))
+        let vpnReport = report(for: reliabilityAnalyzer.filteredCurrentProbes(vpnProbes, using: probeHistory))
         let ranked = selector.rankedServers(context: context, servers: servers)
         let action = recoveryAction(
             directReport: directReport,
