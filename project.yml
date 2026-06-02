@@ -121,7 +121,7 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         MACOSX_DEPLOYMENT_TARGET: 14.0
-        MARKETING_VERSION: 0.75
+        MARKETING_VERSION: 0.86
         CURRENT_PROJECT_VERSION: 75
   RealAiVPNPacketTunneliOS:
     type: app-extension
@@ -146,7 +146,84 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         IPHONEOS_DEPLOYMENT_TARGET: 17.0
-        MARKETING_VERSION: 0.75
+        MARKETING_VERSION: 0.86
+        CURRENT_PROJECT_VERSION: 75
+  RealAiVPNSingBoxPacketTunnel:
+    type: app-extension
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources/PacketTunnelProvider
+      - path: Resources/Routing
+        buildPhase: resources
+    dependencies:
+      - target: AmneziaConfig
+      - target: RealVPNCore
+      - framework: third_party/sing-box/Libbox.xcframework
+        embed: true
+        codeSign: true
+      - sdk: CoreText.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: CoreServices.framework
+      - sdk: AppKit.framework
+      - sdk: ApplicationServices.framework
+      - sdk: CoreGraphics.framework
+      - sdk: UniformTypeIdentifiers.framework
+      - sdk: libbsm.tbd
+      - sdk: libresolv.tbd
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.SingBoxPacketTunnel
+        PRODUCT_NAME: RealAiVPNSingBoxPacketTunnel
+        PRODUCT_MODULE_NAME: RealAiVPNSingBoxPacketTunnel
+        INFOPLIST_FILE: Config/PacketTunnel-Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: Config/PacketTunnel.entitlements
+        SWIFT_VERSION: 5.0
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SINGBOX_TUNNEL"
+        OTHER_LDFLAGS: "$(inherited)"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 9FP39GTDT5
+        MACOSX_DEPLOYMENT_TARGET: 14.0
+        MARKETING_VERSION: 0.86
+        CURRENT_PROJECT_VERSION: 75
+  RealAiVPNSingBoxPacketTunneliOS:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources/PacketTunnelProvider
+      - path: Resources/Routing
+        buildPhase: resources
+    dependencies:
+      - target: AmneziaConfigiOS
+      - target: RealVPNCoreiOS
+      - framework: third_party/sing-box/Libbox.xcframework
+        embed: true
+        codeSign: true
+      - sdk: CoreText.framework
+      - sdk: UIKit.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: CoreServices.framework
+      - sdk: CoreGraphics.framework
+      - sdk: UniformTypeIdentifiers.framework
+      - sdk: libbsm.tbd
+      - sdk: libresolv.tbd
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.iOS.SingBoxPacketTunnel
+        PRODUCT_NAME: RealAiVPNSingBoxPacketTunnel
+        PRODUCT_MODULE_NAME: RealAiVPNSingBoxPacketTunnel
+        INFOPLIST_FILE: Config/PacketTunnel-Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: Config/PacketTunnel-iOS.entitlements
+        SWIFT_VERSION: 5.0
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SINGBOX_TUNNEL"
+        OTHER_LDFLAGS: "$(inherited)"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 9FP39GTDT5
+        IPHONEOS_DEPLOYMENT_TARGET: 17.0
+        MARKETING_VERSION: 0.86
         CURRENT_PROJECT_VERSION: 75
   RealAiVPN:
     type: application
@@ -163,6 +240,7 @@ targets:
       - target: SmartServerSelection
       - target: RealVPNCore
       - target: RealAiVPNPacketTunnel
+      - target: RealAiVPNSingBoxPacketTunnel
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN
@@ -174,7 +252,7 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         MACOSX_DEPLOYMENT_TARGET: 14.0
-        MARKETING_VERSION: 0.75
+        MARKETING_VERSION: 0.86
         CURRENT_PROJECT_VERSION: 75
         ENABLE_HARDENED_RUNTIME: YES
   RealAiVPNiOS:
@@ -192,6 +270,7 @@ targets:
       - target: SmartServerSelectioniOS
       - target: RealVPNCoreiOS
       - target: RealAiVPNPacketTunneliOS
+      - target: RealAiVPNSingBoxPacketTunneliOS
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.iOS
@@ -204,5 +283,5 @@ targets:
         DEVELOPMENT_TEAM: 9FP39GTDT5
         IPHONEOS_DEPLOYMENT_TARGET: 17.0
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        MARKETING_VERSION: 0.75
+        MARKETING_VERSION: 0.86
         CURRENT_PROJECT_VERSION: 75

@@ -26,6 +26,7 @@ public enum NetworkKind: String, Codable, Sendable {
 public enum VPNProtocolKind: String, Codable, Sendable {
     case amneziaWG
     case wireGuard
+    case singBox
     case xray
     case openVPN
     case unknown

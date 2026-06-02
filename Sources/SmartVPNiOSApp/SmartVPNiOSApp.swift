@@ -7,6 +7,21 @@ import SwiftUI
 import UIKit
 import UserNotifications
 import UniformTypeIdentifiers
+import os
+
+private let iosAppLogger = Logger(
+    subsystem: "com.codex.RealAiVPN",
+    category: "iOSDashboard"
+)
+
+private final class iOSNotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .list, .sound]
+    }
+}
 
 private final class ProbeCompletionGate: @unchecked Sendable {
     private let lock = NSLock()
@@ -138,7 +153,14 @@ private struct ProfileEndpoint {
 
 @main
 struct RealAiVPNiOSApp: App {
+    private static let notificationDelegate = iOSNotificationDelegate()
     @StateObject private var model = iOSDashboardModel()
+
+    init() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = Self.notificationDelegate
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
 
     var body: some Scene {
         WindowGroup {
@@ -152,6 +174,9 @@ final class iOSDashboardModel: ObservableObject {
     @Published private(set) var profiles: [StoredAmneziaConfigProfile] = []
     @Published private(set) var activeProfileID: String?
     @Published private(set) var vpnStatus: VPNConnectionStatus = .unknown
+    @Published private(set) var vpnLastError: String?
+    @Published private(set) var vpnProviderBundleIdentifier: String?
+    @Published private(set) var tunnelDiagnostic: TunnelDiagnosticSnapshot?
     @Published private(set) var message = "Import an AmneziaWG .conf profile to start."
     @Published private(set) var routeTitle = "Ready"
     @Published private(set) var confidence = 0
@@ -184,8 +209,10 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     private let decoder = AmneziaConfigDecoder()
+    private let shadowrocketParser = ShadowrocketVLESSConfigParser()
     private let profileStore = AmneziaConfigProfileStore(accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup)
     private let routingExceptionStore = RoutingExceptionStore()
+    private let tunnelDiagnosticsStore = TunnelDiagnosticsStore()
     private let vpnManager = RealVPNProfileManager()
     private let selector = SmartServerSelector()
     private let qualityHistoryStore = LocalProfileQualityHistoryStore()
@@ -206,6 +233,19 @@ final class iOSDashboardModel: ObservableObject {
             .sink { [weak self] status in
                 self?.handleVPNStatusChange(status)
                 self?.refreshStatusMessage()
+            }
+            .store(in: &cancellables)
+        vpnManager.$lastErrorMessage
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] error in
+                self?.vpnLastError = error
+                self?.refreshStatusMessage()
+            }
+            .store(in: &cancellables)
+        vpnManager.$lastProviderBundleIdentifier
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] provider in
+                self?.vpnProviderBundleIdentifier = provider
             }
             .store(in: &cancellables)
         reloadProfiles()
@@ -302,10 +342,38 @@ final class iOSDashboardModel: ObservableObject {
             }
         }
 
+        var rawConfig = ""
         do {
-            let rawConfig = try String(contentsOf: url, encoding: .utf8)
-            let decoded = try decoder.decodeImportedWireGuardConfig(from: rawConfig)
+            rawConfig = try String(contentsOf: url, encoding: .utf8)
             let displayName = url.deletingPathExtension().lastPathComponent
+            Task {
+                await importProfile(displayName: displayName, rawConfig: rawConfig)
+            }
+        } catch {
+            message = Self.importErrorMessage(for: error, rawConfig: rawConfig)
+        }
+    }
+
+    private func importProfile(displayName: String, rawConfig: String) async {
+        do {
+            if let subscriptionURL = try shadowrocketParser.subscriptionURL(from: rawConfig) {
+                let subscriptionText = try await fetchSubscription(from: subscriptionURL)
+                let entries = try shadowrocketParser.parseEntries(subscriptionText)
+                try upsertShadowrocketEntries(entries, fallbackName: displayName, makeFirstActive: true)
+                reloadProfiles()
+                message = "Imported \(entries.count) VLESS profile\(entries.count == 1 ? "" : "s"). Ready to connect."
+                return
+            }
+
+            let entries = (try? shadowrocketParser.parseEntries(rawConfig)) ?? []
+            if !entries.isEmpty {
+                try upsertShadowrocketEntries(entries, fallbackName: displayName, makeFirstActive: true)
+                reloadProfiles()
+                message = "Imported \(entries.count) VLESS profile\(entries.count == 1 ? "" : "s"). Ready to connect."
+                return
+            }
+
+            let decoded = try decoder.decodeImportedWireGuardConfig(from: rawConfig)
             let endpointHost = Self.endpointHost(from: decoded.endpoint)
             let regionCode = Self.regionCode(from: displayName, endpointHost: endpointHost)
             let profile = StoredAmneziaConfigProfile(
@@ -319,37 +387,113 @@ final class iOSDashboardModel: ObservableObject {
             reloadProfiles()
             message = "Imported \(profile.displayName). Ready to connect."
         } catch {
-            message = "Could not import profile: \(error.localizedDescription)"
+            message = Self.importErrorMessage(for: error, rawConfig: rawConfig)
+        }
+    }
+
+    private func fetchSubscription(from url: URL) async throws -> String {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 20
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let response = response as? HTTPURLResponse,
+           !(200..<300).contains(response.statusCode) {
+            throw URLError(.badServerResponse)
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func upsertShadowrocketEntries(
+        _ entries: [ShadowrocketVLESSProfileEntry],
+        fallbackName: String,
+        makeFirstActive: Bool
+    ) throws {
+        for (index, entry) in entries.enumerated() {
+            let displayName = entry.profile.title.isEmpty ? fallbackName : entry.profile.title
+            let profile = StoredAmneziaConfigProfile(
+                displayName: displayName,
+                kind: .singBoxVLESSReality,
+                regionCode: entry.profile.regionCode ?? Self.regionCode(from: displayName, endpointHost: entry.profile.host),
+                endpointHost: entry.profile.host,
+                config: entry.rawConfig
+            )
+            try profileStore.upsert(profile, makeActive: makeFirstActive && index == 0)
         }
     }
 
     func setActiveProfile(id: String) {
+        NSLog("RealAiVPN iOS setActiveProfile id=%@", id)
         do {
             try profileStore.setActiveProfile(id: id)
             reloadProfiles()
+            NSLog("RealAiVPN iOS activeProfile=%@ kind=%@ endpoint=%@",
+                  activeProfile?.displayName ?? "none",
+                  activeProfile?.kind.rawValue ?? "none",
+                  activeProfile?.endpointHost ?? "unknown")
             message = "Selected \(activeProfile?.displayName ?? "profile")."
         } catch {
+            NSLog("RealAiVPN iOS setActiveProfile failed: %@", error.localizedDescription)
             message = "Could not select profile: \(error.localizedDescription)"
         }
     }
 
+    func deleteProfile(id: String) {
+        let deletingActiveProfile = activeProfile?.id == id
+        let deletedName = profiles.first { $0.id == id }?.displayName ?? "profile"
+
+        if deletingActiveProfile, vpnStatus.isConnectedOrConnecting {
+            suppressExpectedDisconnectNotification = true
+            vpnManager.disconnect()
+        }
+
+        do {
+            try profileStore.deleteProfile(id: id)
+            qualitySamples.removeAll { $0.serverID == id }
+            qualityHistoryStore.save(qualitySamples)
+            probeReliabilitySamples.removeAll { $0.serverID == id }
+            probeReliabilityHistoryStore.save(probeReliabilitySamples)
+            liveProbeResults.removeAll { $0.serverID == id }
+            reloadProfiles()
+            Task {
+                await vpnManager.prepareProfile(configuration: vpnConfiguration)
+            }
+            message = profiles.isEmpty
+                ? "Deleted \(deletedName). Import a profile to connect."
+                : "Deleted \(deletedName). Active profile is \(activeProfile?.displayName ?? "profile")."
+        } catch {
+            message = "Could not delete \(deletedName): \(error.localizedDescription)"
+        }
+    }
+
     func connect() {
+        NSLog("RealAiVPN iOS connect() entered connectedOrConnecting=%@", isConnectedOrConnecting ? "true" : "false")
         guard let activeProfile else {
+            NSLog("RealAiVPN iOS connect() no active profile")
             message = "Import an AmneziaWG .conf profile first."
             return
         }
 
         Task {
+            let connectProfile = await resolveProfileForConnect(activeProfile)
+            iosAppLogger.info("Connect requested profile=\(connectProfile.displayName, privacy: .public) kind=\(connectProfile.kind.rawValue, privacy: .public) endpoint=\(connectProfile.endpointHost ?? "unknown", privacy: .public)")
+            NSLog("RealAiVPN iOS Connect requested profile=%@ kind=%@ endpoint=%@ provider=%@",
+                  connectProfile.displayName,
+                  connectProfile.kind.rawValue,
+                  connectProfile.endpointHost ?? "unknown",
+                  providerBundleIdentifier(for: connectProfile))
             await vpnManager.connect(
-                configuration: vpnConfiguration,
-                transientAmneziaKey: nil,
+                configuration: vpnConfiguration(for: connectProfile),
+                transientAmneziaKey: connectProfile.config,
                 routingExceptions: routingExceptions
             )
+            tunnelDiagnostic = tunnelDiagnosticsStore.load()
+            NSLog("RealAiVPN iOS connect() returned from vpnManager")
             refreshStatusMessage()
         }
     }
 
     func disconnect() {
+        NSLog("RealAiVPN iOS disconnect() entered")
         suppressExpectedDisconnectNotification = true
         vpnManager.disconnect()
         message = "Disconnecting..."
@@ -431,6 +575,11 @@ final class iOSDashboardModel: ObservableObject {
 
     private func refreshStatusMessage() {
         let profileName = activeProfile?.displayName ?? "profile"
+        if let vpnLastError, !vpnLastError.isEmpty {
+            message = vpnLastError
+            refreshRoutePreview()
+            return
+        }
         switch vpnStatus {
         case .connected:
             message = "Connected to \(profileName)."
@@ -481,12 +630,83 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     private var vpnConfiguration: VPNProfileConfiguration {
+        vpnConfiguration(for: activeProfile)
+    }
+
+    private func vpnConfiguration(for profile: StoredAmneziaConfigProfile?) -> VPNProfileConfiguration {
         VPNProfileConfiguration(
-            localizedDescription: "Real Ai VPN",
-            providerBundleIdentifier: "com.codex.RealAiVPN.iOS.PacketTunnel",
-            serverID: activeProfile?.id ?? "real-ai-vpn-ios",
-            regionCode: activeProfile?.regionCode ?? "ZZ"
+            localizedDescription: localizedVPNDescription(for: profile),
+            providerBundleIdentifier: providerBundleIdentifier(for: profile),
+            serverID: profile?.id ?? "real-ai-vpn-ios",
+            regionCode: profile?.regionCode ?? "ZZ"
         )
+    }
+
+    private func localizedVPNDescription(for profile: StoredAmneziaConfigProfile?) -> String {
+        profile?.kind == .singBoxVLESSReality ? "Real Ai VPN VLESS" : "Real Ai VPN AWG"
+    }
+
+    private func providerBundleIdentifier(for profile: StoredAmneziaConfigProfile?) -> String {
+        profile?.kind == .singBoxVLESSReality
+            ? "com.codex.RealAiVPN.iOS.SingBoxPacketTunnel"
+            : "com.codex.RealAiVPN.iOS.PacketTunnel"
+    }
+
+    private func resolveProfileForConnect(_ profile: StoredAmneziaConfigProfile) async -> StoredAmneziaConfigProfile {
+        guard profile.kind != .singBoxVLESSReality else {
+            return profile
+        }
+
+        if let repaired = await repairLegacyShadowrocketProfileIfNeeded(profile) {
+            return repaired
+        }
+
+        return profile
+    }
+
+    private func repairLegacyShadowrocketProfileIfNeeded(_ profile: StoredAmneziaConfigProfile) async -> StoredAmneziaConfigProfile? {
+        let rawConfig = profile.config.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawConfig.isEmpty else {
+            return nil
+        }
+
+        do {
+            NSLog("RealAiVPN iOS repairLegacyShadowrocketProfileIfNeeded profile=%@ kind=%@",
+                  profile.displayName,
+                  profile.kind.rawValue)
+            let entries: [ShadowrocketVLESSProfileEntry]
+            if let subscriptionURL = try shadowrocketParser.subscriptionURL(from: rawConfig) {
+                iosAppLogger.info("Repairing legacy Shadowrocket subscription profile=\(profile.displayName, privacy: .public)")
+                NSLog("RealAiVPN iOS repairing Shadowrocket subscription profile=%@", profile.displayName)
+                let subscriptionText = try await fetchSubscription(from: subscriptionURL)
+                entries = try shadowrocketParser.parseEntries(subscriptionText)
+            } else {
+                entries = (try? shadowrocketParser.parseEntries(rawConfig)) ?? []
+            }
+
+            NSLog("RealAiVPN iOS legacy Shadowrocket parsed entries=%ld", entries.count)
+            guard !entries.isEmpty else {
+                return nil
+            }
+
+            try upsertShadowrocketEntries(entries, fallbackName: profile.displayName, makeFirstActive: true)
+            try profileStore.deleteProfile(id: profile.id)
+            reloadProfiles()
+
+            if let repaired = activeProfile, repaired.kind == .singBoxVLESSReality {
+                NSLog("RealAiVPN iOS repaired active profile=%@ endpoint=%@",
+                      repaired.displayName,
+                      repaired.endpointHost ?? "unknown")
+                message = "Converted Shadowrocket profile to VLESS Reality. Connecting \(repaired.displayName)..."
+                return repaired
+            }
+        } catch {
+            NSLog("RealAiVPN iOS legacy Shadowrocket repair failed: %@", error.localizedDescription)
+            iosAppLogger.error("Could not repair Shadowrocket profile: \(error.localizedDescription, privacy: .public)")
+            message = "Could not prepare Shadowrocket profile: \(error.localizedDescription)"
+        }
+
+        return nil
     }
 
     private var effectiveServers: [SmartVPNServer] {
@@ -495,7 +715,7 @@ final class iOSDashboardModel: ObservableObject {
                 id: profile.id,
                 region: RegionCode(profile.regionCode ?? "ZZ"),
                 displayName: profile.displayName,
-                protocolKind: .amneziaWG,
+                protocolKind: profile.kind == .singBoxVLESSReality ? .singBox : .amneziaWG,
                 lastLatencyMilliseconds: lastLatency(for: profile.id),
                 healthState: .healthy
             )
@@ -587,6 +807,7 @@ final class iOSDashboardModel: ObservableObject {
         }
 
         liveProbeResults = probes
+        tunnelDiagnostic = tunnelDiagnosticsStore.load()
         recordProbeReliabilitySamples(probes)
         lastProbeDate = Date()
         refreshRoutePreview()
@@ -690,6 +911,11 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     private func endpoint(for profile: StoredAmneziaConfigProfile) -> ProfileEndpoint? {
+        if profile.kind == .singBoxVLESSReality,
+           let shadowrocket = try? shadowrocketParser.parse(profile.config) {
+            return ProfileEndpoint(host: shadowrocket.host, port: shadowrocket.port)
+        }
+
         guard let decoded = try? decoder.decodeImportedWireGuardConfig(from: profile.config) else {
             return profile.endpointHost.map { ProfileEndpoint(host: $0, port: 51820) }
         }
@@ -743,6 +969,15 @@ final class iOSDashboardModel: ObservableObject {
             .map { String($0).uppercased() }
     }
 
+    private static func importErrorMessage(for error: Error, rawConfig: String) -> String {
+        if rawConfig.localizedCaseInsensitiveContains("\"type\"")
+            && rawConfig.localizedCaseInsensitiveContains("VLESS") {
+            return "Shadowrocket VLESS/Reality JSON was detected, but it could not be parsed: \(error.localizedDescription)"
+        }
+
+        return "Could not import profile: \(error.localizedDescription)"
+    }
+
     private static func routeTitle(
         for decision: RouteDecision,
         activeProfile: StoredAmneziaConfigProfile?,
@@ -793,7 +1028,7 @@ struct iOSDashboardView: View {
             .toolbar(.hidden, for: .navigationBar)
             .fileImporter(
                 isPresented: $importingProfile,
-                allowedContentTypes: [.plainText, .data],
+                allowedContentTypes: [.plainText, .json, .url, .data],
                 allowsMultipleSelection: false
             ) { result in
                 guard case .success(let urls) = result, let url = urls.first else {
@@ -866,6 +1101,8 @@ struct iOSDashboardView: View {
             .foregroundStyle(AppTheme.accent)
 
             Button {
+                NSLog("RealAiVPN iOS main connect button tapped connectedOrConnecting=%@",
+                      model.isConnectedOrConnecting ? "true" : "false")
                 model.isConnectedOrConnecting ? model.disconnect() : model.connect()
             } label: {
                 Label(
@@ -894,27 +1131,46 @@ struct iOSDashboardView: View {
                     .padding(.vertical, 20)
             } else {
                 ForEach(model.profiles) { profile in
-                    Button {
-                        model.setActiveProfile(id: profile.id)
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: model.activeProfileID == profile.id ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(AppTheme.accent)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(profile.displayName)
-                                    .font(.headline)
-                                    .foregroundStyle(AppTheme.primaryText)
-                                Text("\(profile.regionCode ?? "Unknown") · \(profile.endpointHost ?? "endpoint hidden")")
-                                    .font(.subheadline)
-                                    .foregroundStyle(AppTheme.secondaryText)
+                    HStack(spacing: 10) {
+                        Button {
+                            NSLog("RealAiVPN iOS profile row tapped id=%@ name=%@ kind=%@ endpoint=%@",
+                                  profile.id,
+                                  profile.displayName,
+                                  profile.kind.rawValue,
+                                  profile.endpointHost ?? "unknown")
+                            model.setActiveProfile(id: profile.id)
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: model.activeProfile?.id == profile.id ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(AppTheme.accent)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(profile.displayName)
+                                        .font(.headline)
+                                        .foregroundStyle(AppTheme.primaryText)
+                                    Text("\(profile.regionCode ?? "Unknown") · \(profile.endpointHost ?? "endpoint hidden")")
+                                        .font(.subheadline)
+                                        .foregroundStyle(AppTheme.secondaryText)
+                                }
+                                Spacer()
+                                Text(profile.kind.rawValue)
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(AppTheme.accent)
                             }
-                            Spacer()
-                            Text(profile.kind.rawValue)
-                                .font(.caption.weight(.bold))
-                                .foregroundStyle(AppTheme.accent)
                         }
+                        .buttonStyle(.plain)
+
+                        Button(role: .destructive) {
+                            model.deleteProfile(id: profile.id)
+                        } label: {
+                            Image(systemName: "trash")
+                                .font(.callout.weight(.bold))
+                                .frame(width: 42, height: 42)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.red)
+                        .accessibilityLabel("Delete \(profile.displayName)")
                     }
-                    .buttonStyle(.plain)
                     .padding(14)
                     .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
@@ -1119,6 +1375,20 @@ struct iOSDashboardView: View {
             Text(model.message)
                 .foregroundStyle(AppTheme.secondaryText)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            if let provider = model.vpnProviderBundleIdentifier {
+                Text(provider)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(AppTheme.secondaryText.opacity(0.75))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            if let diagnostic = model.tunnelDiagnostic {
+                Text("\(diagnostic.stage): \(diagnostic.message)")
+                    .font(.caption)
+                    .foregroundStyle(AppTheme.warning)
+                    .lineLimit(4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .padding(18)
         .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))

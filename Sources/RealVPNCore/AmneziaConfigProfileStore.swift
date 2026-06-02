@@ -24,6 +24,7 @@ public enum AmneziaConfigProfileStoreError: LocalizedError, Equatable {
 public struct StoredAmneziaConfigProfile: Codable, Equatable, Identifiable, Sendable {
     public enum Kind: String, Codable, Sendable {
         case awgConfig = "AWG Config"
+        case singBoxVLESSReality = "VLESS Reality"
         case premiumToken = "Premium Token"
         case unknown = "Config"
     }

@@ -17,6 +17,12 @@ private final class MacNotificationDelegate: NSObject, UNUserNotificationCenterD
     }
 }
 
+private final class MacAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+}
+
 private enum AppVisibilityMode: String, CaseIterable, Identifiable {
     case menuBarOnly
     case dockOnly
@@ -63,6 +69,7 @@ private enum AppVisibilityMode: String, CaseIterable, Identifiable {
 @main
 struct SmartVPNMacApp: App {
     private static let notificationDelegate = MacNotificationDelegate()
+    @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var appDelegate
     @Environment(\.openWindow) private var openWindow
     @AppStorage("appVisibilityMode") private var appVisibilityModeRaw = AppVisibilityMode.dockAndMenuBar.rawValue
     @StateObject private var model = DashboardModel()
@@ -375,6 +382,7 @@ final class DashboardModel: ObservableObject {
         case none = "No Config"
         case premiumToken = "Premium Token"
         case awgConfig = "AWG Config"
+        case singBoxVLESSReality = "VLESS Reality"
         case unknown = "Config"
     }
 
@@ -424,6 +432,7 @@ final class DashboardModel: ObservableObject {
 
     private let selector = SmartServerSelector()
     private let amneziaDecoder = AmneziaConfigDecoder()
+    private let shadowrocketParser = ShadowrocketVLESSConfigParser()
     private let vpnManager = RealVPNProfileManager()
     private let premiumKeyStore = AmneziaPremiumKeyStore(accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup)
     private let profileStore = AmneziaConfigProfileStore(accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup)
@@ -672,7 +681,7 @@ final class DashboardModel: ObservableObject {
             }
 
             do {
-                _ = try amneziaDecoder.decodeImportedWireGuardConfig(from: amneziaKey)
+                try validateConfigForConnect(amneziaKey, profileKind: activeConfigProfile?.kind)
             } catch {
                 vpnErrorMessage = "The saved Amnezia config cannot be used yet: \(error.localizedDescription)"
                 vpnStatus = .disconnected
@@ -681,7 +690,7 @@ final class DashboardModel: ObservableObject {
 
             await vpnManager.connect(
                 configuration: vpnConfiguration,
-                transientAmneziaKey: nil,
+                transientAmneziaKey: amneziaKey,
                 routingExceptions: routingExceptions
             )
         }
@@ -722,6 +731,18 @@ final class DashboardModel: ObservableObject {
 
     func saveAmneziaPremiumKey(_ key: String) -> String? {
         do {
+            let shadowrocketEntries = (try? shadowrocketParser.parseEntries(key)) ?? []
+            if let entry = shadowrocketEntries.first {
+                try upsertShadowrocketEntries(
+                    shadowrocketEntries,
+                    fallbackName: entry.profile.title,
+                    makeFirstActive: true
+                )
+                refreshPremiumKeyState()
+                vpnErrorMessage = nil
+                return nil
+            }
+
             let decoded = try amneziaDecoder.decodeImportedWireGuardConfig(from: key)
             try premiumKeyStore.save(key)
             let profile = makeProfile(
@@ -740,7 +761,41 @@ final class DashboardModel: ObservableObject {
     }
 
     func importAmneziaConfigProfile(name: String, rawConfig: String) -> String? {
+        importAmneziaConfigProfileSync(name: name, rawConfig: rawConfig)
+    }
+
+    func importAmneziaConfigProfile(name: String, rawConfig: String) async -> String? {
         do {
+            if let subscriptionURL = try shadowrocketParser.subscriptionURL(from: rawConfig) {
+                let subscriptionText = try await fetchSubscription(from: subscriptionURL)
+                let entries = try shadowrocketParser.parseEntries(subscriptionText)
+                try upsertShadowrocketEntries(entries, fallbackName: name, makeFirstActive: true)
+                refreshPremiumKeyState()
+                vpnErrorMessage = nil
+                return nil
+            }
+
+            return importAmneziaConfigProfileSync(name: name, rawConfig: rawConfig)
+        } catch {
+            refreshPremiumKeyState()
+            return "The subscription cannot be imported yet: \(error.localizedDescription)"
+        }
+    }
+
+    private func importAmneziaConfigProfileSync(name: String, rawConfig: String) -> String? {
+        do {
+            let shadowrocketEntries = (try? shadowrocketParser.parseEntries(rawConfig)) ?? []
+            if !shadowrocketEntries.isEmpty {
+                try upsertShadowrocketEntries(
+                    shadowrocketEntries,
+                    fallbackName: name,
+                    makeFirstActive: true
+                )
+                refreshPremiumKeyState()
+                vpnErrorMessage = nil
+                return nil
+            }
+
             let decoded = try amneziaDecoder.decodeImportedWireGuardConfig(from: rawConfig)
             let profile = makeProfile(name: name, rawConfig: rawConfig, decodedConfig: decoded)
             try profileStore.upsert(profile)
@@ -750,7 +805,35 @@ final class DashboardModel: ObservableObject {
             return nil
         } catch {
             refreshPremiumKeyState()
-            return "The Amnezia config cannot be used yet: \(error.localizedDescription)"
+            return "The config cannot be used yet as AmneziaWG or Shadowrocket VLESS/Reality: \(error.localizedDescription)"
+        }
+    }
+
+    private func fetchSubscription(from url: URL) async throws -> String {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 20
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let response = response as? HTTPURLResponse,
+           !(200..<300).contains(response.statusCode) {
+            throw URLError(.badServerResponse)
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func upsertShadowrocketEntries(
+        _ entries: [ShadowrocketVLESSProfileEntry],
+        fallbackName: String,
+        makeFirstActive: Bool
+    ) throws {
+        for (index, entry) in entries.enumerated() {
+            let name = entry.profile.title.isEmpty ? fallbackName : entry.profile.title
+            let profile = makeShadowrocketProfile(
+                name: entries.count == 1 ? name : "\(name)",
+                rawConfig: entry.rawConfig,
+                shadowrocketConfig: entry.profile
+            )
+            try profileStore.upsert(profile, makeActive: makeFirstActive && index == 0)
         }
     }
 
@@ -857,6 +940,10 @@ final class DashboardModel: ObservableObject {
             return .awgConfig
         }
 
+        if (try? shadowrocketParser.parseEntries(trimmed))?.isEmpty == false {
+            return .singBoxVLESSReality
+        }
+
         if trimmed.hasPrefix("vpn://") {
             return .premiumToken
         }
@@ -864,14 +951,34 @@ final class DashboardModel: ObservableObject {
         return .unknown
     }
 
+    private func validateConfigForConnect(_ value: String, profileKind: StoredAmneziaConfigProfile.Kind?) throws {
+        if profileKind == .singBoxVLESSReality {
+            _ = try shadowrocketParser.parse(value)
+            return
+        }
+
+        if (try? shadowrocketParser.parseEntries(value))?.isEmpty == false {
+            return
+        }
+
+        _ = try amneziaDecoder.decodeImportedWireGuardConfig(from: value)
+    }
+
     private var vpnConfiguration: VPNProfileConfiguration {
         let server = servers.first { $0.id == activeServerID } ?? servers[0]
         let activeProfile = activeConfigProfile
 
         return VPNProfileConfiguration(
+            providerBundleIdentifier: providerBundleIdentifier(for: activeProfile),
             serverID: activeProfile?.endpointHost ?? server.id,
             regionCode: activeProfile?.regionCode ?? server.region.rawValue
         )
+    }
+
+    private func providerBundleIdentifier(for profile: StoredAmneziaConfigProfile?) -> String {
+        profile?.kind == .singBoxVLESSReality
+            ? "com.codex.RealAiVPN.SingBoxPacketTunnel"
+            : "com.codex.RealAiVPN.PacketTunnel"
     }
 
     private var effectiveServers: [SmartVPNServer] {
@@ -884,7 +991,7 @@ final class DashboardModel: ObservableObject {
                 id: profile.id,
                 region: RegionCode(profile.regionCode ?? "ZZ"),
                 displayName: profile.displayName,
-                protocolKind: .amneziaWG,
+                protocolKind: profile.kind == .singBoxVLESSReality ? .singBox : .amneziaWG,
                 lastLatencyMilliseconds: lastLatency(for: profile.id),
                 healthState: .healthy
             )
@@ -916,6 +1023,28 @@ final class DashboardModel: ObservableObject {
             kind: .awgConfig,
             regionCode: region,
             endpointHost: endpointHost,
+            config: rawConfig
+        )
+    }
+
+    private func makeShadowrocketProfile(
+        name: String,
+        rawConfig: String,
+        shadowrocketConfig: ShadowrocketVLESSConfig
+    ) -> StoredAmneziaConfigProfile {
+        var displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if displayName.lowercased().hasSuffix(".json") {
+            displayName.removeLast(".json".count)
+        }
+        if displayName.isEmpty {
+            displayName = shadowrocketConfig.title.isEmpty ? "VLESS Reality" : shadowrocketConfig.title
+        }
+
+        return StoredAmneziaConfigProfile(
+            displayName: displayName,
+            kind: .singBoxVLESSReality,
+            regionCode: shadowrocketConfig.regionCode ?? inferRegion(from: displayName),
+            endpointHost: shadowrocketConfig.host,
             config: rawConfig
         )
     }
@@ -1083,6 +1212,11 @@ final class DashboardModel: ObservableObject {
     }
 
     private func endpoint(for profile: StoredAmneziaConfigProfile) -> ProfileEndpoint? {
+        if profile.kind == .singBoxVLESSReality,
+           let parsed = try? shadowrocketParser.parse(profile.config) {
+            return ProfileEndpoint(host: parsed.host, port: parsed.port)
+        }
+
         guard let decoded = try? amneziaDecoder.decodeImportedWireGuardConfig(from: profile.config) else {
             return profile.endpointHost.map { ProfileEndpoint(host: $0, port: 51820) }
         }
@@ -1817,7 +1951,13 @@ struct SettingsView: View {
         }
         .fileImporter(
             isPresented: $showConfigImporter,
-            allowedContentTypes: [.plainText, .data, UTType(filenameExtension: "conf") ?? .data],
+            allowedContentTypes: [
+                .plainText,
+                .json,
+                .url,
+                .data,
+                UTType(filenameExtension: "conf") ?? .data
+            ],
             allowsMultipleSelection: false
         ) { result in
             switch result {
@@ -1833,11 +1973,13 @@ struct SettingsView: View {
                         }
                     }
                     let imported = try String(contentsOf: url, encoding: .utf8)
-                    if let error = model.importAmneziaConfigProfile(name: url.lastPathComponent, rawConfig: imported) {
-                        message = error
-                    } else {
-                        amneziaKey = imported
-                        message = "Imported \(url.lastPathComponent) as the active profile."
+                    Task {
+                        if let error = await model.importAmneziaConfigProfile(name: url.lastPathComponent, rawConfig: imported) {
+                            message = error
+                        } else {
+                            amneziaKey = model.loadAmneziaPremiumKeyForEditing()
+                            message = "Imported \(url.lastPathComponent) as the active profile."
+                        }
                     }
                 } catch {
                     message = "Could not import \(url.lastPathComponent): \(error.localizedDescription)"

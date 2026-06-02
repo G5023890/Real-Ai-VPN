@@ -1,5 +1,11 @@
 import Foundation
 import NetworkExtension
+import os
+
+private let vpnProfileLogger = Logger(
+    subsystem: "com.codex.RealAiVPN",
+    category: "VPNProfileManager"
+)
 
 public enum VPNConnectionStatus: String, Hashable, Codable, Sendable {
     case invalid
@@ -66,6 +72,7 @@ public enum RealVPNProfileError: LocalizedError, Equatable {
 public final class RealVPNProfileManager: ObservableObject {
     @Published public private(set) var status: VPNConnectionStatus = .unknown
     @Published public private(set) var lastErrorMessage: String?
+    @Published public private(set) var lastProviderBundleIdentifier: String?
 
     private var manager: NETunnelProviderManager?
     private var observer: NSObjectProtocol?
@@ -90,9 +97,16 @@ public final class RealVPNProfileManager: ObservableObject {
 
     public func prepareProfile(configuration: VPNProfileConfiguration) async {
         do {
+            vpnProfileLogger.info("Preparing VPN profile provider=\(configuration.providerBundleIdentifier, privacy: .public) serverID=\(configuration.serverID, privacy: .public)")
+            NSLog("RealAiVPN VPNProfileManager prepare provider=%@ serverID=%@",
+                  configuration.providerBundleIdentifier,
+                  configuration.serverID)
             manager = try await loadOrCreateManager(configuration: configuration)
+            lastProviderBundleIdentifier = configuration.providerBundleIdentifier
             refreshStatus()
         } catch {
+            vpnProfileLogger.error("Could not prepare VPN profile: \(error.localizedDescription, privacy: .public)")
+            NSLog("RealAiVPN VPNProfileManager prepare failed: %@", error.localizedDescription)
             lastErrorMessage = error.localizedDescription
             status = .unknown
         }
@@ -104,6 +118,13 @@ public final class RealVPNProfileManager: ObservableObject {
         routingExceptions: RoutingExceptionCollection = RoutingExceptionCollection()
     ) async {
         do {
+            vpnProfileLogger.info("Starting VPN provider=\(configuration.providerBundleIdentifier, privacy: .public) serverID=\(configuration.serverID, privacy: .public) hasConfig=\((transientAmneziaKey?.isEmpty == false), privacy: .public)")
+            NSLog("RealAiVPN VPNProfileManager connect provider=%@ serverID=%@ hasConfig=%@",
+                  configuration.providerBundleIdentifier,
+                  configuration.serverID,
+                  (transientAmneziaKey?.isEmpty == false) ? "true" : "false")
+            lastErrorMessage = nil
+            lastProviderBundleIdentifier = configuration.providerBundleIdentifier
             let manager = try await loadOrCreateManager(configuration: configuration)
             self.manager = manager
             try await save(manager)
@@ -115,18 +136,29 @@ public final class RealVPNProfileManager: ObservableObject {
                 options["routingExceptions"] = encodedExceptions as NSString
             }
             try manager.connection.startVPNTunnel(options: options)
-            refreshStatus()
-            lastErrorMessage = nil
+            await waitForSettledStatus()
+            vpnProfileLogger.info("startVPNTunnel returned status=\(self.status.rawValue, privacy: .public)")
+            NSLog("RealAiVPN VPNProfileManager startVPNTunnel returned status=%@",
+                  self.status.rawValue)
+            if status == .disconnected || status == .invalid {
+                lastErrorMessage = "NetworkExtension returned \(status.rawValue) after start for \(configuration.providerBundleIdentifier)."
+            }
         } catch let error as RealVPNProfileError {
+            vpnProfileLogger.error("VPN start failed: \(error.localizedDescription, privacy: .public)")
+            NSLog("RealAiVPN VPNProfileManager start failed: %@", error.localizedDescription)
             lastErrorMessage = error.localizedDescription
             status = .disconnected
         } catch {
+            vpnProfileLogger.error("VPN start failed: \(error.localizedDescription, privacy: .public)")
+            NSLog("RealAiVPN VPNProfileManager start failed: %@", error.localizedDescription)
             lastErrorMessage = RealVPNProfileError.startFailed(error.localizedDescription).localizedDescription
             status = .disconnected
         }
     }
 
     public func disconnect() {
+        vpnProfileLogger.info("Stopping VPN tunnel")
+        NSLog("RealAiVPN VPNProfileManager disconnect")
         manager?.connection.stopVPNTunnel()
         refreshStatus()
     }
@@ -149,7 +181,28 @@ public final class RealVPNProfileManager: ObservableObject {
             throw RealVPNProfileError.preferencesLoadFailed(error.localizedDescription)
         }
 
-        let manager = managers.first { $0.localizedDescription == configuration.localizedDescription } ?? NETunnelProviderManager()
+        let manager = managers.first {
+            guard $0.localizedDescription == configuration.localizedDescription,
+                  let protocolConfiguration = $0.protocolConfiguration as? NETunnelProviderProtocol else {
+                return false
+            }
+            return protocolConfiguration.providerBundleIdentifier == configuration.providerBundleIdentifier
+        } ?? managers.first {
+            guard $0.localizedDescription == "Real Ai VPN",
+                  let protocolConfiguration = $0.protocolConfiguration as? NETunnelProviderProtocol else {
+                return false
+            }
+            return protocolConfiguration.providerBundleIdentifier == configuration.providerBundleIdentifier
+        } ?? NETunnelProviderManager()
+        NSLog("RealAiVPN VPNProfileManager loadOrCreate matchedExisting=%@ provider=%@",
+              managers.contains(where: {
+                  guard $0.localizedDescription == configuration.localizedDescription,
+                        let protocolConfiguration = $0.protocolConfiguration as? NETunnelProviderProtocol else {
+                      return false
+                  }
+                  return protocolConfiguration.providerBundleIdentifier == configuration.providerBundleIdentifier
+              }) ? "true" : "false",
+              configuration.providerBundleIdentifier)
         let protocolConfiguration = NETunnelProviderProtocol()
         protocolConfiguration.providerBundleIdentifier = configuration.providerBundleIdentifier
         protocolConfiguration.serverAddress = configuration.serverID
@@ -173,6 +226,19 @@ public final class RealVPNProfileManager: ObservableObject {
         } catch {
             throw RealVPNProfileError.preferencesSaveFailed(error.localizedDescription)
         }
+    }
+
+    private func waitForSettledStatus(timeoutSeconds: Double = 8) async {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        repeat {
+            refreshStatus()
+            if status == .connected || status == .reasserting || status == .disconnected || status == .invalid {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+        } while Date() < deadline
+
+        refreshStatus()
     }
 }
 

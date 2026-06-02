@@ -5,3 +5,4 @@ dist/
 DerivedData/
 *.xcuserstate
 xcuserdata/
+third_party/sing-box/Libbox.xcframework/

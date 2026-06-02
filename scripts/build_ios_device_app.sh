@@ -8,7 +8,7 @@ SCHEME="${SCHEME:-RealAiVPNiOS}"
 CONFIGURATION="${CONFIGURATION:-Debug}"
 TEAM_ID="${TEAM_ID:-9FP39GTDT5}"
 DERIVED_DATA_ROOT="${DERIVED_DATA_ROOT:-$PROJECT_DIR/.build/xcode-ios-device}"
-APP_VERSION="${APP_VERSION:-0.75}"
+APP_VERSION="${APP_VERSION:-0.86}"
 BUILD_STAMP="${BUILD_STAMP:-$(date '+%H%M%S%d%m%Y')}"
 BUILD_LABEL="${BUILD_LABEL:-${APP_VERSION} (${BUILD_STAMP})}"
 TOP_LEVEL_GO_OUT="$PROJECT_DIR/Sources/WireGuardKitGo/out"
@@ -54,7 +54,7 @@ cp "$IOS_GO_OUT/wireguard-go-version.h" \
   "$TOP_LEVEL_GO_OUT/wireguard-go-version.h"
 
 log "Generating Xcode project"
-xcodegen generate
+"$PROJECT_DIR/scripts/xcodegen_generate.sh"
 
 log "Building iOS app for a real device destination"
 xcodebuild \

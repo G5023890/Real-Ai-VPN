@@ -16,7 +16,7 @@ TEAM_ID="${TEAM_ID:-9FP39GTDT5}"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 SKIP_SIGN="${SKIP_SIGN:-0}"
 LAUNCH_AFTER_INSTALL="${LAUNCH_AFTER_INSTALL:-1}"
-APP_VERSION="${APP_VERSION:-0.75}"
+APP_VERSION="${APP_VERSION:-0.86}"
 BUILD_STAMP="${BUILD_STAMP:-$(date '+%H%M%S%d%m%Y')}"
 BUILD_LABEL="${BUILD_LABEL:-${APP_VERSION} (${BUILD_STAMP})}"
 RESOLVED_SIGN_IDENTITY=""
@@ -110,7 +110,7 @@ cp "$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo/out/libwg-go
 cp "$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo/out/wireguard-go-version.h" "$PROJECT_DIR/Sources/WireGuardKitGo/out/wireguard-go-version.h"
 
 log "Generating Xcode project"
-xcodegen generate
+"$PROJECT_DIR/scripts/xcodegen_generate.sh"
 
 log "Building app bundle with embedded Packet Tunnel Extension"
 xcodebuild \

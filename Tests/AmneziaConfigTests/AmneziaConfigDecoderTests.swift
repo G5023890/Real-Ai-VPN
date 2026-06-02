@@ -130,6 +130,134 @@ final class AmneziaConfigDecoderTests: XCTestCase {
         XCTAssertTrue(config.redactedSummary.contains("203.0.113.10:51820"))
     }
 
+    func testDecodeShadowrocketVLESSRealityConfig() throws {
+        let rawConfig = """
+        {
+          "type": "VLESS",
+          "title": "DE Reality",
+          "flag": "DE",
+          "host": "example-vless.test",
+          "port": "47538",
+          "password": "02d97ea8-7018-48ea-add8-9f6634e43e85",
+          "peer": "example.com",
+          "publicKey": "test-public-key",
+          "shortId": "d8a1ea76",
+          "fp": "random",
+          "spx": "/",
+          "xtls": "2",
+          "udp": "1"
+        }
+        """
+
+        let config = try ShadowrocketVLESSConfigParser().parse(rawConfig)
+
+        XCTAssertEqual(config.title, "DE Reality")
+        XCTAssertEqual(config.regionCode, "DE")
+        XCTAssertEqual(config.host, "example-vless.test")
+        XCTAssertEqual(config.port, 47538)
+        XCTAssertEqual(config.peer, "example.com")
+        XCTAssertEqual(config.publicKey, "test-public-key")
+        XCTAssertEqual(config.shortID, "d8a1ea76")
+        XCTAssertEqual(config.flow, "xtls-rprx-vision")
+        XCTAssertEqual(config.fingerprint, "random")
+        XCTAssertEqual(config.spiderX, "/")
+        XCTAssertTrue(config.udp)
+    }
+
+    func testDecodeVLESSRealityURL() throws {
+        let rawURL = "vless://02d97ea8-7018-48ea-add8-9f6634e43e85@example-vless.test:47538?security=reality&sni=example.com&pbk=test-public-key&sid=d8a1ea76&flow=xtls-rprx-vision&fp=random&spx=%2F#DE%20Reality"
+
+        let config = try ShadowrocketVLESSConfigParser().parse(rawURL)
+
+        XCTAssertEqual(config.title, "DE Reality")
+        XCTAssertEqual(config.host, "example-vless.test")
+        XCTAssertEqual(config.port, 47538)
+        XCTAssertEqual(config.uuid, "02d97ea8-7018-48ea-add8-9f6634e43e85")
+        XCTAssertEqual(config.peer, "example.com")
+        XCTAssertEqual(config.publicKey, "test-public-key")
+        XCTAssertEqual(config.shortID, "d8a1ea76")
+        XCTAssertEqual(config.flow, "xtls-rprx-vision")
+        XCTAssertEqual(config.fingerprint, "random")
+        XCTAssertEqual(config.spiderX, "/")
+    }
+
+    func testDecodeBase64SubscriptionPayloadWithVLESSAndUnsupportedEntries() throws {
+        let rawURL = "vless://02d97ea8-7018-48ea-add8-9f6634e43e85@example-vless.test:47538?security=reality&sni=example.com&pbk=test-public-key&sid=d8a1ea76#DE"
+        let mixedPayload = "hy2://ignored.example.test:443\n\(rawURL)\n"
+        let encoded = Data(mixedPayload.utf8).base64EncodedString()
+
+        let entries = try ShadowrocketVLESSConfigParser().parseEntries(encoded)
+
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries[0].profile.title, "DE")
+        XCTAssertEqual(entries[0].profile.host, "example-vless.test")
+        XCTAssertEqual(entries[0].rawConfig, rawURL)
+    }
+
+    func testDetectShadowrocketSubscribeURL() throws {
+        let subscribeJSON = """
+        {
+          "type": "Subscribe",
+          "host": "https://example.test/subscription"
+        }
+        """
+
+        let url = try ShadowrocketVLESSConfigParser().subscriptionURL(from: subscribeJSON)
+
+        XCTAssertEqual(url?.absoluteString, "https://example.test/subscription")
+    }
+
+    func testBuildSingBoxConfigFromShadowrocketVLESSReality() throws {
+        let profile = ShadowrocketVLESSConfig(
+            title: "DE Reality",
+            regionCode: "DE",
+            host: "example-vless.test",
+            port: 47538,
+            uuid: "02d97ea8-7018-48ea-add8-9f6634e43e85",
+            peer: "example.com",
+            publicKey: "test-public-key",
+            shortID: "d8a1ea76",
+            flow: "xtls-rprx-vision",
+            fingerprint: "chrome",
+            spiderX: "",
+            udp: true
+        )
+
+        let config = try SingBoxConfigBuilder().build(from: profile)
+        let data = try XCTUnwrap(config.jsonString.data(using: .utf8))
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let outbounds = try XCTUnwrap(root["outbounds"] as? [[String: Any]])
+        let proxy = try XCTUnwrap(outbounds.first)
+        let tls = try XCTUnwrap(proxy["tls"] as? [String: Any])
+        let reality = try XCTUnwrap(tls["reality"] as? [String: Any])
+        let utls = try XCTUnwrap(tls["utls"] as? [String: Any])
+        let route = try XCTUnwrap(root["route"] as? [String: Any])
+        let rules = try XCTUnwrap(route["rules"] as? [[String: Any]])
+        let directDomainRule = try XCTUnwrap(rules.first { ($0["outbound"] as? String) == "direct" && $0["domain_suffix"] != nil })
+        let directDomainSuffixes = try XCTUnwrap(directDomainRule["domain_suffix"] as? [String])
+        let dns = try XCTUnwrap(root["dns"] as? [String: Any])
+        let dnsServers = try XCTUnwrap(dns["servers"] as? [[String: Any]])
+        let cloudflareDNS = try XCTUnwrap(dnsServers.first)
+
+        XCTAssertEqual(proxy["type"] as? String, "vless")
+        XCTAssertEqual(proxy["server"] as? String, "example-vless.test")
+        XCTAssertEqual(proxy["server_port"] as? Int, 47538)
+        XCTAssertEqual(proxy["uuid"] as? String, "02d97ea8-7018-48ea-add8-9f6634e43e85")
+        XCTAssertEqual(proxy["flow"] as? String, "xtls-rprx-vision")
+        XCTAssertEqual(tls["server_name"] as? String, "example.com")
+        XCTAssertEqual(utls["fingerprint"] as? String, "chrome")
+        XCTAssertEqual(reality["public_key"] as? String, "test-public-key")
+        XCTAssertEqual(reality["short_id"] as? String, "d8a1ea76")
+        XCTAssertNil(reality["spider_x"])
+        XCTAssertTrue(directDomainSuffixes.contains("ru"))
+        XCTAssertEqual(dns["final"] as? String, "cloudflare")
+        XCTAssertEqual(cloudflareDNS["tag"] as? String, "cloudflare")
+        XCTAssertEqual(cloudflareDNS["type"] as? String, "tls")
+        XCTAssertEqual(cloudflareDNS["server"] as? String, "1.1.1.1")
+        XCTAssertEqual(cloudflareDNS["server_port"] as? Int, 853)
+        XCTAssertNil(cloudflareDNS["address"])
+    }
+
     private func makeVPNURL(payload: Data, declaredSize: Int? = nil) throws -> String {
         var compressed = Data(count: payload.count + 64)
 
