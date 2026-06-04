@@ -258,6 +258,44 @@ final class AmneziaConfigDecoderTests: XCTestCase {
         XCTAssertNil(cloudflareDNS["address"])
     }
 
+    func testSingBoxRouteOverridesNormalizeRawIPAddressExceptions() throws {
+        let profile = ShadowrocketVLESSConfig(
+            title: "DE Reality",
+            regionCode: "DE",
+            host: "example-vless.test",
+            port: 47538,
+            uuid: "02d97ea8-7018-48ea-add8-9f6634e43e85",
+            peer: "example.com",
+            publicKey: "test-public-key",
+            shortID: "d8a1ea76",
+            flow: "xtls-rprx-vision",
+            fingerprint: "chrome",
+            spiderX: "",
+            udp: true
+        )
+        let overrides = SingBoxRouteOverrides(
+            forceVPNIPCIDRs: ["1.1.1.1"],
+            bypassVPNIPCIDRs: ["212.11.151.58", "bad-hostname"],
+            systemRouteExcludeIPCIDRs: ["212.11.151.58", "2001:db8::1"]
+        )
+
+        let config = try SingBoxConfigBuilder().build(from: profile, routeOverrides: overrides)
+        let data = try XCTUnwrap(config.jsonString.data(using: .utf8))
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let inbounds = try XCTUnwrap(root["inbounds"] as? [[String: Any]])
+        let tun = try XCTUnwrap(inbounds.first)
+        let routeExcludeAddress = try XCTUnwrap(tun["route_exclude_address"] as? [String])
+        let route = try XCTUnwrap(root["route"] as? [String: Any])
+        let rules = try XCTUnwrap(route["rules"] as? [[String: Any]])
+        let allIPCIDRs = rules.compactMap { $0["ip_cidr"] as? [String] }.flatMap { $0 }
+
+        XCTAssertTrue(routeExcludeAddress.contains("212.11.151.58/32"))
+        XCTAssertTrue(routeExcludeAddress.contains("2001:db8::1/128"))
+        XCTAssertTrue(allIPCIDRs.contains("1.1.1.1/32"))
+        XCTAssertTrue(allIPCIDRs.contains("212.11.151.58/32"))
+        XCTAssertFalse(allIPCIDRs.contains("bad-hostname"))
+    }
+
     private func makeVPNURL(payload: Data, declaredSize: Int? = nil) throws -> String {
         var compressed = Data(count: payload.count + 64)
 

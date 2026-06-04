@@ -24,22 +24,29 @@ public struct TunnelDiagnosticsStore: Sendable {
 
     private let suiteName: String
     private let key = "real_ai_vpn.last_tunnel_diagnostic"
+    private let fallbackFileURL = URL(fileURLWithPath: "/tmp/real-ai-vpn-last-tunnel-diagnostic.json")
 
     public init(suiteName: String = Self.suiteName) {
         self.suiteName = suiteName
     }
 
     public func save(_ snapshot: TunnelDiagnosticSnapshot) {
-        guard let data = try? JSONEncoder().encode(snapshot),
-              let defaults = UserDefaults(suiteName: suiteName) else {
+        guard let data = try? JSONEncoder().encode(snapshot) else {
             return
         }
-        defaults.set(data, forKey: key)
+        if let defaults = UserDefaults(suiteName: suiteName) {
+            defaults.set(data, forKey: key)
+        }
+        try? data.write(to: fallbackFileURL, options: [.atomic])
     }
 
     public func load() -> TunnelDiagnosticSnapshot? {
-        guard let defaults = UserDefaults(suiteName: suiteName),
-              let data = defaults.data(forKey: key) else {
+        if let defaults = UserDefaults(suiteName: suiteName),
+           let data = defaults.data(forKey: key),
+           let snapshot = try? JSONDecoder().decode(TunnelDiagnosticSnapshot.self, from: data) {
+            return snapshot
+        }
+        guard let data = try? Data(contentsOf: fallbackFileURL) else {
             return nil
         }
         return try? JSONDecoder().decode(TunnelDiagnosticSnapshot.self, from: data)

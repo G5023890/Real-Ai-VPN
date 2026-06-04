@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 public enum ShadowrocketVLESSConfigError: LocalizedError, Equatable {
     case invalidJSON
@@ -395,8 +398,7 @@ public struct SingBoxConfigBuilder: Sendable {
         ]
 
         let routeExcludeAddresses = routeOverrides.systemRouteExcludeIPCIDRs
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+            .compactMap(normalizedIPPrefix)
             .uniqued()
         if !routeExcludeAddresses.isEmpty {
             tunInbound["route_exclude_address"] = routeExcludeAddresses
@@ -457,8 +459,7 @@ public struct SingBoxConfigBuilder: Sendable {
         }
 
         let normalizedIPCIDRs = ipCIDRs
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+            .compactMap(normalizedIPPrefix)
             .uniqued()
         if !normalizedIPCIDRs.isEmpty {
             rules.append([
@@ -466,6 +467,28 @@ public struct SingBoxConfigBuilder: Sendable {
                 "outbound": outbound
             ])
         }
+    }
+
+    private func normalizedIPPrefix(_ value: String) -> String? {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            return nil
+        }
+        if normalized.contains("/") {
+            return normalized
+        }
+
+        var ipv4 = in_addr()
+        if inet_pton(AF_INET, normalized, &ipv4) == 1 {
+            return "\(normalized)/32"
+        }
+
+        var ipv6 = in6_addr()
+        if inet_pton(AF_INET6, normalized, &ipv6) == 1 {
+            return "\(normalized)/128"
+        }
+
+        return nil
     }
 
     private func normalizedDomainSuffix(_ value: String) -> String {

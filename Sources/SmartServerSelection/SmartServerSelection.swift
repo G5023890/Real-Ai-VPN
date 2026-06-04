@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(CoreML)
+import CoreML
+#endif
 
 public struct RegionCode: Hashable, Codable, Sendable, ExpressibleByStringLiteral, CustomStringConvertible {
     public let rawValue: String
@@ -134,6 +137,7 @@ public enum ProbeMethod: String, Codable, Sendable {
     case tcpConnect
     case dnsQuery
     case httpHead
+    case httpGet
     case tunnelHandshake
 }
 
@@ -327,13 +331,25 @@ private struct ProbeReliabilityKey: Hashable {
 
 public enum PathHealthState: String, Codable, Sendable {
     case healthy
-    case degraded
+    case degradedSoft
+    case degradedHard
     case stalled
     case down
+    case connectedButUnusable
+
+    public var isSwitchEligible: Bool {
+        switch self {
+        case .stalled, .down, .connectedButUnusable:
+            return true
+        case .healthy, .degradedSoft, .degradedHard:
+            return false
+        }
+    }
 }
 
 public struct PathHealthReport: Hashable, Codable, Sendable {
     public var state: PathHealthState
+    public var healthScore: Double
     public var successRate: Double
     public var averageLatencyMilliseconds: Double?
     public var averagePacketLoss: Double
@@ -342,6 +358,7 @@ public struct PathHealthReport: Hashable, Codable, Sendable {
 
     public init(
         state: PathHealthState,
+        healthScore: Double,
         successRate: Double,
         averageLatencyMilliseconds: Double?,
         averagePacketLoss: Double,
@@ -349,11 +366,21 @@ public struct PathHealthReport: Hashable, Codable, Sendable {
         reason: String
     ) {
         self.state = state
+        self.healthScore = min(max(healthScore, 0), 1)
         self.successRate = min(max(successRate, 0), 1)
         self.averageLatencyMilliseconds = averageLatencyMilliseconds
         self.averagePacketLoss = min(max(averagePacketLoss, 0), 1)
         self.consecutiveFailures = max(0, consecutiveFailures)
         self.reason = reason
+    }
+}
+
+public enum PathProbeTrust: String, Codable, Sendable {
+    case trusted
+    case untrustedWhileVPNActive
+
+    public var isTrusted: Bool {
+        self == .trusted
     }
 }
 
@@ -371,24 +398,47 @@ public enum RecoveryAction: Hashable, Codable, Sendable {
     case switchServer(from: String?, to: String, reason: String)
     case adjustParameters(serverID: String, adjustments: [VPNParameterAdjustment], reason: String)
     case askUser(reason: String)
+
+    public var logName: String {
+        switch self {
+        case .keepCurrent:
+            return "keepCurrent"
+        case .refreshDirectDNS:
+            return "refreshDirectDNS"
+        case .reconnect:
+            return "reconnect"
+        case .switchServer:
+            return "switchServer"
+        case .adjustParameters:
+            return "adjustParameters"
+        case .askUser:
+            return "askUser"
+        }
+    }
 }
 
 public struct PreventiveHealthAssessment: Hashable, Codable, Sendable {
     public var directPath: PathHealthReport
+    public var directPathTrust: PathProbeTrust
     public var vpnPath: PathHealthReport
     public var recommendedAction: RecoveryAction
     public var rankedServers: [RankedServer]
+    public var decisionLog: String
 
     public init(
         directPath: PathHealthReport,
+        directPathTrust: PathProbeTrust = .trusted,
         vpnPath: PathHealthReport,
         recommendedAction: RecoveryAction,
-        rankedServers: [RankedServer] = []
+        rankedServers: [RankedServer] = [],
+        decisionLog: String = ""
     ) {
         self.directPath = directPath
+        self.directPathTrust = directPathTrust
         self.vpnPath = vpnPath
         self.recommendedAction = recommendedAction
         self.rankedServers = rankedServers
+        self.decisionLog = decisionLog
     }
 }
 
@@ -544,6 +594,137 @@ public struct HeuristicServerScorer: ServerScoring, Sendable {
     }
 }
 
+public struct CoreMLServerScorer: ServerScoring {
+    private let fallback: any ServerScoring
+    #if canImport(CoreML)
+    private let model: MLModel?
+    #endif
+
+    public init(
+        modelURL: URL? = nil,
+        fallback: any ServerScoring = HeuristicServerScorer()
+    ) {
+        self.fallback = fallback
+        #if canImport(CoreML)
+        if let modelURL {
+            self.model = try? MLModel(contentsOf: modelURL)
+        } else {
+            self.model = nil
+        }
+        #endif
+    }
+
+    public func rank(
+        servers: [SmartVPNServer],
+        context: ServerSelectionContext,
+        historyStore: ServerQualityHistoryStore
+    ) -> [RankedServer] {
+        #if canImport(CoreML)
+        guard let model else {
+            return fallback.rank(servers: servers, context: context, historyStore: historyStore)
+        }
+
+        let ranked = servers
+            .filter { $0.healthState != .unhealthy }
+            .compactMap { server -> RankedServer? in
+                guard let score = predictionScore(
+                    for: server,
+                    context: context,
+                    historyStore: historyStore,
+                    model: model
+                ) else {
+                    return nil
+                }
+
+                return RankedServer(
+                    server: server,
+                    score: score,
+                    confidence: confidence(for: server.id, historyStore: historyStore),
+                    reason: "coreml-score=\(String(format: "%.2f", score))"
+                )
+            }
+            .sorted { lhs, rhs in
+                if lhs.score == rhs.score {
+                    return lhs.server.id < rhs.server.id
+                }
+
+                return lhs.score > rhs.score
+            }
+
+        return ranked.isEmpty ? fallback.rank(servers: servers, context: context, historyStore: historyStore) : ranked
+        #else
+        return fallback.rank(servers: servers, context: context, historyStore: historyStore)
+        #endif
+    }
+
+    #if canImport(CoreML)
+    private func predictionScore(
+        for server: SmartVPNServer,
+        context: ServerSelectionContext,
+        historyStore: ServerQualityHistoryStore,
+        model: MLModel
+    ) -> Double? {
+        let recentSamples = Array(historyStore.samples(for: server.id).suffix(12))
+        let averageLatency = average(recentSamples.map(\.latencyMilliseconds)) ?? server.lastLatencyMilliseconds ?? 250
+        let averageHandshake = average(recentSamples.map(\.handshakeMilliseconds)) ?? 350
+        let averagePacketLoss = average(recentSamples.map(\.packetLoss)) ?? 0
+        let recentFailures = average(recentSamples.map { Double($0.recentFailureCount) }) ?? 0
+        let healthScore = approximateHealthScore(
+            latencyMilliseconds: averageLatency,
+            packetLoss: averagePacketLoss,
+            recentFailures: recentFailures
+        )
+
+        let features: [String: MLFeatureValue] = [
+            "currentRegion": MLFeatureValue(string: context.currentRegion.rawValue),
+            "homeRegion": MLFeatureValue(string: context.homeRegion.rawValue),
+            "serverRegion": MLFeatureValue(string: server.region.rawValue),
+            "networkKind": MLFeatureValue(string: context.networkKind.rawValue),
+            "latencyMilliseconds": MLFeatureValue(double: averageLatency),
+            "handshakeMilliseconds": MLFeatureValue(double: averageHandshake),
+            "packetLoss": MLFeatureValue(double: averagePacketLoss),
+            "recentFailures": MLFeatureValue(double: recentFailures),
+            "healthScore": MLFeatureValue(double: healthScore),
+            "isPreviousServer": MLFeatureValue(double: server.id == context.previousServerID ? 1 : 0),
+            "isQuarantined": MLFeatureValue(double: 0),
+            "sampleCount": MLFeatureValue(double: Double(recentSamples.count)),
+            "hourOfDay": MLFeatureValue(double: Double(context.hourOfDay))
+        ]
+
+        guard let provider = try? MLDictionaryFeatureProvider(dictionary: features),
+              let output = try? model.prediction(from: provider),
+              let scoreValue = output.featureValue(for: "score")?.doubleValue else {
+            return nil
+        }
+
+        return min(max(scoreValue, 0), 1)
+    }
+    #endif
+
+    private func confidence(for serverID: String, historyStore: ServerQualityHistoryStore) -> Double {
+        min(0.35 + Double(historyStore.samples(for: serverID).suffix(12).count) / 12 * 0.55, 0.9)
+    }
+
+    private func approximateHealthScore(
+        latencyMilliseconds: Double,
+        packetLoss: Double,
+        recentFailures: Double
+    ) -> Double {
+        let latencyScore = max(0, min(1, 1 - latencyMilliseconds / 3_000))
+        let lossScore = max(0, min(1, 1 - packetLoss))
+        let failureScore = max(0, min(1, 1 - recentFailures / 4))
+        return min(max(latencyScore * 0.35 + lossScore * 0.35 + failureScore * 0.3, 0), 1)
+    }
+
+    private func average(_ values: [Double]) -> Double? {
+        guard !values.isEmpty else {
+            return nil
+        }
+
+        return values.reduce(0, +) / Double(values.count)
+    }
+}
+
 public struct SmartServerSelector {
     private let scorer: ServerScoring
     private let historyStore: ServerQualityHistoryStore
@@ -641,13 +822,16 @@ public struct SmartServerSelector {
 public struct PreventiveVPNHealthMonitor {
     private let selector: SmartServerSelector
     private let reliabilityAnalyzer: ProbeReliabilityAnalyzer
+    private let minimumSwitchImprovement: Double
 
     public init(
         selector: SmartServerSelector = SmartServerSelector(),
-        reliabilityAnalyzer: ProbeReliabilityAnalyzer = ProbeReliabilityAnalyzer()
+        reliabilityAnalyzer: ProbeReliabilityAnalyzer = ProbeReliabilityAnalyzer(),
+        minimumSwitchImprovement: Double = 0.25
     ) {
         self.selector = selector
         self.reliabilityAnalyzer = reliabilityAnalyzer
+        self.minimumSwitchImprovement = min(max(minimumSwitchImprovement, 0), 1)
     }
 
     public func assess(
@@ -655,76 +839,277 @@ public struct PreventiveVPNHealthMonitor {
         activeServerID: String?,
         context: ServerSelectionContext,
         servers: [SmartVPNServer],
-        probeHistory: [ConnectivityProbeResult] = []
+        probeHistory: [ConnectivityProbeResult] = [],
+        vpnIsConnected: Bool = false,
+        directPathTrust: PathProbeTrust = .trusted,
+        degradedHardDurationSeconds: TimeInterval = 0,
+        quarantinedServerIDs: Set<String> = []
     ) -> PreventiveHealthAssessment {
         let directProbes = probes.filter { $0.targetKind == .directEndpoint || $0.targetKind == .dnsResolver }
         let vpnProbes = probes.filter { $0.targetKind == .vpnServer || $0.targetKind == .vpnProtectedEndpoint }
         let directReport = report(for: reliabilityAnalyzer.filteredCurrentProbes(directProbes, using: probeHistory))
-        let vpnReport = report(for: reliabilityAnalyzer.filteredCurrentProbes(vpnProbes, using: probeHistory))
+        let visibleDirectReport = providerReportForDisplay(directReport, trust: directPathTrust)
+        let vpnReport = report(
+            for: reliabilityAnalyzer.filteredCurrentProbes(vpnProbes, using: probeHistory),
+            vpnIsConnected: vpnIsConnected
+        )
         let ranked = selector.rankedServers(context: context, servers: servers)
         let action = recoveryAction(
             directReport: directReport,
             vpnReport: vpnReport,
+            directPathTrust: directPathTrust,
             activeServerID: activeServerID,
-            rankedServers: ranked
+            rankedServers: ranked,
+            degradedHardDurationSeconds: degradedHardDurationSeconds,
+            quarantinedServerIDs: quarantinedServerIDs
+        )
+        let decisionLog = decisionLog(
+            directReport: directReport,
+            vpnReport: vpnReport,
+            directPathTrust: directPathTrust,
+            activeServerID: activeServerID,
+            rankedServers: ranked,
+            action: action,
+            degradedHardDurationSeconds: degradedHardDurationSeconds,
+            quarantinedServerIDs: quarantinedServerIDs
         )
 
         return PreventiveHealthAssessment(
-            directPath: directReport,
+            directPath: visibleDirectReport,
+            directPathTrust: directPathTrust,
             vpnPath: vpnReport,
             recommendedAction: action,
-            rankedServers: ranked
+            rankedServers: ranked,
+            decisionLog: decisionLog
         )
     }
 
     private func recoveryAction(
         directReport: PathHealthReport,
         vpnReport: PathHealthReport,
+        directPathTrust: PathProbeTrust,
         activeServerID: String?,
-        rankedServers: [RankedServer]
+        rankedServers: [RankedServer],
+        degradedHardDurationSeconds: TimeInterval,
+        quarantinedServerIDs: Set<String>
     ) -> RecoveryAction {
-        if directReport.state == .down {
+        switch vpnReport.state {
+        case .stalled, .down, .connectedButUnusable:
+            if let action = switchOrReconnectBrokenVPN(
+                directReport: directReport,
+                directPathTrust: directPathTrust,
+                vpnReport: vpnReport,
+                activeServerID: activeServerID,
+                rankedServers: rankedServers,
+                quarantinedServerIDs: quarantinedServerIDs
+            ) {
+                return action
+            }
+
+        case .healthy:
+            break
+        case .degradedSoft:
+            break
+        case .degradedHard:
+            if degradedHardDurationSeconds >= 180,
+               let action = switchOrReconnectBrokenVPN(
+                directReport: directReport,
+                directPathTrust: directPathTrust,
+                vpnReport: vpnReport,
+                activeServerID: activeServerID,
+                rankedServers: rankedServers,
+                quarantinedServerIDs: quarantinedServerIDs,
+                reasonOverride: "vpn-path-degraded-hard-persistent"
+               ) {
+                return action
+            }
+        }
+
+        if directPathTrust.isTrusted, directReport.state == .down {
             return .askUser(reason: "provider-path-down")
         }
 
-        if directReport.state == .degraded {
+        if directPathTrust.isTrusted, directReport.state == .degradedSoft || directReport.state == .degradedHard {
             return .refreshDirectDNS(reason: "provider-dns-or-direct-path-degraded")
         }
 
         switch vpnReport.state {
         case .healthy:
             return .keepCurrent(reason: "vpn-path-healthy")
-        case .degraded:
+        case .degradedSoft:
             if let activeServerID {
                 return .adjustParameters(
                     serverID: activeServerID,
                     adjustments: [.rehandshake, .refreshDNS],
-                    reason: "vpn-path-degraded"
+                    reason: "vpn-path-degraded-soft"
                 )
             }
 
-            return .askUser(reason: "vpn-path-degraded-without-active-server")
-        case .stalled, .down:
-            if let replacement = rankedServers.first(where: { $0.server.id != activeServerID }) {
-                return .switchServer(
-                    from: activeServerID,
-                    to: replacement.server.id,
-                    reason: "vpn-path-\(vpnReport.state.rawValue)"
-                )
+            return .askUser(reason: "vpn-path-degraded-soft-without-active-server")
+        case .degradedHard:
+            guard degradedHardDurationSeconds >= 180 else {
+                if let activeServerID {
+                    return .adjustParameters(
+                        serverID: activeServerID,
+                        adjustments: [.rehandshake, .refreshDNS],
+                        reason: "vpn-path-degraded-hard-observing"
+                    )
+                }
+
+                return .askUser(reason: "vpn-path-degraded-hard-without-active-server")
             }
 
             if let activeServerID {
-                return .reconnect(serverID: activeServerID, reason: "vpn-path-\(vpnReport.state.rawValue)-no-replacement")
+                return .reconnect(serverID: activeServerID, reason: "vpn-path-degraded-hard-no-better-candidate")
+            }
+
+            return .askUser(reason: "vpn-path-degraded-hard-no-server")
+        case .stalled, .down, .connectedButUnusable:
+            if let activeServerID {
+                return .reconnect(serverID: activeServerID, reason: "vpn-path-\(vpnReport.state.rawValue)-no-better-candidate")
             }
 
             return .askUser(reason: "vpn-path-\(vpnReport.state.rawValue)-no-server")
         }
     }
 
-    private func report(for probes: [ConnectivityProbeResult]) -> PathHealthReport {
+    private func switchOrReconnectBrokenVPN(
+        directReport: PathHealthReport,
+        directPathTrust: PathProbeTrust,
+        vpnReport: PathHealthReport,
+        activeServerID: String?,
+        rankedServers: [RankedServer],
+        quarantinedServerIDs: Set<String>,
+        reasonOverride: String? = nil
+    ) -> RecoveryAction? {
+        let requiresScoreImprovement = reasonOverride != nil
+        if let replacement = replacementServer(
+            rankedServers: rankedServers,
+            activeServerID: activeServerID,
+            quarantinedServerIDs: quarantinedServerIDs,
+            requiresScoreImprovement: requiresScoreImprovement
+        ) {
+            return .switchServer(
+                from: activeServerID,
+                to: replacement.server.id,
+                reason: reasonOverride ?? "vpn-path-\(vpnReport.state.rawValue)"
+            )
+        }
+
+        if directPathTrust.isTrusted, directReport.state == .down {
+            return .askUser(reason: "provider-path-down-no-vpn-candidate")
+        }
+
+        if let activeServerID {
+            return .reconnect(
+                serverID: activeServerID,
+                reason: "\(reasonOverride ?? "vpn-path-\(vpnReport.state.rawValue)")-no-better-candidate"
+            )
+        }
+
+        return .askUser(reason: "\(reasonOverride ?? "vpn-path-\(vpnReport.state.rawValue)")-no-server")
+    }
+
+    private func replacementServer(
+        rankedServers: [RankedServer],
+        activeServerID: String?,
+        quarantinedServerIDs: Set<String>,
+        requiresScoreImprovement: Bool
+    ) -> RankedServer? {
+        let currentScore = activeServerID
+            .flatMap { id in rankedServers.first { $0.server.id == id }?.score }
+            ?? 0
+
+        return rankedServers.first { ranked in
+            guard ranked.server.id != activeServerID,
+                  !quarantinedServerIDs.contains(ranked.server.id),
+                  ranked.score > 0.05
+            else {
+                return false
+            }
+
+            if requiresScoreImprovement {
+                return ranked.score >= currentScore + minimumSwitchImprovement
+            }
+
+            return true
+        }
+    }
+
+    private func decisionLog(
+        directReport: PathHealthReport,
+        vpnReport: PathHealthReport,
+        directPathTrust: PathProbeTrust,
+        activeServerID: String?,
+        rankedServers: [RankedServer],
+        action: RecoveryAction,
+        degradedHardDurationSeconds: TimeInterval,
+        quarantinedServerIDs: Set<String>
+    ) -> String {
+        let currentScore = activeServerID
+            .flatMap { id in rankedServers.first { $0.server.id == id }?.score }
+            .map { String(format: "%.2f", $0) } ?? "n/a"
+        let candidate = rankedServers.first { $0.server.id != activeServerID && !quarantinedServerIDs.contains($0.server.id) }
+        let candidateText = candidate.map { "\(safeLogToken($0.server.id)) score=\(String(format: "%.2f", $0.score))" } ?? "none"
+
+        return [
+            "action=\(action.logName)",
+            "direct=\(directReport.state.rawValue) trust=\(directPathTrust.rawValue) score=\(String(format: "%.2f", directReport.healthScore))",
+            "vpn=\(vpnReport.state.rawValue) score=\(String(format: "%.2f", vpnReport.healthScore))",
+            "active=\(activeServerID.map(safeLogToken) ?? "none") score=\(currentScore)",
+            "candidate=\(candidateText)",
+            "hardDegradedFor=\(Int(degradedHardDurationSeconds))s",
+            "quarantine=\(quarantinedServerIDs.count)"
+        ].joined(separator: " · ")
+    }
+
+    private func safeLogToken(_ raw: String) -> String {
+        let lowercased = raw.lowercased()
+        let sensitiveMarkers = [
+            "vpn://",
+            "vless://",
+            "ss://",
+            "trojan://",
+            "privatekey",
+            "private_key",
+            "presharedkey",
+            "password=",
+            "passwd="
+        ]
+
+        if sensitiveMarkers.contains(where: { lowercased.contains($0) }) || raw.contains(".") || raw.count > 80 {
+            return "redacted"
+        }
+
+        return raw
+    }
+
+    private func providerReportForDisplay(_ report: PathHealthReport, trust: PathProbeTrust) -> PathHealthReport {
+        guard trust == .untrustedWhileVPNActive else {
+            return report
+        }
+
+        switch report.state {
+        case .healthy, .degradedSoft:
+            return report
+        case .degradedHard, .stalled, .down, .connectedButUnusable:
+            return PathHealthReport(
+                state: .degradedSoft,
+                healthScore: max(report.healthScore, 0.5),
+                successRate: report.successRate,
+                averageLatencyMilliseconds: report.averageLatencyMilliseconds,
+                averagePacketLoss: report.averagePacketLoss,
+                consecutiveFailures: report.consecutiveFailures,
+                reason: "direct-path-not-confirmed-while-vpn-active"
+            )
+        }
+    }
+
+    private func report(for probes: [ConnectivityProbeResult], vpnIsConnected: Bool = false) -> PathHealthReport {
         guard !probes.isEmpty else {
             return PathHealthReport(
                 state: .down,
+                healthScore: 0,
                 successRate: 0,
                 averageLatencyMilliseconds: nil,
                 averagePacketLoss: 1,
@@ -739,18 +1124,36 @@ public struct PreventiveVPNHealthMonitor {
         let averageLatency = average(successes.compactMap(\.latencyMilliseconds))
         let averagePacketLoss = average(recent.map(\.packetLoss)) ?? 0
         let consecutiveFailures = recent.reversed().prefix { !$0.succeeded }.count
+        let endpointProbes = recent.filter { $0.targetKind == .vpnServer }
+        let exitProbes = recent.filter { $0.targetKind == .vpnProtectedEndpoint }
+        let endpointReachability = probeSuccessRate(for: endpointProbes)
+        let exitReachability = probeSuccessRate(for: exitProbes)
+        var healthScore = healthScore(
+            availability: successRate,
+            averageLatencyMilliseconds: averageLatency,
+            averagePacketLoss: averagePacketLoss,
+            endpointReachability: endpointReachability,
+            exitReachability: exitReachability
+        )
         let state: PathHealthState
         let reason: String
 
-        if consecutiveFailures >= 3 || successRate == 0 {
+        if vpnIsConnected, !exitProbes.isEmpty, exitReachability == 0 {
+            state = .connectedButUnusable
+            healthScore = 0
+            reason = "connected-but-no-exit"
+        } else if consecutiveFailures >= 3 || successRate == 0 {
             state = .down
             reason = "consecutive-failures=\(consecutiveFailures)"
         } else if consecutiveFailures >= 2 || successRate < 0.5 {
             state = .stalled
             reason = "stalled-success-rate=\(String(format: "%.2f", successRate))"
-        } else if successRate < 0.85 || averagePacketLoss > 0.08 || (averageLatency ?? 0) > 1_200 {
-            state = .degraded
-            reason = "degraded-success-rate=\(String(format: "%.2f", successRate))"
+        } else if successRate < 0.7 || averagePacketLoss > 0.2 || (averageLatency ?? 0) > 2_500 || healthScore < 0.45 {
+            state = .degradedHard
+            reason = "degraded-hard-score=\(String(format: "%.2f", healthScore))"
+        } else if successRate < 0.85 || averagePacketLoss > 0.08 || (averageLatency ?? 0) > 1_200 || healthScore < 0.7 {
+            state = .degradedSoft
+            reason = "degraded-soft-score=\(String(format: "%.2f", healthScore))"
         } else {
             state = .healthy
             reason = "healthy"
@@ -758,12 +1161,46 @@ public struct PreventiveVPNHealthMonitor {
 
         return PathHealthReport(
             state: state,
+            healthScore: healthScore,
             successRate: successRate,
             averageLatencyMilliseconds: averageLatency,
             averagePacketLoss: averagePacketLoss,
             consecutiveFailures: consecutiveFailures,
             reason: reason
         )
+    }
+
+    private func probeSuccessRate(for probes: [ConnectivityProbeResult]) -> Double {
+        guard !probes.isEmpty else {
+            return 1
+        }
+
+        return Double(probes.filter(\.succeeded).count) / Double(probes.count)
+    }
+
+    private func healthScore(
+        availability: Double,
+        averageLatencyMilliseconds: Double?,
+        averagePacketLoss: Double,
+        endpointReachability: Double,
+        exitReachability: Double
+    ) -> Double {
+        let latencyScore: Double
+        if let averageLatencyMilliseconds {
+            latencyScore = max(0, min(1, 1 - averageLatencyMilliseconds / 3_000))
+        } else {
+            latencyScore = availability > 0 ? 0.5 : 0
+        }
+
+        let packetLossScore = max(0, min(1, 1 - averagePacketLoss))
+        return min(max(
+            availability * 0.4
+                + latencyScore * 0.2
+                + packetLossScore * 0.2
+                + endpointReachability * 0.1
+                + exitReachability * 0.1,
+            0
+        ), 1)
     }
 
     private func average(_ values: [Double]) -> Double? {

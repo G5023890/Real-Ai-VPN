@@ -91,6 +91,30 @@ final class SmartServerSelectionTests: XCTestCase {
         XCTAssertFalse(json.contains("example.com"))
     }
 
+    func testDecisionLogRedactsRawKeysAndDomains() {
+        let monitor = PreventiveVPNHealthMonitor()
+        let assessment = monitor.assess(
+            probes: .healthyDirect + .downVPN(serverID: "vpn://secret.example.com/privateKey=abc"),
+            activeServerID: "vpn://secret.example.com/privateKey=abc",
+            context: .ruInRussia,
+            servers: [
+                SmartVPNServer(
+                    id: "vless://secret.example.com?password=abc",
+                    region: "DE",
+                    displayName: "Sensitive Candidate",
+                    protocolKind: .singBox,
+                    lastLatencyMilliseconds: 20
+                )
+            ]
+        )
+
+        XCTAssertFalse(assessment.decisionLog.contains("vpn://"))
+        XCTAssertFalse(assessment.decisionLog.contains("vless://"))
+        XCTAssertFalse(assessment.decisionLog.contains("secret.example.com"))
+        XCTAssertFalse(assessment.decisionLog.contains("privateKey"))
+        XCTAssertFalse(assessment.decisionLog.contains("password"))
+    }
+
     func testPreviousServerWinsTieForStability() {
         let selector = SmartServerSelector()
         selector.record(.sample(serverID: "il-1", region: "IL", latency: 100, handshake: 200, loss: 0))
@@ -108,6 +132,20 @@ final class SmartServerSelectionTests: XCTestCase {
         )
 
         XCTAssertEqual(ranked.first?.server.id, "de-1")
+    }
+
+    func testCoreMLScorerFallsBackToHeuristicWhenModelIsMissing() {
+        let selector = SmartServerSelector(scorer: CoreMLServerScorer(modelURL: nil))
+        selector.record(.sample(serverID: "il-1", region: "IL", latency: 250, handshake: 500, loss: 0.05))
+        selector.record(.sample(serverID: "de-1", region: "DE", latency: 40, handshake: 100, loss: 0))
+
+        let ranked = selector.rankedServers(
+            context: .ruInRussia,
+            servers: [.israelFast, .germanySlow]
+        )
+
+        XCTAssertEqual(ranked.first?.server.id, "de-1")
+        XCTAssertTrue(ranked.first?.reason.contains("latency=") ?? false)
     }
 
     func testPreventiveMonitorKeepsHealthyVPN() {
@@ -133,10 +171,160 @@ final class SmartServerSelectionTests: XCTestCase {
             servers: [.israelFast, .germanySlow]
         )
 
-        XCTAssertEqual(assessment.vpnPath.state, .degraded)
+        XCTAssertEqual(assessment.vpnPath.state, .degradedSoft)
         XCTAssertEqual(
             assessment.recommendedAction,
-            .adjustParameters(serverID: "il-1", adjustments: [.rehandshake, .refreshDNS], reason: "vpn-path-degraded")
+            .adjustParameters(serverID: "il-1", adjustments: [.rehandshake, .refreshDNS], reason: "vpn-path-degraded-soft")
+        )
+    }
+
+    func testPreventiveMonitorSwitchesAfterPersistentHardDegradedVPN() {
+        let selector = SmartServerSelector()
+        selector.record(.sample(serverID: "il-1", region: "IL", latency: 2_800, handshake: 2_800, loss: 0.25))
+        selector.record(.sample(serverID: "de-1", region: "DE", latency: 40, handshake: 100, loss: 0))
+        let monitor = PreventiveVPNHealthMonitor(selector: selector)
+
+        let assessment = monitor.assess(
+            probes: .healthyDirect + .hardDegradedVPN(serverID: "il-1"),
+            activeServerID: "il-1",
+            context: .ruInRussia,
+            servers: [.israelFast, .germanySlow],
+            degradedHardDurationSeconds: 181
+        )
+
+        XCTAssertEqual(assessment.vpnPath.state, .degradedHard)
+        XCTAssertEqual(
+            assessment.recommendedAction,
+            .switchServer(from: "il-1", to: "de-1", reason: "vpn-path-degraded-hard-persistent")
+        )
+    }
+
+    func testPreventiveMonitorDetectsConnectedButUnusableVPN() {
+        let selector = SmartServerSelector()
+        selector.record(.sample(serverID: "il-1", region: "IL", latency: 250, handshake: 500, loss: 0.05))
+        selector.record(.sample(serverID: "de-1", region: "DE", latency: 40, handshake: 100, loss: 0))
+        let monitor = PreventiveVPNHealthMonitor(selector: selector)
+
+        let assessment = monitor.assess(
+            probes: .healthyDirect + .connectedButNoExitVPN(serverID: "il-1"),
+            activeServerID: "il-1",
+            context: .ruInRussia,
+            servers: [.israelFast, .germanySlow],
+            vpnIsConnected: true
+        )
+
+        XCTAssertEqual(assessment.vpnPath.state, .connectedButUnusable)
+        XCTAssertEqual(
+            assessment.recommendedAction,
+            .switchServer(from: "il-1", to: "de-1", reason: "vpn-path-connectedButUnusable")
+        )
+    }
+
+    func testConnectedButUnusableIgnoresStaleActiveHistoryWhenSelectingReplacement() {
+        let selector = SmartServerSelector()
+        for _ in 0..<12 {
+            selector.record(.sample(serverID: "il-1", region: "IL", latency: 20, handshake: 60, loss: 0))
+        }
+        let monitor = PreventiveVPNHealthMonitor(selector: selector)
+
+        let assessment = monitor.assess(
+            probes: .healthyDirect + .connectedButNoExitVPN(serverID: "il-1"),
+            activeServerID: "il-1",
+            context: .ruInRussia,
+            servers: [.israelFast, .germanySlow],
+            vpnIsConnected: true
+        )
+
+        XCTAssertEqual(assessment.rankedServers.first?.server.id, "il-1")
+        XCTAssertEqual(assessment.vpnPath.healthScore, 0)
+        XCTAssertEqual(
+            assessment.recommendedAction,
+            .switchServer(from: "il-1", to: "de-1", reason: "vpn-path-connectedButUnusable")
+        )
+    }
+
+    func testPersistentHardDegradedStillRequiresMeaningfullyBetterCandidate() {
+        let selector = SmartServerSelector()
+        for _ in 0..<12 {
+            selector.record(.sample(serverID: "il-1", region: "IL", latency: 20, handshake: 60, loss: 0))
+        }
+        let monitor = PreventiveVPNHealthMonitor(selector: selector)
+
+        let assessment = monitor.assess(
+            probes: .healthyDirect + .hardDegradedVPN(serverID: "il-1"),
+            activeServerID: "il-1",
+            context: .ruInRussia,
+            servers: [.israelFast, .germanySlow],
+            degradedHardDurationSeconds: 181
+        )
+
+        XCTAssertEqual(assessment.vpnPath.state, .degradedHard)
+        XCTAssertEqual(
+            assessment.recommendedAction,
+            .reconnect(serverID: "il-1", reason: "vpn-path-degraded-hard-persistent-no-better-candidate")
+        )
+    }
+
+    func testUntrustedProviderFailureDoesNotBlockUnusableVPNSwitch() {
+        let selector = SmartServerSelector()
+        selector.record(.sample(serverID: "il-1", region: "IL", latency: 2_500, handshake: 2_500, loss: 0.3))
+        selector.record(.sample(serverID: "de-1", region: "DE", latency: 40, handshake: 100, loss: 0))
+        let monitor = PreventiveVPNHealthMonitor(selector: selector)
+
+        let assessment = monitor.assess(
+            probes: .downDirect + .connectedButNoExitVPN(serverID: "il-1"),
+            activeServerID: "il-1",
+            context: .ruInRussia,
+            servers: [.israelFast, .germanySlow],
+            vpnIsConnected: true,
+            directPathTrust: .untrustedWhileVPNActive
+        )
+
+        XCTAssertEqual(assessment.directPath.state, .degradedSoft)
+        XCTAssertEqual(assessment.directPath.reason, "direct-path-not-confirmed-while-vpn-active")
+        XCTAssertEqual(assessment.vpnPath.state, .connectedButUnusable)
+        XCTAssertEqual(
+            assessment.recommendedAction,
+            .switchServer(from: "il-1", to: "de-1", reason: "vpn-path-connectedButUnusable")
+        )
+        XCTAssertTrue(assessment.decisionLog.contains("trust=untrustedWhileVPNActive"))
+    }
+
+    func testTrustedProviderDownBlocksWhenNoVPNCandidateExists() {
+        let monitor = PreventiveVPNHealthMonitor()
+
+        let assessment = monitor.assess(
+            probes: .downDirect + .downVPN(serverID: "il-1"),
+            activeServerID: "il-1",
+            context: .ruInRussia,
+            servers: [.israelFast],
+            vpnIsConnected: true,
+            directPathTrust: .trusted
+        )
+
+        XCTAssertEqual(assessment.directPath.state, .down)
+        XCTAssertEqual(assessment.vpnPath.state, .connectedButUnusable)
+        XCTAssertEqual(assessment.recommendedAction, .askUser(reason: "provider-path-down-no-vpn-candidate"))
+    }
+
+    func testPreventiveMonitorSkipsQuarantinedCandidate() {
+        let selector = SmartServerSelector()
+        selector.record(.sample(serverID: "il-1", region: "IL", latency: 2_800, handshake: 2_800, loss: 0.25))
+        selector.record(.sample(serverID: "de-1", region: "DE", latency: 40, handshake: 100, loss: 0))
+        let monitor = PreventiveVPNHealthMonitor(selector: selector)
+
+        let assessment = monitor.assess(
+            probes: .healthyDirect + .downVPN(serverID: "il-1"),
+            activeServerID: "il-1",
+            context: .ruInRussia,
+            servers: [.israelFast, .germanySlow],
+            quarantinedServerIDs: ["de-1"]
+        )
+
+        XCTAssertEqual(assessment.vpnPath.state, .down)
+        XCTAssertEqual(
+            assessment.recommendedAction,
+            .reconnect(serverID: "il-1", reason: "vpn-path-down-no-better-candidate")
         )
     }
 
@@ -177,7 +365,7 @@ final class SmartServerSelectionTests: XCTestCase {
         let analyzer = ProbeReliabilityAnalyzer(minimumSamplesForFiltering: 4)
         let stable = (0..<6).map {
             ConnectivityProbeResult.probe(
-                targetID: "foreign-apple-success",
+                targetID: "foreign-cloudflare-204",
                 targetKind: .vpnProtectedEndpoint,
                 serverID: "ee-1",
                 method: .httpHead,
@@ -198,7 +386,7 @@ final class SmartServerSelectionTests: XCTestCase {
 
         let summaries = analyzer.summaries(from: stable + noisy, serverID: "ee-1", targetKind: .vpnProtectedEndpoint)
 
-        XCTAssertEqual(summaries.first?.targetID, "foreign-apple-success")
+        XCTAssertEqual(summaries.first?.targetID, "foreign-cloudflare-204")
         XCTAssertGreaterThan(summaries.first?.reliabilityScore ?? 0, summaries.last?.reliabilityScore ?? 0)
     }
 
@@ -312,6 +500,22 @@ private extension Array where Element == ConnectivityProbeResult {
             .probe(targetID: "vpn-handshake", targetKind: .vpnServer, serverID: serverID, method: .tunnelHandshake, succeeded: true, latency: 1_350, loss: 0.1),
             .probe(targetID: "foreign-site", targetKind: .vpnProtectedEndpoint, serverID: serverID, method: .httpHead, succeeded: true, latency: 1_420, loss: 0.12),
             .probe(targetID: "vpn-dns", targetKind: .vpnProtectedEndpoint, serverID: serverID, method: .dnsQuery, succeeded: true, latency: 1_250, loss: 0.09)
+        ]
+    }
+
+    static func hardDegradedVPN(serverID: String) -> [ConnectivityProbeResult] {
+        [
+            .probe(targetID: "vpn-handshake", targetKind: .vpnServer, serverID: serverID, method: .tunnelHandshake, succeeded: true, latency: 2_800, loss: 0.25),
+            .probe(targetID: "foreign-site", targetKind: .vpnProtectedEndpoint, serverID: serverID, method: .httpHead, succeeded: true, latency: 2_900, loss: 0.25),
+            .probe(targetID: "vpn-dns", targetKind: .vpnProtectedEndpoint, serverID: serverID, method: .dnsQuery, succeeded: true, latency: 2_700, loss: 0.25)
+        ]
+    }
+
+    static func connectedButNoExitVPN(serverID: String) -> [ConnectivityProbeResult] {
+        [
+            .probe(targetID: "vpn-handshake", targetKind: .vpnServer, serverID: serverID, method: .tunnelHandshake, succeeded: true, latency: 120),
+            .probe(targetID: "foreign-site", targetKind: .vpnProtectedEndpoint, serverID: serverID, method: .httpHead, succeeded: false),
+            .probe(targetID: "exit-ip", targetKind: .vpnProtectedEndpoint, serverID: serverID, method: .httpHead, succeeded: false)
         ]
     }
 

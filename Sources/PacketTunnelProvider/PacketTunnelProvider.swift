@@ -49,6 +49,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let routingExceptions = RoutingExceptionCodec.decode(
             (options?["routingExceptions"] as? String) ?? (options?["routingExceptions"] as? NSString).map(String.init)
         )
+        let killSwitchEnabled = (options?["killSwitchEnabled"] as? NSNumber)?.boolValue ?? false
 
         guard let importedConfig, !importedConfig.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             packetTunnelLogger.error("Missing transient Amnezia config")
@@ -62,7 +63,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             saveDiagnostic(stage: "decoded-vless", message: shadowrocketConfig.redactedSummary)
             NSLog("RealAiVPN PacketTunnel decoded Shadowrocket profile=%@", shadowrocketConfig.redactedSummary)
             do {
-                try await startSingBoxTunnel(with: shadowrocketConfig, routingExceptions: routingExceptions)
+                try await startSingBoxTunnel(with: shadowrocketConfig, routingExceptions: routingExceptions, killSwitchEnabled: killSwitchEnabled)
                 saveDiagnostic(stage: "started-vless", message: "sing-box tunnel start returned successfully.")
             } catch {
                 saveDiagnostic(stage: "vless-failed", message: error.localizedDescription)
@@ -89,7 +90,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         do {
-            try await startAmneziaWireGuardTunnel(with: config, routingExceptions: routingExceptions)
+            try await startAmneziaWireGuardTunnel(with: config, routingExceptions: routingExceptions, killSwitchEnabled: killSwitchEnabled)
             saveDiagnostic(stage: "started-awg", message: "AmneziaWG tunnel start returned successfully.")
         } catch {
             saveDiagnostic(stage: "awg-failed", message: error.localizedDescription)
@@ -114,11 +115,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return try? premiumKeyStore.read()
     }
 
-    private func startAmneziaWireGuardTunnel(with config: AmneziaWireGuardConfig, routingExceptions: RoutingExceptionCollection) async throws {
+    private func startAmneziaWireGuardTunnel(
+        with config: AmneziaWireGuardConfig,
+        routingExceptions: RoutingExceptionCollection,
+        killSwitchEnabled: Bool
+    ) async throws {
 #if SINGBOX_TUNNEL
         throw PacketTunnelProviderError.invalidAmneziaConfig
 #else
-        let tunnelConfiguration = try config.makeTunnelConfiguration(named: "Real Ai VPN", routingExceptions: routingExceptions)
+        let tunnelConfiguration = try config.makeTunnelConfiguration(
+            named: "Real Ai VPN",
+            routingExceptions: routingExceptions,
+            killSwitchEnabled: killSwitchEnabled
+        )
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             adapter.start(tunnelConfiguration: tunnelConfiguration) { error in
@@ -133,14 +142,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 #endif
     }
 
-    private func startSingBoxTunnel(with config: ShadowrocketVLESSConfig, routingExceptions: RoutingExceptionCollection) async throws {
+    private func startSingBoxTunnel(
+        with config: ShadowrocketVLESSConfig,
+        routingExceptions: RoutingExceptionCollection,
+        killSwitchEnabled: Bool
+    ) async throws {
         let singBoxConfig = try SingBoxConfigBuilder().build(
             from: config,
             routeOverrides: singBoxRouteOverrides(from: routingExceptions)
         )
         packetTunnelLogger.info("Prepared sing-box config for \(config.endpoint, privacy: .public), bytes=\(singBoxConfig.jsonString.utf8.count, privacy: .public)")
         saveDiagnostic(stage: "singbox-config-built", message: "Config bytes: \(singBoxConfig.jsonString.utf8.count).")
-        try await singBoxRuntime.start(configJSON: singBoxConfig.jsonString)
+        try await singBoxRuntime.start(configJSON: singBoxConfig.jsonString, killSwitchEnabled: killSwitchEnabled)
     }
 
     private func singBoxRouteOverrides(from routingExceptions: RoutingExceptionCollection) -> SingBoxRouteOverrides {
@@ -171,11 +184,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         let localProviderRanges = [
+            "127.0.0.0/8",
             "10.0.0.0/8",
             "100.64.0.0/10",
             "169.254.0.0/16",
             "172.16.0.0/12",
             "192.168.0.0/16",
+            "::1/128",
             "fc00::/7",
             "fe80::/10"
         ]
@@ -322,7 +337,11 @@ private func subtract(forceHostRoutes: [String], from cidrs: [String]) -> [Strin
 
 #if !SINGBOX_TUNNEL
 private extension AmneziaWireGuardConfig {
-    func makeTunnelConfiguration(named name: String, routingExceptions: RoutingExceptionCollection) throws -> TunnelConfiguration {
+    func makeTunnelConfiguration(
+        named name: String,
+        routingExceptions: RoutingExceptionCollection,
+        killSwitchEnabled: Bool
+    ) throws -> TunnelConfiguration {
         guard let privateKey = PrivateKey(base64Key: privateKey) else {
             throw PacketTunnelProviderError.invalidWireGuardConfig("invalid private key")
         }
@@ -407,11 +426,15 @@ private extension AmneziaWireGuardConfig {
     private func splitTunnelBypassRanges(excludingForceHostRoutes forceHostRoutes: [IPAddressRange]) -> [IPAddressRange] {
         let localProviderRanges = [
             // Local/provider networks must never hairpin through the VPN tunnel.
+            "127.0.0.0/8",
             "10.0.0.0/8",
             "100.64.0.0/10",
             "169.254.0.0/16",
             "172.16.0.0/12",
-            "192.168.0.0/16"
+            "192.168.0.0/16",
+            "::1/128",
+            "fc00::/7",
+            "fe80::/10"
         ]
 
         let ruRanges = subtract(

@@ -31,17 +31,20 @@ public struct VPNProfileConfiguration: Hashable, Codable, Sendable {
     public var providerBundleIdentifier: String
     public var serverID: String
     public var regionCode: String
+    public var killSwitchEnabled: Bool
 
     public init(
         localizedDescription: String = "Real Ai VPN",
         providerBundleIdentifier: String = "com.codex.RealAiVPN.PacketTunnel",
         serverID: String,
-        regionCode: String
+        regionCode: String,
+        killSwitchEnabled: Bool = false
     ) {
         self.localizedDescription = localizedDescription
         self.providerBundleIdentifier = providerBundleIdentifier
         self.serverID = serverID
         self.regionCode = regionCode
+        self.killSwitchEnabled = killSwitchEnabled
     }
 }
 
@@ -135,6 +138,7 @@ public final class RealVPNProfileManager: ObservableObject {
             if let encodedExceptions = RoutingExceptionCodec.encode(routingExceptions) {
                 options["routingExceptions"] = encodedExceptions as NSString
             }
+            options["killSwitchEnabled"] = NSNumber(value: configuration.killSwitchEnabled)
             try manager.connection.startVPNTunnel(options: options)
             await waitForSettledStatus()
             vpnProfileLogger.info("startVPNTunnel returned status=\(self.status.rawValue, privacy: .public)")

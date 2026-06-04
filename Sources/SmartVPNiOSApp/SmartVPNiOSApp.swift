@@ -90,6 +90,41 @@ private enum ConnectivityProbeRunner {
             return (false, nil)
         }
     }
+
+    static func fetchText(url: URL, timeout: TimeInterval = 5) async -> String? {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(statusCode),
+                  let text = String(data: data, encoding: .utf8) else {
+                return nil
+            }
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            return nil
+        }
+    }
+
+    static func fetchJSONDictionary(url: URL, timeout: TimeInterval = 5) async -> [String: Any]? {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(statusCode) else {
+                return nil
+            }
+            return try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        } catch {
+            return nil
+        }
+    }
 }
 
 private struct StoredProfileQualityHistory: Codable {
@@ -173,6 +208,9 @@ struct RealAiVPNiOSApp: App {
 final class iOSDashboardModel: ObservableObject {
     @Published private(set) var profiles: [StoredAmneziaConfigProfile] = []
     @Published private(set) var activeProfileID: String?
+    @Published private(set) var connectedProfileID: String?
+    @Published private(set) var observedExitIP: String?
+    @Published private(set) var observedExitCountry: String?
     @Published private(set) var vpnStatus: VPNConnectionStatus = .unknown
     @Published private(set) var vpnLastError: String?
     @Published private(set) var vpnProviderBundleIdentifier: String?
@@ -184,6 +222,7 @@ final class iOSDashboardModel: ObservableObject {
     @Published private(set) var healthAssessment = PreventiveHealthAssessment(
         directPath: PathHealthReport(
             state: .healthy,
+            healthScore: 1,
             successRate: 1,
             averageLatencyMilliseconds: nil,
             averagePacketLoss: 0,
@@ -192,6 +231,7 @@ final class iOSDashboardModel: ObservableObject {
         ),
         vpnPath: PathHealthReport(
             state: .down,
+            healthScore: 0,
             successRate: 0,
             averageLatencyMilliseconds: nil,
             averagePacketLoss: 1,
@@ -202,9 +242,15 @@ final class iOSDashboardModel: ObservableObject {
     )
     @Published private(set) var rankedServers: [RankedServer] = []
     @Published private(set) var lastProbeDate: Date?
+    @Published private(set) var lastRecoveryDecisionLog = ""
     @Published var automaticFailoverEnabled = UserDefaults.standard.object(forKey: "ios.automaticFailoverEnabled") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(automaticFailoverEnabled, forKey: "ios.automaticFailoverEnabled")
+        }
+    }
+    @Published var killSwitchEnabled = UserDefaults.standard.object(forKey: "ios.killSwitchEnabled") as? Bool ?? false {
+        didSet {
+            UserDefaults.standard.set(killSwitchEnabled, forKey: "ios.killSwitchEnabled")
         }
     }
 
@@ -225,6 +271,8 @@ final class iOSDashboardModel: ObservableObject {
     private var liveProbeResults: [ConnectivityProbeResult] = []
     private var monitoringTask: Task<Void, Never>?
     private var lastAutomaticFailoverDate: Date?
+    private var vpnHardDegradedSince: Date?
+    private var profileQuarantineUntil: [String: Date] = [:]
     private var suppressExpectedDisconnectNotification = false
 
     init() {
@@ -238,8 +286,11 @@ final class iOSDashboardModel: ObservableObject {
         vpnManager.$lastErrorMessage
             .receive(on: DispatchQueue.main)
             .sink { [weak self] error in
-                self?.vpnLastError = error
-                self?.refreshStatusMessage()
+                guard let self else {
+                    return
+                }
+                self.vpnLastError = self.vpnStatus == .connected ? nil : error
+                self.refreshStatusMessage()
             }
             .store(in: &cancellables)
         vpnManager.$lastProviderBundleIdentifier
@@ -274,16 +325,27 @@ final class iOSDashboardModel: ObservableObject {
         return profiles.first { $0.id == activeProfileID } ?? profiles.first
     }
 
+    var connectedProfile: StoredAmneziaConfigProfile? {
+        guard let connectedProfileID else {
+            return nil
+        }
+        return profiles.first { $0.id == connectedProfileID }
+    }
+
+    var displayedProfile: StoredAmneziaConfigProfile? {
+        vpnStatus.isConnectedOrConnecting ? (connectedProfile ?? activeProfile) : activeProfile
+    }
+
     var confidenceDetail: String {
         guard let lastProbeDate else {
             return "collecting live probes"
         }
 
         let age = max(0, Int(Date().timeIntervalSince(lastProbeDate)))
-        let sampleCount = activeProfile.map { profile in
+        let sampleCount = displayedProfile.map { profile in
             qualitySamples.filter { $0.serverID == profile.id }.count
         } ?? qualitySamples.count
-        if let best = activeProfile.flatMap({ profile in
+        if let best = displayedProfile.flatMap({ profile in
             probeReliabilityAnalyzer.bestSummary(
                 from: probeReliabilitySamples,
                 serverID: profile.id,
@@ -297,10 +359,10 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     var probeReliabilityDetail: String {
-        guard let activeProfile,
+        guard let displayedProfile,
               let best = probeReliabilityAnalyzer.bestSummary(
                 from: probeReliabilitySamples,
-                serverID: activeProfile.id,
+                serverID: displayedProfile.id,
                 targetKind: .vpnProtectedEndpoint
               ) else {
             return "Probe reliability is learning on this profile."
@@ -352,6 +414,26 @@ final class iOSDashboardModel: ObservableObject {
         } catch {
             message = Self.importErrorMessage(for: error, rawConfig: rawConfig)
         }
+    }
+
+    func importProfileFromPastedText(displayName: String, rawConfig: String) {
+        let trimmedConfig = rawConfig.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedConfig.isEmpty else {
+            message = "Paste a key, URL, JSON, or raw config first."
+            return
+        }
+
+        let trimmedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            await importProfile(
+                displayName: trimmedName.isEmpty ? "Pasted Profile" : trimmedName,
+                rawConfig: trimmedConfig
+            )
+        }
+    }
+
+    func reportStatus(_ status: String) {
+        message = status
     }
 
     private func importProfile(displayName: String, rawConfig: String) async {
@@ -437,14 +519,40 @@ final class iOSDashboardModel: ObservableObject {
         }
     }
 
-    func deleteProfile(id: String) {
-        let deletingActiveProfile = activeProfile?.id == id
-        let deletedName = profiles.first { $0.id == id }?.displayName ?? "profile"
-
-        if deletingActiveProfile, vpnStatus.isConnectedOrConnecting {
-            suppressExpectedDisconnectNotification = true
-            vpnManager.disconnect()
+    func reconnectProfile(id: String) {
+        NSLog("RealAiVPN iOS reconnectProfile id=%@", id)
+        let wasConnectedOrConnecting = vpnStatus.isConnectedOrConnecting
+        do {
+            try profileStore.setActiveProfile(id: id)
+            reloadProfiles()
+            guard let selected = activeProfile else {
+                message = "Could not reconnect: profile is missing."
+                return
+            }
+            message = wasConnectedOrConnecting
+                ? "Reconnecting \(selected.displayName)..."
+                : "Connecting \(selected.displayName)..."
+            if wasConnectedOrConnecting {
+                suppressExpectedDisconnectNotification = true
+                vpnManager.disconnect()
+                Task {
+                    try? await Task.sleep(for: .seconds(1))
+                    connect()
+                }
+            } else {
+                connect()
+            }
+        } catch {
+            NSLog("RealAiVPN iOS reconnectProfile failed: %@", error.localizedDescription)
+            message = "Could not reconnect profile: \(error.localizedDescription)"
         }
+    }
+
+    func deleteProfile(id: String) {
+        let wasConnected = vpnStatus.isConnectedOrConnecting
+        let deletingActiveProfile = activeProfile?.id == id
+        let deletingConnectedProfile = connectedProfile?.id == id
+        let deletedName = profiles.first { $0.id == id }?.displayName ?? "profile"
 
         do {
             try profileStore.deleteProfile(id: id)
@@ -457,11 +565,43 @@ final class iOSDashboardModel: ObservableObject {
             Task {
                 await vpnManager.prepareProfile(configuration: vpnConfiguration)
             }
-            message = profiles.isEmpty
-                ? "Deleted \(deletedName). Import a profile to connect."
-                : "Deleted \(deletedName). Active profile is \(activeProfile?.displayName ?? "profile")."
+            if profiles.isEmpty {
+                if wasConnected {
+                    suppressExpectedDisconnectNotification = true
+                    vpnManager.disconnect()
+                }
+                connectedProfileID = nil
+                message = "Deleted \(deletedName). Import a profile to connect."
+            } else if wasConnected, deletingActiveProfile || deletingConnectedProfile {
+                connectedProfileID = nil
+                suppressExpectedDisconnectNotification = true
+                vpnManager.disconnect()
+                Task {
+                    try? await Task.sleep(for: .seconds(1))
+                    connect()
+                }
+                message = "Deleted \(deletedName). Reconnecting \(activeProfile?.displayName ?? "profile")."
+            } else {
+                message = "Deleted \(deletedName). Active profile is \(activeProfile?.displayName ?? "profile")."
+            }
         } catch {
             message = "Could not delete \(deletedName): \(error.localizedDescription)"
+        }
+    }
+
+    func renameProfile(id: String, displayName: String) {
+        let trimmedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            message = "Profile name cannot be empty."
+            return
+        }
+
+        do {
+            try profileStore.renameProfile(id: id, displayName: trimmedName)
+            reloadProfiles()
+            message = "Renamed profile to \(trimmedName)."
+        } catch {
+            message = "Could not rename profile: \(error.localizedDescription)"
         }
     }
 
@@ -475,6 +615,9 @@ final class iOSDashboardModel: ObservableObject {
 
         Task {
             let connectProfile = await resolveProfileForConnect(activeProfile)
+            connectedProfileID = connectProfile.id
+            observedExitIP = nil
+            observedExitCountry = nil
             iosAppLogger.info("Connect requested profile=\(connectProfile.displayName, privacy: .public) kind=\(connectProfile.kind.rawValue, privacy: .public) endpoint=\(connectProfile.endpointHost ?? "unknown", privacy: .public)")
             NSLog("RealAiVPN iOS Connect requested profile=%@ kind=%@ endpoint=%@ provider=%@",
                   connectProfile.displayName,
@@ -561,20 +704,29 @@ final class iOSDashboardModel: ObservableObject {
         if !liveProbeResults.isEmpty {
             healthAssessment = monitor.assess(
                 probes: liveProbeResults,
-                activeServerID: activeProfile?.id,
+                activeServerID: displayedProfile?.id,
                 context: context,
                 servers: servers,
-                probeHistory: probeReliabilitySamples
+                probeHistory: probeReliabilitySamples,
+                vpnIsConnected: vpnStatus.isConnectedOrConnecting,
+                directPathTrust: providerProbeTrust,
+                degradedHardDurationSeconds: currentHardDegradedDuration(),
+                quarantinedServerIDs: activeQuarantinedProfileIDs()
             )
+            updateRecoveryTracking(from: healthAssessment)
         }
-        routeTitle = Self.routeTitle(for: decision, activeProfile: activeProfile, status: vpnStatus)
-        let activeConfidence = activeProfile
-            .flatMap { profile in rankedServers.first { $0.server.id == profile.id }?.confidence }
-        confidence = Int(((activeConfidence ?? decision.rankedServers.first?.confidence ?? rankedServers.first?.confidence ?? 0) * 100).rounded())
+        routeTitle = Self.routeTitle(for: decision, activeProfile: displayedProfile, status: vpnStatus)
+        if vpnStatus.isConnectedOrConnecting {
+            confidence = Int((healthAssessment.vpnPath.healthScore * 100).rounded())
+        } else {
+            let activeConfidence = displayedProfile
+                .flatMap { profile in rankedServers.first { $0.server.id == profile.id }?.confidence }
+            confidence = Int(((activeConfidence ?? decision.rankedServers.first?.confidence ?? rankedServers.first?.confidence ?? 0) * 100).rounded())
+        }
     }
 
     private func refreshStatusMessage() {
-        let profileName = activeProfile?.displayName ?? "profile"
+        let profileName = displayedProfile?.displayName ?? activeProfile?.displayName ?? "profile"
         if let vpnLastError, !vpnLastError.isEmpty {
             message = vpnLastError
             refreshRoutePreview()
@@ -601,9 +753,18 @@ final class iOSDashboardModel: ObservableObject {
         let previousStatus = vpnStatus
         vpnStatus = status
 
+        if status == .connected {
+            vpnLastError = nil
+            tunnelDiagnostic = nil
+        }
+
         guard status == .disconnected else {
             return
         }
+
+        connectedProfileID = nil
+        observedExitIP = nil
+        observedExitCountry = nil
 
         if suppressExpectedDisconnectNotification {
             suppressExpectedDisconnectNotification = false
@@ -638,7 +799,8 @@ final class iOSDashboardModel: ObservableObject {
             localizedDescription: localizedVPNDescription(for: profile),
             providerBundleIdentifier: providerBundleIdentifier(for: profile),
             serverID: profile?.id ?? "real-ai-vpn-ios",
-            regionCode: profile?.regionCode ?? "ZZ"
+            regionCode: profile?.regionCode ?? "ZZ",
+            killSwitchEnabled: killSwitchEnabled
         )
     }
 
@@ -750,6 +912,32 @@ final class iOSDashboardModel: ObservableObject {
         probeReliabilityHistoryStore.save(probeReliabilitySamples)
     }
 
+    private func activeQuarantinedProfileIDs(now: Date = Date()) -> Set<String> {
+        profileQuarantineUntil = profileQuarantineUntil.filter { $0.value > now }
+        return Set(profileQuarantineUntil.keys)
+    }
+
+    private func currentHardDegradedDuration(now: Date = Date()) -> TimeInterval {
+        guard let vpnHardDegradedSince else {
+            return 0
+        }
+
+        return now.timeIntervalSince(vpnHardDegradedSince)
+    }
+
+    private func updateRecoveryTracking(from assessment: PreventiveHealthAssessment, now: Date = Date()) {
+        lastRecoveryDecisionLog = assessment.decisionLog
+        if assessment.vpnPath.state == .degradedHard {
+            vpnHardDegradedSince = vpnHardDegradedSince ?? now
+        } else {
+            vpnHardDegradedSince = nil
+        }
+    }
+
+    private func quarantineProfile(id: String, until date: Date = Date().addingTimeInterval(300)) {
+        profileQuarantineUntil[id] = date
+    }
+
     private func startMonitoring() {
         monitoringTask?.cancel()
         monitoringTask = Task { [weak self] in
@@ -767,7 +955,7 @@ final class iOSDashboardModel: ObservableObject {
         }
 
         let currentProfiles = profiles
-        let activeID = activeProfile?.id
+        let activeID = displayedProfile?.id
         var probes = await directProviderProbes()
 
         for profile in currentProfiles {
@@ -804,6 +992,8 @@ final class iOSDashboardModel: ObservableObject {
 
         if vpnStatus.isConnectedOrConnecting, let activeID {
             probes.append(contentsOf: await vpnProtectedProbes(serverID: activeID))
+            probes.append(await exitIPProbe(serverID: activeID))
+            probes.append(await exitCountryProbe(serverID: activeID))
         }
 
         liveProbeResults = probes
@@ -812,6 +1002,10 @@ final class iOSDashboardModel: ObservableObject {
         lastProbeDate = Date()
         refreshRoutePreview()
         await applyAutomaticFailoverIfNeeded()
+    }
+
+    private var providerProbeTrust: PathProbeTrust {
+        vpnStatus.isConnectedOrConnecting ? .untrustedWhileVPNActive : .trusted
     }
 
     private func directProviderProbes() async -> [ConnectivityProbeResult] {
@@ -840,7 +1034,7 @@ final class iOSDashboardModel: ObservableObject {
     private func vpnProtectedProbes(serverID: String) async -> [ConnectivityProbeResult] {
         let targets: [(String, ProbeMethod, () async -> (succeeded: Bool, latency: Double?))] = [
             ("foreign-gstatic-204", .httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.gstatic.com/generate_204")!) }),
-            ("foreign-apple-success", .httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.apple.com/library/test/success.html")!) }),
+            ("foreign-cloudflare-204", .httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://cp.cloudflare.com/generate_204")!) }),
             ("foreign-cloudflare-tcp", .tcpConnect, { await ConnectivityProbeRunner.tcpConnect(host: "1.1.1.1", port: 443, timeout: 3) })
         ]
 
@@ -861,6 +1055,81 @@ final class iOSDashboardModel: ObservableObject {
         return probes
     }
 
+    private func updateObservedExitIP() async {
+        guard vpnStatus.isConnectedOrConnecting else {
+            observedExitIP = nil
+            observedExitCountry = nil
+            return
+        }
+
+        observedExitIP = await ConnectivityProbeRunner.fetchText(url: URL(string: "https://api.ipify.org")!)
+        observedExitCountry = await fetchExitCountry()
+    }
+
+    private func exitIPProbe(serverID: String) async -> ConnectivityProbeResult {
+        guard vpnStatus.isConnectedOrConnecting else {
+            observedExitIP = nil
+            observedExitCountry = nil
+            return ConnectivityProbeResult(
+                targetID: "exit-ip",
+                targetKind: .vpnProtectedEndpoint,
+                serverID: serverID,
+                method: .httpHead,
+                succeeded: false,
+                packetLoss: 1
+            )
+        }
+
+        let started = Date()
+        let exitIP = await ConnectivityProbeRunner.fetchText(url: URL(string: "https://api.ipify.org")!)
+        observedExitIP = exitIP
+        return ConnectivityProbeResult(
+            targetID: "exit-ip",
+            targetKind: .vpnProtectedEndpoint,
+            serverID: serverID,
+            method: .httpHead,
+            succeeded: exitIP != nil,
+            latencyMilliseconds: Date().timeIntervalSince(started) * 1_000,
+            packetLoss: exitIP == nil ? 1 : 0
+        )
+    }
+
+    private func exitCountryProbe(serverID: String) async -> ConnectivityProbeResult {
+        guard vpnStatus.isConnectedOrConnecting else {
+            observedExitCountry = nil
+            return ConnectivityProbeResult(
+                targetID: "exit-country",
+                targetKind: .vpnProtectedEndpoint,
+                serverID: serverID,
+                method: .httpGet,
+                succeeded: false,
+                packetLoss: 1
+            )
+        }
+
+        let started = Date()
+        let country = await fetchExitCountry()
+        observedExitCountry = country
+        return ConnectivityProbeResult(
+            targetID: "exit-country",
+            targetKind: .vpnProtectedEndpoint,
+            serverID: serverID,
+            method: .httpGet,
+            succeeded: country != nil,
+            latencyMilliseconds: Date().timeIntervalSince(started) * 1_000,
+            packetLoss: country == nil ? 1 : 0
+        )
+    }
+
+    private func fetchExitCountry() async -> String? {
+        guard let json = await ConnectivityProbeRunner.fetchJSONDictionary(url: URL(string: "https://api.country.is")!),
+              let country = json["country"] as? String else {
+            return nil
+        }
+        let normalized = country.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        return normalized.isEmpty ? nil : normalized
+    }
+
     private func applyAutomaticFailoverIfNeeded() async {
         guard automaticFailoverEnabled, vpnStatus.isConnectedOrConnecting else {
             return
@@ -873,12 +1142,15 @@ final class iOSDashboardModel: ObservableObject {
 
         guard case .switchServer(_, let to, let reason) = healthAssessment.recommendedAction,
               profiles.contains(where: { $0.id == to }),
-              to != activeProfile?.id else {
+              to != displayedProfile?.id else {
             return
         }
 
         let oldProfile = activeProfile?.displayName ?? "profile"
         do {
+            if let from = displayedProfile?.id {
+                quarantineProfile(id: from)
+            }
             try profileStore.setActiveProfile(id: to)
             reloadProfiles()
             lastAutomaticFailoverDate = Date()
@@ -1016,8 +1288,7 @@ struct iOSDashboardView: View {
                 VStack(spacing: 16) {
                     header
                     routeCard
-                    profileList
-                    routingExceptionsCard
+                    navigationCards
                     healthAndRecoveryCard
                     statusCard
                 }
@@ -1093,6 +1364,14 @@ struct iOSDashboardView: View {
                 .font(.system(size: 34, weight: .bold, design: .rounded))
                 .foregroundStyle(AppTheme.primaryText)
 
+            if let profile = model.displayedProfile {
+                Text(routeEndpointText(for: profile))
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             HStack {
                 Label("Current RU", systemImage: "location.fill")
                 Label("Home IL", systemImage: "house.fill")
@@ -1115,6 +1394,99 @@ struct iOSDashboardView: View {
             .tint(model.isConnectedOrConnecting ? .red : AppTheme.accent)
         }
         .padding(18)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private var navigationCards: some View {
+        VStack(spacing: 12) {
+            NavigationLink {
+                iOSProfilesScreen(model: model)
+            } label: {
+                navigationCard(
+                    title: "Profiles",
+                    subtitle: profilesSubtitle,
+                    systemImage: "server.rack",
+                    detail: "\(model.profiles.count)"
+                )
+            }
+            .buttonStyle(.plain)
+
+            NavigationLink {
+                iOSRoutingExceptionsScreen(model: model)
+            } label: {
+                navigationCard(
+                    title: "Routing Exceptions",
+                    subtitle: routingSubtitle,
+                    systemImage: "arrow.triangle.branch",
+                    detail: "\(model.routingExceptions.rules.count)"
+                )
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var profilesSubtitle: String {
+        if let profile = model.connectedProfile {
+            let exit = model.observedExitIP.map { " · exit \($0)" } ?? ""
+            let country = model.observedExitCountry.map { " · country \($0)" } ?? ""
+            return "Connected: \(profile.displayName) · \(profile.endpointHost ?? "endpoint hidden")\(exit)\(country)"
+        }
+
+        guard let profile = model.activeProfile else {
+            return "No imported profiles"
+        }
+
+        return "Active: \(profile.displayName) · \(profile.endpointHost ?? "endpoint hidden")"
+    }
+
+    private func routeEndpointText(for profile: StoredAmneziaConfigProfile) -> String {
+        var parts = ["endpoint \(profile.endpointHost ?? "hidden")"]
+        if let observedExitIP = model.observedExitIP {
+            parts.append("exit \(observedExitIP)")
+        }
+        if let observedExitCountry = model.observedExitCountry {
+            parts.append("country \(observedExitCountry)")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var routingSubtitle: String {
+        let forceCount = model.routingExceptions.rules.filter { $0.mode == .forceVPN && $0.isEnabled }.count
+        let bypassCount = model.routingExceptions.rules.filter { $0.mode == .bypassVPN && $0.isEnabled }.count
+        return "\(forceCount) through VPN · \(bypassCount) without VPN"
+    }
+
+    private func navigationCard(title: String, subtitle: String, systemImage: String, detail: String) -> some View {
+        HStack(spacing: 14) {
+            Image(systemName: systemImage)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(AppTheme.accent)
+                .frame(width: 30)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.headline)
+                    .foregroundStyle(AppTheme.primaryText)
+                Text(subtitle)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 10)
+
+            Text(detail)
+                .font(.callout.monospacedDigit().weight(.bold))
+                .foregroundStyle(AppTheme.accent)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(AppTheme.row, in: Capsule())
+
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(AppTheme.secondaryText)
+        }
+        .padding(16)
         .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
@@ -1158,6 +1530,14 @@ struct iOSDashboardView: View {
                             }
                         }
                         .buttonStyle(.plain)
+                        .simultaneousGesture(
+                            TapGesture(count: 2).onEnded {
+                                NSLog("RealAiVPN iOS inline profile row double tapped id=%@ name=%@",
+                                      profile.id,
+                                      profile.displayName)
+                                model.reconnectProfile(id: profile.id)
+                            }
+                        )
 
                         Button(role: .destructive) {
                             model.deleteProfile(id: profile.id)
@@ -1192,6 +1572,11 @@ struct iOSDashboardView: View {
             }
 
             Toggle("Auto-switch degraded VPN", isOn: $model.automaticFailoverEnabled)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(AppTheme.primaryText)
+                .tint(AppTheme.accent)
+
+            Toggle("Kill Switch", isOn: $model.killSwitchEnabled)
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(AppTheme.primaryText)
                 .tint(AppTheme.accent)
@@ -1234,9 +1619,9 @@ struct iOSDashboardView: View {
         switch state {
         case .healthy:
             return AppTheme.success
-        case .degraded:
+        case .degradedSoft, .degradedHard:
             return AppTheme.warning
-        case .stalled, .down:
+        case .stalled, .down, .connectedButUnusable:
             return .red
         }
     }
@@ -1392,6 +1777,461 @@ struct iOSDashboardView: View {
         }
         .padding(18)
         .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
+private struct iOSProfilesScreen: View {
+    @ObservedObject var model: iOSDashboardModel
+    @State private var showingPasteImport = false
+    @State private var importingConfProfile = false
+    @State private var importingJSONProfile = false
+    @State private var renamingProfile: StoredAmneziaConfigProfile?
+    @State private var deletingProfile: StoredAmneziaConfigProfile?
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(spacing: 12) {
+                if model.profiles.isEmpty {
+                    emptyState
+                } else {
+                    ForEach(model.profiles) { profile in
+                        profileRow(profile)
+                    }
+                }
+            }
+            .padding(18)
+        }
+        .background(AppTheme.background.ignoresSafeArea())
+        .navigationTitle("Profiles")
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Button {
+                        showingPasteImport = true
+                    } label: {
+                        Label("Paste key / URL", systemImage: "doc.on.clipboard")
+                    }
+
+                    Button {
+                        importingConfProfile = true
+                    } label: {
+                        Label("Import .conf", systemImage: "doc.badge.plus")
+                    }
+
+                    Button {
+                        importingJSONProfile = true
+                    } label: {
+                        Label("Import JSON", systemImage: "curlybraces.square")
+                    }
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.headline.weight(.bold))
+                }
+                .accessibilityLabel("Add profile")
+            }
+        }
+        .sheet(isPresented: $showingPasteImport) {
+            iOSProfilePasteImportSheet { name, rawConfig in
+                model.importProfileFromPastedText(displayName: name, rawConfig: rawConfig)
+            }
+        }
+        .sheet(item: $renamingProfile) { profile in
+            iOSProfileRenameSheet(profile: profile) { newName in
+                model.renameProfile(id: profile.id, displayName: newName)
+            }
+        }
+        .confirmationDialog(
+            "Delete profile?",
+            isPresented: Binding(
+                get: { deletingProfile != nil },
+                set: { if !$0 { deletingProfile = nil } }
+            ),
+            presenting: deletingProfile
+        ) { profile in
+            Button("Delete \(profile.displayName)", role: .destructive) {
+                model.deleteProfile(id: profile.id)
+                deletingProfile = nil
+            }
+            Button("Cancel", role: .cancel) {
+                deletingProfile = nil
+            }
+        } message: { profile in
+            Text("This removes \(profile.displayName) from Real Ai VPN. Other profiles and routing exceptions are kept.")
+        }
+        .fileImporter(
+            isPresented: $importingConfProfile,
+            allowedContentTypes: [UTType(filenameExtension: "conf") ?? .data],
+            allowsMultipleSelection: false,
+            onCompletion: importFileResult
+        )
+        .fileImporter(
+            isPresented: $importingJSONProfile,
+            allowedContentTypes: [.json],
+            allowsMultipleSelection: false,
+            onCompletion: importFileResult
+        )
+    }
+
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("No imported profiles", systemImage: "server.rack")
+                .font(.headline)
+                .foregroundStyle(AppTheme.primaryText)
+            Text("Use the import button on the main screen to add AmneziaWG .conf or Shadowrocket VLESS profiles.")
+                .font(.callout)
+                .foregroundStyle(AppTheme.secondaryText)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(18)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private func profileRow(_ profile: StoredAmneziaConfigProfile) -> some View {
+        HStack(spacing: 10) {
+            Button {
+                NSLog("RealAiVPN iOS profile row tapped id=%@ name=%@ kind=%@ endpoint=%@",
+                      profile.id,
+                      profile.displayName,
+                      profile.kind.rawValue,
+                      profile.endpointHost ?? "unknown")
+                model.setActiveProfile(id: profile.id)
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: model.activeProfile?.id == profile.id ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(AppTheme.accent)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(profile.displayName)
+                            .font(.headline)
+                            .foregroundStyle(AppTheme.primaryText)
+                            .lineLimit(2)
+                        Text("\(profile.regionCode ?? "Unknown") · \(profile.endpointHost ?? "endpoint hidden")")
+                            .font(.subheadline)
+                            .foregroundStyle(AppTheme.secondaryText)
+                            .lineLimit(2)
+                    }
+
+                    Spacer(minLength: 10)
+
+                    Text(profile.kind.rawValue)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(AppTheme.accent)
+                        .lineLimit(1)
+                }
+            }
+            .buttonStyle(.plain)
+            .simultaneousGesture(
+                TapGesture(count: 2).onEnded {
+                    NSLog("RealAiVPN iOS profile row double tapped id=%@ name=%@",
+                          profile.id,
+                          profile.displayName)
+                    model.reconnectProfile(id: profile.id)
+                }
+            )
+
+            Button {
+                renamingProfile = profile
+            } label: {
+                Image(systemName: "pencil")
+                    .font(.callout.weight(.bold))
+                    .frame(width: 42, height: 42)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(AppTheme.secondaryText)
+            .accessibilityLabel("Rename \(profile.displayName)")
+
+            Button(role: .destructive) {
+                deletingProfile = profile
+            } label: {
+                Image(systemName: "trash")
+                    .font(.callout.weight(.bold))
+                    .frame(width: 42, height: 42)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.red)
+            .accessibilityLabel("Delete \(profile.displayName)")
+        }
+        .padding(14)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private func importFileResult(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else {
+                return
+            }
+            do {
+                let didAccess = url.startAccessingSecurityScopedResource()
+                defer {
+                    if didAccess {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                }
+                let imported = try String(contentsOf: url, encoding: .utf8)
+                model.importProfileFromPastedText(displayName: url.deletingPathExtension().lastPathComponent, rawConfig: imported)
+            } catch {
+                model.reportStatus("Could not import \(url.lastPathComponent): \(error.localizedDescription)")
+            }
+        case .failure(let error):
+            model.reportStatus("Could not import config: \(error.localizedDescription)")
+        }
+    }
+}
+
+private struct iOSProfilePasteImportSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var displayName = ""
+    @State private var rawConfig = ""
+    let onImport: (String, String) -> Void
+
+    private var trimmedConfig: String {
+        rawConfig.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Display name") {
+                    TextField("Optional name", text: $displayName)
+                }
+
+                Section("Key / URL / Config") {
+                    TextEditor(text: $rawConfig)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(minHeight: 220)
+                }
+
+                Section {
+                    Text("Paste a vpn:// key, VLESS URL, subscription URL, or raw config. Secrets stay local.")
+                        .font(.footnote)
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(AppTheme.background.ignoresSafeArea())
+            .navigationTitle("Add Profile")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Import") {
+                        onImport(displayName, rawConfig)
+                        dismiss()
+                    }
+                    .disabled(trimmedConfig.isEmpty)
+                }
+            }
+        }
+    }
+}
+
+private struct iOSProfileRenameSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let profile: StoredAmneziaConfigProfile
+    let onSave: (String) -> Void
+    @State private var displayName: String
+
+    init(profile: StoredAmneziaConfigProfile, onSave: @escaping (String) -> Void) {
+        self.profile = profile
+        self.onSave = onSave
+        _displayName = State(initialValue: profile.displayName)
+    }
+
+    private var trimmedName: String {
+        displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Profile name") {
+                    TextField("Name", text: $displayName)
+                }
+
+                Section {
+                    Text(profile.endpointHost ?? profile.kind.rawValue)
+                        .font(.footnote)
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .lineLimit(1)
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(AppTheme.background.ignoresSafeArea())
+            .navigationTitle("Rename Profile")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        onSave(displayName)
+                        dismiss()
+                    }
+                    .disabled(trimmedName.isEmpty)
+                }
+            }
+        }
+    }
+}
+
+private struct iOSRoutingExceptionsScreen: View {
+    @ObservedObject var model: iOSDashboardModel
+    @State private var forceVPNException = ""
+    @State private var bypassVPNException = ""
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                routingForm
+                rulesList
+            }
+            .padding(18)
+        }
+        .background(AppTheme.background.ignoresSafeArea())
+        .navigationTitle("Routing")
+        .navigationBarTitleDisplayMode(.large)
+    }
+
+    private var routingForm: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("Routing Exceptions", systemImage: "arrow.triangle.branch")
+                .font(.headline)
+                .foregroundStyle(AppTheme.secondaryText)
+
+            Text("Exact domains, IPs, or CIDR ranges. Changes apply on the next reconnect.")
+                .font(.footnote)
+                .foregroundStyle(AppTheme.secondaryText)
+
+            exceptionInput(
+                title: "Через VPN",
+                placeholder: "example.ru",
+                text: $forceVPNException,
+                mode: .forceVPN
+            )
+
+            exceptionInput(
+                title: "Без VPN",
+                placeholder: "mos.ru",
+                text: $bypassVPNException,
+                mode: .bypassVPN
+            )
+        }
+        .padding(18)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private var rulesList: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Rules", systemImage: "list.bullet")
+                .font(.headline)
+                .foregroundStyle(AppTheme.secondaryText)
+
+            if model.routingExceptions.rules.isEmpty {
+                Text("No routing exceptions yet.")
+                    .font(.callout)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 12)
+            } else {
+                ForEach(model.routingExceptions.rules) { rule in
+                    routingExceptionRow(rule)
+                }
+            }
+        }
+        .padding(18)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private func exceptionInput(
+        title: String,
+        placeholder: String,
+        text: Binding<String>,
+        mode: RoutingExceptionMode
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(mode == .forceVPN ? AppTheme.accent : AppTheme.success)
+
+            HStack(spacing: 10) {
+                TextField(placeholder, text: text)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(.white.opacity(0.12), lineWidth: 1)
+                    )
+
+                Button {
+                    model.addRoutingException(value: text.wrappedValue, mode: mode)
+                    text.wrappedValue = ""
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.headline.weight(.bold))
+                        .frame(width: 42, height: 42)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white)
+                .background(mode == .forceVPN ? AppTheme.accent : AppTheme.success, in: Circle())
+                .disabled(text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .opacity(text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.45 : 1)
+                .accessibilityLabel("Add \(title)")
+            }
+        }
+    }
+
+    private func routingExceptionRow(_ rule: RoutingExceptionRule) -> some View {
+        HStack(spacing: 12) {
+            Toggle("", isOn: Binding(
+                get: { rule.isEnabled },
+                set: { model.setRoutingExceptionEnabled(id: rule.id, isEnabled: $0) }
+            ))
+            .labelsHidden()
+            .tint(AppTheme.accent)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(rule.value)
+                    .font(.system(.callout, design: .monospaced).weight(.semibold))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(rule.mode.title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(rule.mode == .forceVPN ? AppTheme.accent : AppTheme.success)
+            }
+
+            Spacer()
+
+            Button(role: .destructive) {
+                model.deleteRoutingException(id: rule.id)
+            } label: {
+                Image(systemName: "trash")
+                    .font(.body.weight(.semibold))
+                    .frame(width: 36, height: 36)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(AppTheme.warning)
+            .accessibilityLabel("Delete \(rule.value)")
+        }
+        .padding(12)
+        .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }
 

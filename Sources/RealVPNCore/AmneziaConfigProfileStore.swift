@@ -163,6 +163,21 @@ public struct AmneziaConfigProfileStore: Sendable {
         try save(collection)
     }
 
+    public func renameProfile(id: String, displayName: String) throws {
+        let trimmedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            return
+        }
+
+        var collection = try load()
+        guard let index = collection.profiles.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+
+        collection.profiles[index].displayName = trimmedName
+        try save(collection)
+    }
+
     public func deleteProfile(id: String) throws {
         var collection = try load()
         collection.profiles.removeAll { $0.id == id }
