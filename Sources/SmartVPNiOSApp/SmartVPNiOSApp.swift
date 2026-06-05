@@ -14,6 +14,12 @@ private let iosAppLogger = Logger(
     category: "iOSDashboard"
 )
 
+private var iOSBuildLabel: String {
+    Bundle.main.object(forInfoDictionaryKey: "RAIVPNBuildLabel") as? String
+        ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        ?? "dev"
+}
+
 private final class iOSNotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
@@ -1270,7 +1276,667 @@ final class iOSDashboardModel: ObservableObject {
     }
 }
 
+private enum iOSMainTab: Hashable {
+    case home
+    case profiles
+    case route
+    case settings
+}
+
 struct iOSDashboardView: View {
+    @ObservedObject var model: iOSDashboardModel
+    @State private var selectedTab: iOSMainTab = .home
+
+    var body: some View {
+        TabView(selection: $selectedTab) {
+            NavigationStack {
+                iOSHomeScreen(model: model) {
+                    selectedTab = .route
+                } openProfiles: {
+                    selectedTab = .profiles
+                }
+            }
+            .tabItem {
+                Label("Home", systemImage: "house.fill")
+            }
+            .tag(iOSMainTab.home)
+
+            NavigationStack {
+                iOSProfilesScreen(model: model)
+            }
+            .tabItem {
+                Label("Profiles", systemImage: "person.2.fill")
+            }
+            .tag(iOSMainTab.profiles)
+
+            NavigationStack {
+                iOSRouteScreen(model: model)
+            }
+            .tabItem {
+                Label("Route", systemImage: "arrow.triangle.swap")
+            }
+            .tag(iOSMainTab.route)
+
+            NavigationStack {
+                iOSSettingsScreen(model: model)
+            }
+            .tabItem {
+                Label("Settings", systemImage: "gearshape.fill")
+            }
+            .tag(iOSMainTab.settings)
+        }
+        .tint(AppTheme.accent)
+        .background(AppTheme.background.ignoresSafeArea())
+    }
+}
+
+private struct iOSHomeScreen: View {
+    @ObservedObject var model: iOSDashboardModel
+    let openRoute: () -> Void
+    let openProfiles: () -> Void
+
+    private var activeProfile: StoredAmneziaConfigProfile? {
+        model.displayedProfile ?? model.activeProfile
+    }
+
+    private var statusTitle: String {
+        model.isConnectedOrConnecting ? "Connected" : "Disconnected"
+    }
+
+    private var locationTitle: String {
+        guard let profile = activeProfile else {
+            return "No profile"
+        }
+        let region = profile.regionCode ?? "ZZ"
+        return "\(profile.displayName) · \(region)"
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 14) {
+                header
+                heroCard
+                healthCard
+                routeSummaryCard
+                profilesPreviewCard
+                statusCard
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 28)
+        }
+        .background(AppTheme.background.ignoresSafeArea())
+        .toolbar(.hidden, for: .navigationBar)
+    }
+
+    private var header: some View {
+        HStack(spacing: 14) {
+            AppIconImage()
+                .frame(width: 60, height: 60)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Real Ai VPN")
+                    .font(.system(size: 34, weight: .bold, design: .rounded))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                Text("v\(iOSBuildLabel)")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            NavigationLink {
+                iOSProfilesScreen(model: model)
+            } label: {
+                Image(systemName: "square.and.arrow.down")
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .frame(width: 54, height: 54)
+                    .background(AppTheme.floatingButton, in: Circle())
+                    .overlay(Circle().stroke(AppTheme.border, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Import profile")
+        }
+    }
+
+    private var heroCard: some View {
+        VStack(spacing: 18) {
+            ZStack {
+                Circle()
+                    .stroke(AppTheme.accent.opacity(0.20), lineWidth: 10)
+                Circle()
+                    .trim(from: 0, to: max(0.02, CGFloat(model.confidence) / 100))
+                    .stroke(
+                        AppTheme.accent,
+                        style: StrokeStyle(lineWidth: 10, lineCap: .round)
+                    )
+                    .rotationEffect(.degrees(-90))
+                Image(systemName: model.isConnectedOrConnecting ? "checkmark.shield.fill" : "shield.fill")
+                    .font(.system(size: 50, weight: .bold))
+                    .foregroundStyle(model.isConnectedOrConnecting ? AppTheme.accent : AppTheme.secondaryText)
+            }
+            .frame(width: 168, height: 168)
+            .padding(.top, 8)
+
+            VStack(spacing: 7) {
+                Text(statusTitle)
+                    .font(.title.bold())
+                    .foregroundStyle(AppTheme.primaryText)
+                Text(locationTitle)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                Text("\(model.confidence)% confidence")
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(AppTheme.accent)
+            }
+
+            metricsGrid
+
+            Button {
+                model.isConnectedOrConnecting ? model.disconnect() : model.connect()
+            } label: {
+                Label(
+                    model.isConnectedOrConnecting ? "Disconnect" : "Connect",
+                    systemImage: model.isConnectedOrConnecting ? "stop.fill" : "power"
+                )
+                .font(.headline.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 13)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(model.isConnectedOrConnecting ? .red : .white)
+            .background(
+                model.isConnectedOrConnecting
+                    ? Color.red.opacity(0.10)
+                    : AppTheme.accent,
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+        }
+        .padding(16)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+        .shadow(color: AppTheme.shadow, radius: 22, x: 0, y: 14)
+    }
+
+    private var metricsGrid: some View {
+        HStack(spacing: 0) {
+            metric(title: "Latency", value: latencyText)
+            Divider().opacity(0.35)
+            metric(title: "Packet Loss", value: packetLossText)
+            Divider().opacity(0.35)
+            metric(title: "Last Check", value: lastCheckText)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 4)
+    }
+
+    private func metric(title: String, value: String) -> some View {
+        VStack(spacing: 4) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(AppTheme.secondaryText)
+            Text(value)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(AppTheme.primaryText)
+                .monospacedDigit()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var healthCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Connection Health")
+                .font(.title3.bold())
+                .foregroundStyle(AppTheme.primaryText)
+
+            healthRow(title: "Provider", report: model.healthAssessment.directPath)
+            healthRow(title: "Tunnel", report: model.healthAssessment.vpnPath)
+            HStack {
+                statusDot(color: AppTheme.accent)
+                Text("Auto Recovery")
+                    .font(.headline)
+                    .foregroundStyle(AppTheme.primaryText)
+                Spacer()
+                Text(model.automaticFailoverEnabled ? "Ready" : "Off")
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(model.automaticFailoverEnabled ? AppTheme.accent : AppTheme.secondaryText)
+            }
+            .padding(13)
+            .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            Label("All systems operational", systemImage: "checkmark.circle.fill")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(AppTheme.success)
+                .padding(.top, 4)
+        }
+        .padding(16)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+        .shadow(color: AppTheme.shadow, radius: 18, x: 0, y: 10)
+    }
+
+    private func healthRow(title: String, report: PathHealthReport) -> some View {
+        HStack {
+            statusDot(color: color(for: report.state))
+            Text(title)
+                .font(.headline)
+                .foregroundStyle(AppTheme.primaryText)
+            Spacer()
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(report.state.rawValue.capitalized)
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(color(for: report.state))
+                Text("\(Int((report.successRate * 100).rounded()))%")
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(AppTheme.secondaryText)
+            }
+        }
+        .padding(13)
+        .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func statusDot(color: Color) -> some View {
+        Circle()
+            .fill(color)
+            .frame(width: 10, height: 10)
+    }
+
+    private var routeSummaryCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Current Route")
+                .font(.title3.bold())
+                .foregroundStyle(AppTheme.primaryText)
+            routeLine("Current Region", "RU - Russia")
+            routeLine("Home Region", "IL - Israel")
+            routeLine("Exit Location", exitLocationText)
+            Divider()
+            Button(action: openRoute) {
+                HStack {
+                    Text("Details")
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                }
+                .font(.headline)
+                .foregroundStyle(AppTheme.primaryText)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(16)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+    }
+
+    private func routeLine(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(AppTheme.secondaryText)
+            Spacer()
+            Text(value)
+                .font(.callout.weight(.bold))
+                .foregroundStyle(AppTheme.primaryText)
+                .multilineTextAlignment(.trailing)
+        }
+    }
+
+    private var profilesPreviewCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("VPN Profiles")
+                    .font(.title3.bold())
+                    .foregroundStyle(AppTheme.primaryText)
+                Spacer()
+                Button(action: openProfiles) {
+                    Image(systemName: "plus")
+                        .font(.headline.weight(.bold))
+                        .foregroundStyle(AppTheme.accent)
+                }
+                .buttonStyle(.plain)
+            }
+
+            ForEach(Array(model.profiles.prefix(3))) { profile in
+                Button {
+                    model.setActiveProfile(id: profile.id)
+                } label: {
+                    HStack(spacing: 10) {
+                        Text(flag(for: profile.regionCode))
+                        Text(profile.displayName)
+                            .font(.headline)
+                            .foregroundStyle(AppTheme.primaryText)
+                            .lineLimit(1)
+                        Spacer()
+                        Text(profile.id == model.activeProfile?.id ? "Active" : "Standby")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(profile.id == model.activeProfile?.id ? AppTheme.success : AppTheme.secondaryText)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(AppTheme.pill, in: Capsule())
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+
+            Divider()
+
+            Button(action: openProfiles) {
+                HStack {
+                    Text("View All Profiles")
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                }
+                .font(.headline)
+                .foregroundStyle(AppTheme.primaryText)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(16)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+    }
+
+    private var statusCard: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Label("Status", systemImage: "waveform.path.ecg")
+                .font(.headline)
+                .foregroundStyle(AppTheme.secondaryText)
+            Text(model.vpnStatus.rawValue.capitalized)
+                .font(.title2.bold())
+                .foregroundStyle(AppTheme.primaryText)
+            Text(model.message)
+                .font(.callout)
+                .foregroundStyle(AppTheme.secondaryText)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if let diagnostic = model.tunnelDiagnostic {
+                Text("\(diagnostic.stage): \(diagnostic.message)")
+                    .font(.caption)
+                    .foregroundStyle(AppTheme.warning)
+                    .lineLimit(4)
+            }
+        }
+        .padding(16)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+    }
+
+    private var latencyText: String {
+        guard let latency = model.healthAssessment.vpnPath.averageLatencyMilliseconds
+            ?? model.healthAssessment.directPath.averageLatencyMilliseconds else {
+            return "--"
+        }
+        return "\(Int(latency.rounded())) ms"
+    }
+
+    private var packetLossText: String {
+        let loss = model.healthAssessment.vpnPath.averagePacketLoss
+        return "\(Int((loss * 100).rounded()))%"
+    }
+
+    private var lastCheckText: String {
+        guard let lastProbeDate = model.lastProbeDate else {
+            return "--"
+        }
+        return "\(max(0, Int(Date().timeIntervalSince(lastProbeDate))))s ago"
+    }
+
+    private var exitLocationText: String {
+        let region = activeProfile?.regionCode ?? model.observedExitCountry ?? "ZZ"
+        if let exit = model.observedExitIP {
+            return "\(region) - \(exit)"
+        }
+        return region
+    }
+
+    private func color(for state: PathHealthState) -> Color {
+        switch state {
+        case .healthy:
+            return AppTheme.success
+        case .degradedSoft, .degradedHard:
+            return AppTheme.warning
+        case .stalled, .down, .connectedButUnusable:
+            return .red
+        }
+    }
+}
+
+private struct iOSRouteScreen: View {
+    @ObservedObject var model: iOSDashboardModel
+    @State private var selectedProfileID: String?
+
+    private var selectedProfile: StoredAmneziaConfigProfile? {
+        model.profiles.first { $0.id == selectedProfileID } ?? model.activeProfile
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                routeSummary
+                profilePicker
+                NavigationLink {
+                    iOSRoutingExceptionsScreen(model: model)
+                } label: {
+                    HStack {
+                        Label("Routing Exceptions", systemImage: "arrow.triangle.branch")
+                        Spacer()
+                        Text("\(model.routingExceptions.rules.count)")
+                            .font(.headline.monospacedDigit())
+                            .foregroundStyle(AppTheme.accent)
+                        Image(systemName: "chevron.right")
+                    }
+                    .font(.headline)
+                    .foregroundStyle(AppTheme.primaryText)
+                    .padding(16)
+                    .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    guard let selectedProfile else {
+                        return
+                    }
+                    if model.isConnectedOrConnecting {
+                        model.reconnectProfile(id: selectedProfile.id)
+                    } else {
+                        model.setActiveProfile(id: selectedProfile.id)
+                    }
+                } label: {
+                    Text("Apply Route")
+                        .font(.headline.weight(.bold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white)
+                .background(AppTheme.accent, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .disabled(selectedProfile == nil)
+            }
+            .padding(16)
+            .padding(.bottom, 24)
+        }
+        .background(AppTheme.background.ignoresSafeArea())
+        .navigationTitle("Switch Route")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            selectedProfileID = model.activeProfile?.id
+        }
+    }
+
+    private var routeSummary: some View {
+        VStack(spacing: 12) {
+            routeLine("Current Region", "RU - Russia")
+            routeLine("Home Region", "IL - Israel")
+            routeLine("Exit Location", selectedProfile.map { "\($0.regionCode ?? "ZZ") - \($0.displayName)" } ?? "No profile")
+        }
+        .padding(16)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+    }
+
+    private func routeLine(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(AppTheme.secondaryText)
+            Spacer()
+            Text(value)
+                .font(.callout.weight(.bold))
+                .foregroundStyle(AppTheme.primaryText)
+                .multilineTextAlignment(.trailing)
+        }
+    }
+
+    private var profilePicker: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Select Exit Location")
+                .font(.headline)
+                .foregroundStyle(AppTheme.primaryText)
+
+            ForEach(model.profiles) { profile in
+                Button {
+                    selectedProfileID = profile.id
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: selectedProfileID == profile.id ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(selectedProfileID == profile.id ? AppTheme.accent : AppTheme.secondaryText)
+                        Text(flag(for: profile.regionCode))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(profile.displayName)
+                                .font(.headline)
+                                .foregroundStyle(AppTheme.primaryText)
+                            Text(profile.endpointHost ?? "endpoint hidden")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(AppTheme.secondaryText)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+                        if profile.id == model.activeProfile?.id {
+                            Text("Active")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(AppTheme.success)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(AppTheme.pill, in: Capsule())
+                        }
+                    }
+                    .padding(13)
+                    .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(16)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+    }
+}
+
+private struct iOSSettingsScreen: View {
+    @ObservedObject var model: iOSDashboardModel
+    @AppStorage("ios.showNotificationsAfterSwitch") private var showNotificationsAfterSwitch = true
+    @AppStorage("ios.appearanceMode") private var appearanceMode = "System"
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                settingsSection("GENERAL") {
+                    settingNavigationRow(title: "Appearance", value: appearanceMode, systemImage: "circle.lefthalf.filled")
+                    settingToggleRow(title: "Kill Switch", systemImage: "shield.fill", isOn: $model.killSwitchEnabled)
+                    settingNavigationRow(title: "Language", value: "English", systemImage: "globe")
+                }
+
+                settingsSection("BEHAVIOR") {
+                    settingToggleRow(title: "Auto-switch", systemImage: "arrow.triangle.2.circlepath", isOn: $model.automaticFailoverEnabled)
+                    settingToggleRow(title: "Show Notification", systemImage: "bell.fill", isOn: $showNotificationsAfterSwitch)
+                }
+
+                settingsSection("ABOUT") {
+                    settingNavigationRow(title: "Version", value: iOSBuildLabel, systemImage: "info.circle")
+                    settingNavigationRow(title: "About Real Ai VPN", value: "", systemImage: "lock.shield")
+                }
+            }
+            .padding(16)
+            .padding(.bottom, 24)
+        }
+        .background(AppTheme.background.ignoresSafeArea())
+        .navigationTitle("Settings")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func settingsSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(AppTheme.secondaryText)
+                .padding(.horizontal, 2)
+            VStack(spacing: 0) {
+                content()
+            }
+            .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+        }
+    }
+
+    private func settingToggleRow(title: String, systemImage: String, isOn: Binding<Bool>) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: systemImage)
+                .foregroundStyle(AppTheme.secondaryText)
+                .frame(width: 22)
+            Text(title)
+                .font(.headline)
+                .foregroundStyle(AppTheme.primaryText)
+            Spacer()
+            Toggle("", isOn: isOn)
+                .labelsHidden()
+                .tint(AppTheme.accent)
+        }
+        .padding(14)
+        .background(AppTheme.row.opacity(0.001))
+    }
+
+    private func settingNavigationRow(title: String, value: String, systemImage: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: systemImage)
+                .foregroundStyle(AppTheme.secondaryText)
+                .frame(width: 22)
+            Text(title)
+                .font(.headline)
+                .foregroundStyle(AppTheme.primaryText)
+            Spacer()
+            if !value.isEmpty {
+                Text(value)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
+            }
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(AppTheme.secondaryText)
+        }
+        .padding(14)
+    }
+}
+
+private func flag(for regionCode: String?) -> String {
+    guard let regionCode = regionCode?.uppercased(), regionCode.count == 2 else {
+        return "🏳️"
+    }
+    let regionalIndicatorBase: UInt32 = 127397
+    var scalars = String.UnicodeScalarView()
+    for scalar in regionCode.unicodeScalars {
+        guard let flagScalar = UnicodeScalar(regionalIndicatorBase + scalar.value) else {
+            return "🏳️"
+        }
+        scalars.append(flagScalar)
+    }
+    return String(scalars)
+}
+
+private struct LegacyiOSDashboardView: View {
     @ObservedObject var model: iOSDashboardModel
     @State private var importingProfile = false
     @State private var forceVPNException = ""
@@ -2254,17 +2920,21 @@ private struct AppIconImage: View {
 private enum AppTheme {
     static let background = LinearGradient(
         colors: [
-            Color(red: 0.08, green: 0.11, blue: 0.15),
-            Color(red: 0.13, green: 0.12, blue: 0.17)
+            Color(red: 0.97, green: 0.99, blue: 1.00),
+            Color(red: 0.92, green: 0.97, blue: 0.99)
         ],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
     )
-    static let card = Color.white.opacity(0.12)
-    static let row = Color.white.opacity(0.08)
-    static let primaryText = Color.white
-    static let secondaryText = Color.white.opacity(0.72)
-    static let accent = Color(red: 0.27, green: 0.76, blue: 0.82)
-    static let success = Color(red: 0.34, green: 0.82, blue: 0.62)
-    static let warning = Color(red: 1.0, green: 0.58, blue: 0.26)
+    static let card = Color.white.opacity(0.82)
+    static let row = Color(red: 0.96, green: 0.985, blue: 1.0).opacity(0.78)
+    static let pill = Color(red: 0.89, green: 0.97, blue: 0.96)
+    static let floatingButton = Color.white.opacity(0.72)
+    static let border = Color.black.opacity(0.08)
+    static let shadow = Color(red: 0.10, green: 0.22, blue: 0.28).opacity(0.10)
+    static let primaryText = Color(red: 0.06, green: 0.08, blue: 0.11)
+    static let secondaryText = Color(red: 0.38, green: 0.43, blue: 0.50)
+    static let accent = Color(red: 0.00, green: 0.64, blue: 0.58)
+    static let success = Color(red: 0.14, green: 0.70, blue: 0.52)
+    static let warning = Color(red: 0.95, green: 0.50, blue: 0.16)
 }

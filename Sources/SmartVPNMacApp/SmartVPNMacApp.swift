@@ -1632,9 +1632,133 @@ final class DashboardModel: ObservableObject {
     }
 }
 
+private enum MacSidebarPage: String, CaseIterable, Identifiable {
+    case dashboard = "Dashboard"
+    case profiles = "VPN Profiles"
+    case settings = "Settings"
+    case about = "About"
+
+    var id: String { rawValue }
+
+    var symbol: String {
+        switch self {
+        case .dashboard:
+            return "house"
+        case .profiles:
+            return "server.rack"
+        case .settings:
+            return "gearshape"
+        case .about:
+            return "info.circle"
+        }
+    }
+}
+
+private enum MacSettingsSection: String, CaseIterable, Identifiable {
+    case general = "General"
+    case connection = "Connection"
+    case routing = "Routing"
+    case regions = "Regions"
+    case security = "Security"
+
+    var id: String { rawValue }
+
+    var symbol: String {
+        switch self {
+        case .general:
+            return "sparkles"
+        case .connection:
+            return "network"
+        case .routing:
+            return "arrow.triangle.branch"
+        case .regions:
+            return "globe"
+        case .security:
+            return "shield.checkered"
+        }
+    }
+}
+
+private struct MacLiquidTheme {
+    let scheme: ColorScheme
+
+    var background: LinearGradient {
+        if scheme == .dark {
+            return LinearGradient(
+                colors: [
+                    Color(red: 0.08, green: 0.11, blue: 0.15),
+                    Color(red: 0.12, green: 0.16, blue: 0.20),
+                    Color(red: 0.10, green: 0.09, blue: 0.14)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        }
+
+        return LinearGradient(
+            colors: [
+                Color(red: 0.96, green: 0.98, blue: 0.99),
+                Color(red: 0.99, green: 0.995, blue: 1.0),
+                Color(red: 0.93, green: 0.96, blue: 0.98)
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+
+    var primaryText: Color {
+        scheme == .dark ? .white : Color(red: 0.06, green: 0.08, blue: 0.10)
+    }
+
+    var secondaryText: Color {
+        scheme == .dark ? .white.opacity(0.64) : Color(red: 0.34, green: 0.39, blue: 0.45)
+    }
+
+    var tertiaryText: Color {
+        scheme == .dark ? .white.opacity(0.44) : Color(red: 0.52, green: 0.57, blue: 0.63)
+    }
+
+    var cardFill: Color {
+        scheme == .dark ? .white.opacity(0.08) : .white.opacity(0.72)
+    }
+
+    var rowFill: Color {
+        scheme == .dark ? .white.opacity(0.075) : Color(red: 0.96, green: 0.98, blue: 0.99).opacity(0.86)
+    }
+
+    var selectedFill: Color {
+        Color.teal.opacity(scheme == .dark ? 0.22 : 0.12)
+    }
+
+    var stroke: Color {
+        scheme == .dark ? .white.opacity(0.14) : Color.black.opacity(0.08)
+    }
+
+    var accent: Color { .teal }
+    var success: Color { .mint }
+    var warning: Color { .orange }
+    var danger: Color { .red }
+}
+
+private extension View {
+    func macLiquidCard(_ theme: MacLiquidTheme, radius: CGFloat = 14) -> some View {
+        self
+            .background(.ultraThinMaterial.opacity(theme.scheme == .dark ? 0.74 : 0.88), in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .background(theme.cardFill, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .stroke(theme.stroke, lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(theme.scheme == .dark ? 0.18 : 0.06), radius: 18, x: 0, y: 10)
+    }
+}
+
 struct DashboardView: View {
     @ObservedObject var model: DashboardModel
     @Binding var showSettings: Bool
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var selectedPage: MacSidebarPage = .dashboard
+    @State private var selectedSettingsSection: MacSettingsSection = .general
 
     private var buildLabel: String {
         Bundle.main.object(forInfoDictionaryKey: "RAIVPNBuildLabel") as? String
@@ -1643,93 +1767,180 @@ struct DashboardView: View {
     }
 
     var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: [
-                    Color(red: 0.08, green: 0.11, blue: 0.15),
-                    Color(red: 0.12, green: 0.18, blue: 0.22),
-                    Color(red: 0.16, green: 0.13, blue: 0.18)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
+        let theme = MacLiquidTheme(scheme: colorScheme)
 
-            VStack(spacing: 0) {
-                titleBar
-                Divider().opacity(0.16)
-                content
+        GeometryReader { proxy in
+            let compactSidebar = proxy.size.width < 920
+
+            HStack(spacing: 0) {
+                sidebar(theme: theme, compact: compactSidebar)
+                    .frame(width: compactSidebar ? 74 : 188)
+
+                Divider()
+                    .opacity(colorScheme == .dark ? 0.35 : 0.55)
+
+                VStack(spacing: 0) {
+                    topBar(theme: theme, compact: compactSidebar)
+                    Divider().opacity(colorScheme == .dark ? 0.2 : 0.55)
+                    pageContent(theme: theme, compact: compactSidebar)
+                }
             }
+            .frame(width: proxy.size.width, height: proxy.size.height)
         }
-        .foregroundStyle(.white)
-    }
-
-    private var titleBar: some View {
-        HStack(spacing: 14) {
-            Image(systemName: "lock.shield.fill")
-                .font(.system(size: 24, weight: .semibold))
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(.teal)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Real Ai VPN")
-                    .font(.system(size: 18, weight: .semibold))
-                Text("\(titleSubtitle) · v\(buildLabel)")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.white.opacity(0.62))
-            }
-
-            Spacer()
-
-            Button {
-                showSettings = true
-            } label: {
-                Image(systemName: "gearshape.fill")
-                    .font(.system(size: 15, weight: .semibold))
-                    .frame(width: 42, height: 30)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.large)
-
-            Button {
-                model.toggleVPN()
-            } label: {
-                Label(connectButtonTitle, systemImage: connectButtonSymbol)
-                    .frame(width: 132, height: 30)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .tint(model.vpnStatus.isConnectedOrConnecting ? .red : .teal)
-        }
-        .padding(.horizontal, 28)
-        .padding(.vertical, 18)
-        .background(.ultraThinMaterial.opacity(0.62))
+        .background(theme.background.ignoresSafeArea())
+        .foregroundStyle(theme.primaryText)
         .sheet(isPresented: $showSettings) {
             SettingsView(model: model)
         }
     }
 
-    private var content: some View {
-        VStack(spacing: 16) {
-            HStack(alignment: .top, spacing: 16) {
-                ConnectionPanel(model: model)
-                    .frame(maxWidth: .infinity, minHeight: 260)
-
-                HealthPanel(model: model)
-                    .frame(width: 320)
-                    .frame(minHeight: 260)
+    private func sidebar(theme: MacLiquidTheme, compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 18) {
+            if compact {
+                Image(systemName: "shield.lefthalf.filled")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(theme.accent)
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 46)
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Real AI Router")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(theme.primaryText)
+                    Text("Smart VPN Routing")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(theme.secondaryText)
+                }
+                .padding(.top, 46)
+                .padding(.horizontal, 22)
             }
 
-            HStack(alignment: .top, spacing: 16) {
-                ServerRankingPanel(model: model)
-                    .frame(maxWidth: .infinity, minHeight: 300)
+            VStack(spacing: 8) {
+                ForEach(MacSidebarPage.allCases.filter { $0 != .about }) { page in
+                    sidebarButton(page, theme: theme, compact: compact)
+                }
+            }
+            .padding(.horizontal, 12)
 
-                RecoveryPanel(model: model)
-                    .frame(width: 320)
-                    .frame(minHeight: 300)
+            Spacer()
+
+            VStack(spacing: 8) {
+                sidebarButton(.about, theme: theme, compact: compact)
+                if !compact {
+                    Text("v\(buildLabel)")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(theme.tertiaryText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 18)
+        }
+        .background(.ultraThinMaterial.opacity(colorScheme == .dark ? 0.34 : 0.62))
+    }
+
+    private func sidebarButton(_ page: MacSidebarPage, theme: MacLiquidTheme, compact: Bool) -> some View {
+        Button {
+            selectedPage = page
+        } label: {
+            if compact {
+                Image(systemName: page.symbol)
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+                    .foregroundStyle(selectedPage == page ? theme.accent : theme.secondaryText)
+                    .background(selectedPage == page ? theme.selectedFill : .clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            } else {
+                Label(page.rawValue, systemImage: page.symbol)
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .foregroundStyle(selectedPage == page ? theme.accent : theme.secondaryText)
+                    .background(selectedPage == page ? theme.selectedFill : .clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
         }
-        .padding(24)
+        .buttonStyle(.plain)
+        .help(page.rawValue)
+    }
+
+    private func topBar(theme: MacLiquidTheme, compact: Bool) -> some View {
+        HStack(spacing: compact ? 8 : 14) {
+            Menu {
+                Text(titleSubtitle)
+            } label: {
+                HStack(spacing: compact ? 6 : 10) {
+                    Image(systemName: model.vpnStatus.isConnectedOrConnecting ? "checkmark.shield.fill" : "shield")
+                        .foregroundStyle(model.vpnStatus.isConnectedOrConnecting ? .green : theme.secondaryText)
+                    Text(model.vpnStatus.rawValue.capitalized)
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(theme.secondaryText)
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .foregroundStyle(theme.primaryText)
+
+            if selectedPage != .settings && !compact {
+                Text(selectedPage.rawValue)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(theme.secondaryText)
+            }
+
+            Spacer()
+
+            Button {
+                selectedPage = .settings
+                selectedSettingsSection = .general
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 34, height: 30)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .tint(theme.secondaryText)
+
+            Button {
+                model.toggleVPN()
+            } label: {
+                Label(connectButtonTitle, systemImage: connectButtonSymbol)
+                    .frame(width: compact ? 108 : 132, height: 30)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .tint(model.vpnStatus.isConnectedOrConnecting ? .red : .teal)
+        }
+        .padding(.horizontal, compact ? 16 : 28)
+        .padding(.vertical, 16)
+        .background(.ultraThinMaterial.opacity(colorScheme == .dark ? 0.38 : 0.72))
+    }
+
+    @ViewBuilder
+    private func pageContent(theme: MacLiquidTheme, compact: Bool) -> some View {
+        ScrollView {
+            switch selectedPage {
+            case .dashboard:
+                MacDashboardHome(model: model, selectedPage: $selectedPage, theme: theme)
+                    .padding(compact ? 14 : 24)
+            case .profiles:
+                MacProfilesWorkspace(model: model, theme: theme)
+                    .padding(compact ? 14 : 24)
+            case .settings:
+                MacSettingsWorkspace(
+                    model: model,
+                    selectedSection: $selectedSettingsSection,
+                    theme: theme
+                )
+                .padding(compact ? 14 : 24)
+            case .about:
+                MacAboutWorkspace(buildLabel: buildLabel, theme: theme)
+                    .padding(compact ? 14 : 24)
+            }
+        }
     }
 
     private var activeServerName: String {
@@ -1746,6 +1957,966 @@ struct DashboardView: View {
 
     private var connectButtonSymbol: String {
         model.vpnStatus.isConnectedOrConnecting ? "stop.fill" : "power"
+    }
+}
+
+private struct MacDashboardHome: View {
+    @ObservedObject var model: DashboardModel
+    @Binding var selectedPage: MacSidebarPage
+    let theme: MacLiquidTheme
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            wideLayout
+                .frame(minWidth: 980)
+            compactLayout
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private var wideLayout: some View {
+        HStack(alignment: .top, spacing: 16) {
+            VStack(spacing: 16) {
+                heroCard
+                    .frame(maxWidth: .infinity, minHeight: 260)
+
+                currentRouteCard
+                    .frame(maxWidth: .infinity, minHeight: 190)
+            }
+            .frame(maxWidth: .infinity, alignment: .top)
+
+            VStack(spacing: 16) {
+                connectionHealth
+                    .frame(maxWidth: .infinity, minHeight: 260)
+                profilesPreview
+                    .frame(maxWidth: .infinity, minHeight: 190)
+            }
+            .frame(width: 310, alignment: .top)
+        }
+    }
+
+    private var compactLayout: some View {
+        VStack(spacing: 14) {
+            heroCard
+                .frame(maxWidth: .infinity, minHeight: 250)
+            connectionHealth
+                .frame(maxWidth: .infinity)
+            currentRouteCard
+                .frame(maxWidth: .infinity)
+            profilesPreview
+                .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var heroCard: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 26) {
+                confidenceMark(size: 190, scale: 2.15, iconSize: 48)
+                VStack(alignment: .leading, spacing: 18) {
+                    HStack(alignment: .center, spacing: 24) {
+                        heroTextBlock
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        heroMetrics
+                            .frame(width: 130)
+                    }
+
+                    heroButtons
+                        .frame(maxWidth: 420, alignment: .leading)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(alignment: .center, spacing: 18) {
+                    confidenceMark(size: 132, scale: 1.55, iconSize: 36)
+                    heroTextBlock
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                heroMetrics
+                    .frame(maxWidth: .infinity)
+                heroButtons
+                    .frame(maxWidth: .infinity)
+            }
+        }
+        .padding(26)
+        .macLiquidCard(theme)
+    }
+
+    private var heroTextBlock: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(model.vpnStatus.isConnectedOrConnecting ? "Connected" : "Disconnected")
+                .font(.system(size: 26, weight: .semibold))
+                .foregroundStyle(theme.primaryText)
+                .minimumScaleFactor(0.78)
+                .lineLimit(1)
+
+            Text(profileTitle)
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(theme.primaryText)
+                .lineLimit(2)
+                .minimumScaleFactor(0.78)
+
+            Text("\(Int((model.routeConfidence * 100).rounded()))% confidence")
+                .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(.teal)
+        }
+    }
+
+    private var heroButtons: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                switchRouteButton
+                connectButton
+            }
+            .frame(maxWidth: 420)
+
+            VStack(spacing: 10) {
+                switchRouteButton
+                connectButton
+            }
+            .frame(maxWidth: 420)
+        }
+    }
+
+    private var switchRouteButton: some View {
+        Button {
+            selectedPage = .profiles
+        } label: {
+            Label("Switch Route", systemImage: "arrow.left.arrow.right")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .tint(.teal)
+    }
+
+    private var connectButton: some View {
+        Button {
+            model.toggleVPN()
+        } label: {
+            Text(model.vpnStatus.isConnectedOrConnecting ? "Disconnect" : "Connect")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(model.vpnStatus.isConnectedOrConnecting ? .red : .teal)
+    }
+
+    private var heroMetrics: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            metric("Latency", value: latencyText)
+            metric("Packet Loss", value: packetLossText)
+            metric("Last Check", value: lastCheckText)
+        }
+    }
+
+    private func confidenceMark(size: CGFloat, scale: CGFloat, iconSize: CGFloat) -> some View {
+        ZStack {
+            Gauge(value: model.routeConfidence) {
+                EmptyView()
+            }
+            .gaugeStyle(.accessoryCircularCapacity)
+            .tint(.teal)
+            .scaleEffect(scale)
+
+            Image(systemName: model.vpnStatus.isConnectedOrConnecting ? "checkmark.shield.fill" : "shield")
+                .font(.system(size: iconSize, weight: .semibold))
+                .foregroundStyle(model.vpnStatus.isConnectedOrConnecting ? .teal : theme.tertiaryText)
+        }
+        .frame(width: size, height: size)
+    }
+
+    private var connectionHealth: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Connection Health")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(theme.primaryText)
+
+            MacHealthMiniRow(title: "Provider", report: model.healthAssessment.directPath, theme: theme)
+            MacHealthMiniRow(title: "Tunnel", report: model.healthAssessment.vpnPath, theme: theme)
+            MacHealthStatusRow(title: "Auto Recovery", value: autoRecoveryStatus, color: autoRecoveryColor, theme: theme)
+
+            Spacer()
+
+            Label(overallHealthText, systemImage: overallHealthIcon)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(overallHealthColor)
+        }
+        .padding(20)
+        .macLiquidCard(theme)
+    }
+
+    private var currentRouteCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Current Route")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(theme.primaryText)
+
+            routeLine("Current Region", "\(model.currentRegion.rawValue) - Russia")
+            routeLine("Home Region", "\(model.homeRegion.rawValue) - Israel")
+            routeLine("Exit Location", exitLocation)
+
+            Divider().opacity(0.45)
+            Button {
+                selectedPage = .settings
+            } label: {
+                HStack {
+                    Text("Details")
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                }
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(theme.primaryText)
+        }
+        .padding(20)
+        .macLiquidCard(theme)
+    }
+
+    private var profilesPreview: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("VPN Profiles")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(theme.primaryText)
+                Spacer()
+                Button {
+                    selectedPage = .profiles
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.teal)
+            }
+
+            ForEach(Array(model.configProfiles.prefix(3))) { profile in
+                HStack(spacing: 10) {
+                    Text(profile.displayName)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(theme.primaryText)
+                    Spacer()
+                    Text(profile.id == model.displayedConfigProfile?.id ? "Active" : "Standby")
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(profile.id == model.displayedConfigProfile?.id ? .mint.opacity(0.16) : theme.rowFill, in: Capsule())
+                        .foregroundStyle(profile.id == model.displayedConfigProfile?.id ? .mint : theme.secondaryText)
+                    Image(systemName: "chart.bar.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.teal)
+                }
+            }
+
+            if model.configProfiles.isEmpty {
+                Text("No imported profiles")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(theme.secondaryText)
+            }
+
+            Divider().opacity(0.45)
+            Button {
+                selectedPage = .profiles
+            } label: {
+                HStack {
+                    Text("View All Profiles")
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                }
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(theme.primaryText)
+        }
+        .padding(20)
+        .macLiquidCard(theme)
+    }
+
+    private func metric(_ label: String, value: String) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(theme.secondaryText)
+            Spacer()
+            Text(value)
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(theme.primaryText)
+        }
+        .lineLimit(1)
+    }
+
+    private func routeLine(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(theme.secondaryText)
+            Spacer()
+            Text(value)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(theme.primaryText)
+                .multilineTextAlignment(.trailing)
+                .lineLimit(2)
+                .minimumScaleFactor(0.82)
+        }
+    }
+
+    private var profileTitle: String {
+        guard let profile = model.displayedConfigProfile else {
+            return model.activeRouteTitle
+        }
+        let region = profile.regionCode.map { " · \($0)" } ?? ""
+        return "\(profile.displayName)\(region)"
+    }
+
+    private var latencyText: String {
+        guard let value = model.healthAssessment.vpnPath.averageLatencyMilliseconds else {
+            return "n/a"
+        }
+        guard value > 0 else { return "n/a" }
+        return "\(Int(value.rounded())) ms"
+    }
+
+    private var packetLossText: String {
+        "\(Int((model.healthAssessment.vpnPath.averagePacketLoss * 100).rounded()))%"
+    }
+
+    private var lastCheckText: String {
+        guard let date = model.lastProbeDate else { return "n/a" }
+        let age = max(0, Int(Date().timeIntervalSince(date)))
+        return "\(age)s ago"
+    }
+
+    private var exitLocation: String {
+        if let country = model.observedExitCountry {
+            return "\(country) - \(model.observedExitIP ?? "exit hidden")"
+        }
+        if let profile = model.displayedConfigProfile {
+            return "\(profile.regionCode ?? "VPN") - \(profile.displayName)"
+        }
+        return "Not connected"
+    }
+
+    private var recoveryStatus: String {
+        switch model.healthAssessment.recommendedAction {
+        case .keepCurrent:
+            return "Ready"
+        case .switchServer:
+            return "Switch"
+        case .reconnect:
+            return "Reconnect"
+        case .refreshDirectDNS:
+            return "DNS"
+        case .adjustParameters:
+            return "Tune"
+        case .askUser:
+            return "Review"
+        }
+    }
+
+    private var autoRecoveryStatus: String {
+        model.automaticFailoverEnabled ? recoveryStatus : "Off"
+    }
+
+    private var autoRecoveryColor: Color {
+        guard model.automaticFailoverEnabled else {
+            return theme.tertiaryText
+        }
+
+        switch model.healthAssessment.recommendedAction {
+        case .keepCurrent:
+            return .mint
+        case .refreshDirectDNS:
+            return .yellow
+        case .switchServer, .reconnect, .adjustParameters, .askUser:
+            return .orange
+        }
+    }
+
+    private var overallHealthText: String {
+        guard model.automaticFailoverEnabled else {
+            return "Auto recovery disabled"
+        }
+
+        let provider = model.healthAssessment.directPath.state
+        let tunnel = model.healthAssessment.vpnPath.state
+        if provider == .healthy, tunnel == .healthy {
+            return "All systems operational"
+        }
+        if tunnel == .connectedButUnusable || tunnel == .down || tunnel == .stalled {
+            return "VPN path needs recovery"
+        }
+        if provider != .healthy {
+            return "Provider path degraded"
+        }
+        return "Monitoring connection quality"
+    }
+
+    private var overallHealthIcon: String {
+        guard model.automaticFailoverEnabled else {
+            return "pause.circle.fill"
+        }
+
+        let provider = model.healthAssessment.directPath.state
+        let tunnel = model.healthAssessment.vpnPath.state
+        return provider == .healthy && tunnel == .healthy ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+    }
+
+    private var overallHealthColor: Color {
+        guard model.automaticFailoverEnabled else {
+            return theme.tertiaryText
+        }
+
+        let provider = model.healthAssessment.directPath.state
+        let tunnel = model.healthAssessment.vpnPath.state
+        if provider == .healthy, tunnel == .healthy {
+            return .mint
+        }
+        if tunnel == .degradedSoft || provider == .degradedSoft {
+            return .yellow
+        }
+        return .orange
+    }
+}
+
+private struct MacHealthMiniRow: View {
+    let title: String
+    let report: PathHealthReport
+    let theme: MacLiquidTheme
+
+    var body: some View {
+        MacHealthStatusRow(
+            title: title,
+            value: report.state.rawValue.capitalized,
+            color: color,
+            theme: theme,
+            detail: "\(Int((report.successRate * 100).rounded()))%"
+        )
+    }
+
+    private var color: Color {
+        switch report.state {
+        case .healthy:
+            return .mint
+        case .degradedSoft, .degradedHard:
+            return .yellow
+        case .stalled, .down, .connectedButUnusable:
+            return .orange
+        }
+    }
+}
+
+private struct MacHealthStatusRow: View {
+    let title: String
+    let value: String
+    let color: Color
+    let theme: MacLiquidTheme
+    var detail: String?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            Text(title)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(theme.primaryText)
+            Spacer()
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(value)
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(color)
+                if let detail {
+                    Text(detail)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(theme.secondaryText)
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+private struct MacProfilesWorkspace: View {
+    @ObservedObject var model: DashboardModel
+    let theme: MacLiquidTheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("VPN Profiles")
+                        .font(.system(size: 24, weight: .semibold))
+                        .foregroundStyle(theme.primaryText)
+                    Text("Import, rename, delete, or double-click a profile to reconnect through it.")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(theme.secondaryText)
+                }
+                Spacer()
+            }
+
+            ServerRankingPanel(model: model)
+                .frame(minHeight: 520)
+        }
+    }
+}
+
+private struct MacSettingsWorkspace: View {
+    @ObservedObject var model: DashboardModel
+    @Binding var selectedSection: MacSettingsSection
+    let theme: MacLiquidTheme
+    @AppStorage("appVisibilityMode") private var appVisibilityModeRaw = AppVisibilityMode.dockAndMenuBar.rawValue
+    @AppStorage("launchAtLogin") private var launchAtLogin = false
+    @AppStorage("showFailoverNotifications") private var showFailoverNotifications = true
+    @AppStorage("dnsProtectionEnabled") private var dnsProtectionEnabled = true
+    @AppStorage("localNetworkAccessEnabled") private var localNetworkAccessEnabled = true
+    @AppStorage("ipv6LeakProtectionEnabled") private var ipv6LeakProtectionEnabled = true
+    @State private var amneziaKey = ""
+    @State private var forceVPNException = ""
+    @State private var bypassVPNException = ""
+    @State private var message: String?
+    @State private var showConfigImporter = false
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: 18) {
+                settingsSidebar
+                    .frame(width: 170)
+
+                settingsMainContent
+            }
+            .frame(minWidth: 760)
+
+            VStack(alignment: .leading, spacing: 16) {
+                compactSettingsTabs
+                settingsMainContent
+            }
+        }
+        .onAppear {
+            amneziaKey = model.loadAmneziaPremiumKeyForEditing()
+        }
+        .fileImporter(
+            isPresented: $showConfigImporter,
+            allowedContentTypes: [.plainText, .json, .url, .data, UTType(filenameExtension: "conf") ?? .data],
+            allowsMultipleSelection: false
+        ) { result in
+            importFileResult(result)
+        }
+    }
+
+    private var settingsMainContent: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(selectedSection.rawValue)
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(theme.primaryText)
+
+            settingsContent
+
+            if let message {
+                Text(message)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(message.localizedCaseInsensitiveContains("could not") || message.localizedCaseInsensitiveContains("cannot") ? .orange : .mint)
+                    .lineLimit(2)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private var settingsSidebar: some View {
+        VStack(spacing: 8) {
+            ForEach(MacSettingsSection.allCases) { section in
+                Button {
+                    selectedSection = section
+                } label: {
+                    Label(section.rawValue, systemImage: section.symbol)
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .foregroundStyle(selectedSection == section ? theme.accent : theme.secondaryText)
+                        .background(selectedSection == section ? theme.selectedFill : .clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+    }
+
+    private var compactSettingsTabs: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(MacSettingsSection.allCases) { section in
+                    Button {
+                        selectedSection = section
+                    } label: {
+                        Label(section.rawValue, systemImage: section.symbol)
+                            .font(.system(size: 12, weight: .semibold))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
+                            .foregroundStyle(selectedSection == section ? theme.accent : theme.secondaryText)
+                            .background(selectedSection == section ? theme.selectedFill : theme.rowFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var settingsContent: some View {
+        switch selectedSection {
+        case .general:
+            generalSettings
+        case .connection:
+            connectionSettings
+        case .routing:
+            routingSettings
+        case .regions:
+            regionsSettings
+        case .security:
+            securitySettings
+        }
+    }
+
+    private var generalSettings: some View {
+        VStack(spacing: 16) {
+            MacSettingsSectionCard(title: "Appearance", theme: theme) {
+                settingsToggle("Show in Menu Bar", isOn: Binding(
+                    get: { appVisibilityMode.showsMenuBar },
+                    set: { enabled in
+                        if enabled {
+                            appVisibilityModeRaw = appVisibilityMode == .dockOnly
+                                ? AppVisibilityMode.dockAndMenuBar.rawValue
+                                : appVisibilityMode.rawValue
+                        } else {
+                            appVisibilityModeRaw = AppVisibilityMode.dockOnly.rawValue
+                        }
+                    }
+                ))
+                settingsToggle("Show in Dock", isOn: Binding(
+                    get: { appVisibilityMode != .menuBarOnly },
+                    set: { enabled in
+                        appVisibilityModeRaw = enabled
+                            ? AppVisibilityMode.dockAndMenuBar.rawValue
+                            : AppVisibilityMode.menuBarOnly.rawValue
+                    }
+                ))
+                settingsToggle("Launch at Login", isOn: $launchAtLogin)
+            }
+
+            MacSettingsSectionCard(title: "Behavior", theme: theme) {
+                settingsToggle("Auto-switch when connection is unstable", isOn: $model.automaticFailoverEnabled)
+                settingsToggle("Show notification after switch", isOn: $showFailoverNotifications)
+            }
+
+            MacSettingsSectionCard(title: "Language", theme: theme) {
+                Picker("Language", selection: .constant("English")) {
+                    Text("English").tag("English")
+                    Text("Русский").tag("Русский")
+                }
+                .pickerStyle(.menu)
+            }
+        }
+    }
+
+    private var connectionSettings: some View {
+        MacSettingsSectionCard(title: "Amnezia Profiles", theme: theme) {
+            if model.configProfiles.isEmpty {
+                Text("No imported profiles yet.")
+                    .foregroundStyle(theme.secondaryText)
+            } else {
+                Picker("Active profile", selection: Binding(
+                    get: { model.activeConfigProfileID ?? "" },
+                    set: { model.selectConfigProfile(id: $0.isEmpty ? nil : $0) }
+                )) {
+                    ForEach(model.configProfiles) { profile in
+                        Text(profileRowTitle(profile)).tag(profile.id)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+
+            SecureField("Paste Amnezia Premium key, vpn:// link, or raw config", text: $amneziaKey)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, design: .monospaced))
+                .padding(10)
+                .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(theme.stroke, lineWidth: 1))
+
+            HStack {
+                Button("Save") {
+                    if let error = model.saveAmneziaPremiumKey(amneziaKey) {
+                        message = error
+                    } else {
+                        message = "Saved Amnezia config in Keychain."
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
+
+                Button("Import .conf / JSON") {
+                    showConfigImporter = true
+                }
+                .buttonStyle(.bordered)
+
+                Button("Delete Active", role: .destructive) {
+                    if let error = model.deleteActiveConfigProfile() {
+                        message = error
+                    } else {
+                        amneziaKey = ""
+                        message = "Deleted active profile."
+                    }
+                }
+                .buttonStyle(.bordered)
+                .tint(.orange)
+            }
+        }
+    }
+
+    private var routingSettings: some View {
+        VStack(spacing: 16) {
+            MacSettingsSectionCard(title: "Bypass VPN", theme: theme) {
+                routingInput("Domain or CIDR", text: $bypassVPNException, mode: .bypassVPN)
+                routingRules(mode: .bypassVPN)
+            }
+            MacSettingsSectionCard(title: "Through VPN", theme: theme) {
+                routingInput("Domain or CIDR", text: $forceVPNException, mode: .forceVPN)
+                routingRules(mode: .forceVPN)
+            }
+        }
+    }
+
+    private var regionsSettings: some View {
+        VStack(spacing: 16) {
+            MacSettingsSectionCard(title: "Current Regions", theme: theme) {
+                regionRow("Current Region", value: "\(model.currentRegion.rawValue) - Russia")
+                regionRow("Home Region", value: "\(model.homeRegion.rawValue) - Israel")
+            }
+            MacSettingsSectionCard(title: "Preferred Exit Regions", theme: theme) {
+                ForEach(Array(model.configProfiles.prefix(6))) { profile in
+                    regionRow(profile.displayName, value: profile.regionCode ?? "Unknown")
+                }
+                if model.configProfiles.isEmpty {
+                    Text("Import profiles to build a preferred region list.")
+                        .foregroundStyle(theme.secondaryText)
+                }
+            }
+            MacSettingsSectionCard(title: "Avoid Regions", theme: theme) {
+                regionRow("Russia", value: "RU")
+                regionRow("Belarus", value: "BY")
+                regionRow("China", value: "CN")
+            }
+        }
+    }
+
+    private var securitySettings: some View {
+        VStack(spacing: 16) {
+            MacSettingsSectionCard(title: "Security", theme: theme) {
+                settingsToggle("Kill Switch", isOn: $model.killSwitchEnabled)
+                settingsToggle("DNS Protection", isOn: $dnsProtectionEnabled)
+                settingsToggle("Local Network Access", isOn: $localNetworkAccessEnabled)
+                settingsToggle("IPv6 Leak Protection", isOn: $ipv6LeakProtectionEnabled)
+                settingsToggle("Auto Recovery", isOn: $model.automaticFailoverEnabled)
+            }
+
+            Button(role: .destructive) {
+                model.killSwitchEnabled = false
+                dnsProtectionEnabled = true
+                localNetworkAccessEnabled = true
+                ipv6LeakProtectionEnabled = true
+                model.automaticFailoverEnabled = true
+            } label: {
+                Label("Reset Security Settings", systemImage: "arrow.counterclockwise")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .tint(.red)
+        }
+    }
+
+    private func settingsToggle(_ title: String, isOn: Binding<Bool>) -> some View {
+        HStack(spacing: 18) {
+            Text(title)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(theme.primaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.82)
+            Spacer(minLength: 24)
+            Toggle("", isOn: isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .tint(.teal)
+                .frame(width: 52, alignment: .trailing)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 3)
+    }
+
+    private func routingInput(_ placeholder: String, text: Binding<String>, mode: RoutingExceptionMode) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                routingTextField(placeholder, text: text)
+                    .frame(maxWidth: .infinity)
+                routingAddButton(text: text, mode: mode)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                routingTextField(placeholder, text: text)
+                routingAddButton(text: text, mode: mode)
+            }
+        }
+    }
+
+    private func routingTextField(_ placeholder: String, text: Binding<String>) -> some View {
+        TextField(placeholder, text: text)
+            .textFieldStyle(.plain)
+            .font(.system(size: 12, design: .monospaced))
+            .padding(9)
+            .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func routingAddButton(text: Binding<String>, mode: RoutingExceptionMode) -> some View {
+        Button {
+            model.addRoutingException(value: text.wrappedValue, mode: mode)
+            text.wrappedValue = ""
+        } label: {
+            Label("Add Item", systemImage: "plus")
+        }
+        .buttonStyle(.bordered)
+        .tint(.teal)
+        .disabled(text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
+    private func routingRules(mode: RoutingExceptionMode) -> some View {
+        VStack(spacing: 0) {
+            ForEach(model.routingExceptions.rules.filter { $0.mode == mode }) { rule in
+                HStack {
+                    Image(systemName: "globe")
+                        .foregroundStyle(theme.secondaryText)
+                    Text(rule.value)
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundStyle(theme.primaryText)
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { rule.isEnabled },
+                        set: { model.setRoutingExceptionEnabled(id: rule.id, isEnabled: $0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    Button(role: .destructive) {
+                        model.deleteRoutingException(id: rule.id)
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.red)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                Divider().opacity(0.35)
+                    .padding(.leading, 12)
+            }
+        }
+        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func regionRow(_ title: String, value: String) -> some View {
+        HStack {
+            Text(title)
+                .foregroundStyle(theme.primaryText)
+                .lineLimit(1)
+            Spacer()
+            Text(value)
+                .foregroundStyle(theme.secondaryText)
+                .multilineTextAlignment(.trailing)
+                .lineLimit(2)
+                .minimumScaleFactor(0.82)
+        }
+        .font(.system(size: 12, weight: .medium))
+        .padding(.vertical, 5)
+    }
+
+    private var appVisibilityMode: AppVisibilityMode {
+        AppVisibilityMode(rawValue: appVisibilityModeRaw) ?? .dockAndMenuBar
+    }
+
+    private func profileRowTitle(_ profile: StoredAmneziaConfigProfile) -> String {
+        [profile.displayName, profile.regionCode, profile.endpointHost]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+    }
+
+    private func importFileResult(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            do {
+                let didAccess = url.startAccessingSecurityScopedResource()
+                defer {
+                    if didAccess { url.stopAccessingSecurityScopedResource() }
+                }
+                let imported = try String(contentsOf: url, encoding: .utf8)
+                Task {
+                    if let error = await model.importAmneziaConfigProfile(name: url.lastPathComponent, rawConfig: imported) {
+                        message = error
+                    } else {
+                        amneziaKey = model.loadAmneziaPremiumKeyForEditing()
+                        message = "Imported \(url.lastPathComponent) as active profile."
+                    }
+                }
+            } catch {
+                message = "Could not import \(url.lastPathComponent): \(error.localizedDescription)"
+            }
+        case .failure(let error):
+            message = "Could not import config: \(error.localizedDescription)"
+        }
+    }
+}
+
+private struct MacSettingsSectionCard<Content: View>: View {
+    let title: String
+    let theme: MacLiquidTheme
+    let content: Content
+
+    init(title: String, theme: MacLiquidTheme, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.theme = theme
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(title)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(theme.primaryText)
+            content
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .macLiquidCard(theme)
+    }
+}
+
+private struct MacAboutWorkspace: View {
+    let buildLabel: String
+    let theme: MacLiquidTheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("About")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(theme.primaryText)
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Real Ai VPN")
+                    .font(.system(size: 22, weight: .bold))
+                Text("v\(buildLabel)")
+                    .foregroundStyle(theme.secondaryText)
+                Text("Smart VPN routing with local profile quality history, health probes, recovery, and region-aware exceptions.")
+                    .foregroundStyle(theme.secondaryText)
+            }
+            .padding(22)
+            .macLiquidCard(theme)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1873,6 +3044,7 @@ struct HealthPanel: View {
 
 struct ServerRankingPanel: View {
     @ObservedObject var model: DashboardModel
+    @Environment(\.colorScheme) private var colorScheme
     @State private var showPasteImport = false
     @State private var showConfImporter = false
     @State private var showJSONImporter = false
@@ -1958,7 +3130,7 @@ struct ServerRankingPanel: View {
             ForEach(model.rankedServers, id: \.server.id) { ranked in
                 HStack(spacing: 12) {
                     Image(systemName: ranked.server.id == model.activeServerID ? "checkmark.circle.fill" : "circle")
-                        .foregroundStyle(ranked.server.id == model.activeServerID ? .teal : .white.opacity(0.38))
+                        .foregroundStyle(ranked.server.id == model.activeServerID ? .teal : secondaryText.opacity(0.62))
                         .frame(width: 22)
 
                     VStack(alignment: .leading, spacing: 3) {
@@ -1966,7 +3138,7 @@ struct ServerRankingPanel: View {
                             .font(.system(size: 14, weight: .semibold))
                         Text("\(ranked.server.region.rawValue) · \(ranked.reason)")
                             .font(.system(size: 11))
-                            .foregroundStyle(.white.opacity(0.62))
+                            .foregroundStyle(secondaryText)
                     }
 
                     Spacer()
@@ -1978,11 +3150,11 @@ struct ServerRankingPanel: View {
 
                     Text("\(Int(ranked.score * 100))")
                         .font(.system(size: 13, weight: .bold, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.82))
+                        .foregroundStyle(primaryText)
                         .frame(width: 34, alignment: .trailing)
                 }
                 .padding(12)
-                .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(rowBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
         }
     }
@@ -2027,7 +3199,10 @@ struct ServerRankingPanel: View {
                         }
                         .padding(12)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(.white.opacity(profile.id == model.displayedConfigProfile?.id ? 0.11 : 0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .background(
+                            profile.id == model.displayedConfigProfile?.id ? selectedRowBackground : rowBackground,
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        )
                         .simultaneousGesture(
                             TapGesture(count: 2).onEnded {
                                 model.reconnectConfigProfile(id: profile.id)
@@ -2050,7 +3225,7 @@ struct ServerRankingPanel: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .frame(minHeight: 0, maxHeight: 310)
+        .frame(minHeight: 0, maxHeight: .infinity)
     }
 
     private var profileImportMenu: some View {
@@ -2086,17 +3261,17 @@ struct ServerRankingPanel: View {
     private func profileSummary(_ profile: StoredAmneziaConfigProfile) -> some View {
         Group {
             Image(systemName: profile.id == model.displayedConfigProfile?.id ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(profile.id == model.displayedConfigProfile?.id ? .teal : .white.opacity(0.38))
+                .foregroundStyle(profile.id == model.displayedConfigProfile?.id ? .teal : secondaryText.opacity(0.62))
                 .frame(width: 22)
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(profile.displayName)
                     .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(primaryText)
                     .lineLimit(1)
                 Text(profileDetail(profile))
                     .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(0.62))
+                    .foregroundStyle(secondaryText)
                     .lineLimit(1)
             }
             .layoutPriority(1)
@@ -2111,7 +3286,23 @@ struct ServerRankingPanel: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(.white.opacity(0.82))
+        .foregroundStyle(primaryText.opacity(0.82))
+    }
+
+    private var primaryText: Color {
+        colorScheme == .dark ? .white : Color(red: 0.10, green: 0.13, blue: 0.18)
+    }
+
+    private var secondaryText: Color {
+        colorScheme == .dark ? .white.opacity(0.62) : Color(red: 0.38, green: 0.43, blue: 0.50)
+    }
+
+    private var rowBackground: Color {
+        colorScheme == .dark ? Color.white.opacity(0.07) : Color.white.opacity(0.72)
+    }
+
+    private var selectedRowBackground: Color {
+        colorScheme == .dark ? Color.white.opacity(0.11) : Color.teal.opacity(0.10)
     }
 
     private func importFileResult(_ result: Result<[URL], Error>) {
@@ -2417,6 +3608,7 @@ struct RecoveryPanel: View {
 }
 
 struct Panel<Content: View, Accessory: View>: View {
+    @Environment(\.colorScheme) private var colorScheme
     var title: String
     var symbol: String
     var accessory: Accessory
@@ -2452,7 +3644,7 @@ struct Panel<Content: View, Accessory: View>: View {
                     .foregroundStyle(.teal)
                 Text(title)
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.72))
+                    .foregroundStyle(secondaryText)
                 Spacer()
                 accessory
             }
@@ -2462,11 +3654,24 @@ struct Panel<Content: View, Accessory: View>: View {
         }
         .padding(18)
         .frame(minHeight: 210)
-        .background(.ultraThinMaterial.opacity(0.72), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .background(.ultraThinMaterial.opacity(colorScheme == .dark ? 0.72 : 0.86), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(panelFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(.white.opacity(0.12), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(strokeColor, lineWidth: 1)
         )
+    }
+
+    private var secondaryText: Color {
+        colorScheme == .dark ? .white.opacity(0.72) : Color(red: 0.34, green: 0.39, blue: 0.45)
+    }
+
+    private var panelFill: Color {
+        colorScheme == .dark ? .white.opacity(0.04) : .white.opacity(0.56)
+    }
+
+    private var strokeColor: Color {
+        colorScheme == .dark ? .white.opacity(0.12) : .black.opacity(0.06)
     }
 }
 
