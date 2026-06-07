@@ -208,20 +208,7 @@ final class AmneziaConfigDecoderTests: XCTestCase {
     }
 
     func testBuildSingBoxConfigFromShadowrocketVLESSReality() throws {
-        let profile = ShadowrocketVLESSConfig(
-            title: "DE Reality",
-            regionCode: "DE",
-            host: "example-vless.test",
-            port: 47538,
-            uuid: "02d97ea8-7018-48ea-add8-9f6634e43e85",
-            peer: "example.com",
-            publicKey: "test-public-key",
-            shortID: "d8a1ea76",
-            flow: "xtls-rprx-vision",
-            fingerprint: "chrome",
-            spiderX: "",
-            udp: true
-        )
+        let profile = makeVLESSProfile()
 
         let config = try SingBoxConfigBuilder().build(from: profile)
         let data = try XCTUnwrap(config.jsonString.data(using: .utf8))
@@ -233,11 +220,19 @@ final class AmneziaConfigDecoderTests: XCTestCase {
         let utls = try XCTUnwrap(tls["utls"] as? [String: Any])
         let route = try XCTUnwrap(root["route"] as? [String: Any])
         let rules = try XCTUnwrap(route["rules"] as? [[String: Any]])
+        let inbounds = try XCTUnwrap(root["inbounds"] as? [[String: Any]])
+        let tunInbound = try XCTUnwrap(inbounds.first { ($0["type"] as? String) == "tun" })
+        let sniffRule = try XCTUnwrap(rules.first { ($0["action"] as? String) == "sniff" })
         let directDomainRule = try XCTUnwrap(rules.first { ($0["outbound"] as? String) == "direct" && $0["domain_suffix"] != nil })
         let directDomainSuffixes = try XCTUnwrap(directDomainRule["domain_suffix"] as? [String])
         let dns = try XCTUnwrap(root["dns"] as? [String: Any])
         let dnsServers = try XCTUnwrap(dns["servers"] as? [[String: Any]])
-        let cloudflareDNS = try XCTUnwrap(dnsServers.first)
+        let cloudflareDNS = try XCTUnwrap(dnsServers.first { ($0["tag"] as? String) == "cloudflare" })
+        let providerDNS = try XCTUnwrap(dnsServers.first { ($0["tag"] as? String) == "provider-yandex" })
+        let providerBackupDNS = try XCTUnwrap(dnsServers.first { ($0["tag"] as? String) == "provider-yandex-backup" })
+        let dnsRules = try XCTUnwrap(dns["rules"] as? [[String: Any]])
+        let providerRule = try XCTUnwrap(dnsRules.first { ($0["server"] as? String) == "provider-yandex" })
+        let providerSuffixes = try XCTUnwrap(providerRule["domain_suffix"] as? [String])
 
         XCTAssertEqual(proxy["type"] as? String, "vless")
         XCTAssertEqual(proxy["server"] as? String, "example-vless.test")
@@ -249,30 +244,90 @@ final class AmneziaConfigDecoderTests: XCTestCase {
         XCTAssertEqual(reality["public_key"] as? String, "test-public-key")
         XCTAssertEqual(reality["short_id"] as? String, "d8a1ea76")
         XCTAssertNil(reality["spider_x"])
+        XCTAssertNil(tunInbound["sniff"])
+        XCTAssertNil(tunInbound["sniff_override_destination"])
+        XCTAssertEqual(sniffRule["inbound"] as? String, "tun-in")
         XCTAssertTrue(directDomainSuffixes.contains("ru"))
         XCTAssertEqual(dns["final"] as? String, "cloudflare")
         XCTAssertEqual(cloudflareDNS["tag"] as? String, "cloudflare")
         XCTAssertEqual(cloudflareDNS["type"] as? String, "tls")
         XCTAssertEqual(cloudflareDNS["server"] as? String, "1.1.1.1")
         XCTAssertEqual(cloudflareDNS["server_port"] as? Int, 853)
+        XCTAssertEqual(cloudflareDNS["detour"] as? String, "proxy")
         XCTAssertNil(cloudflareDNS["address"])
+        XCTAssertEqual(providerDNS["type"] as? String, "udp")
+        XCTAssertEqual(providerDNS["server"] as? String, "77.88.8.88")
+        XCTAssertNil(providerDNS["detour"])
+        XCTAssertEqual(providerBackupDNS["server"] as? String, "77.88.8.2")
+        XCTAssertNil(providerBackupDNS["detour"])
+        XCTAssertTrue(providerSuffixes.contains("ru"))
+        XCTAssertTrue(providerSuffixes.contains("local"))
+    }
+
+    func testSingBoxDNSProtectionRoutesProviderDomainsToYandex() throws {
+        let overrides = SingBoxRouteOverrides(
+            forceVPNDomainSuffixes: ["2ip.ru"],
+            bypassVPNDomainSuffixes: ["mos.ru", "Example.Local", "yandex.ru"]
+        )
+
+        let config = try SingBoxConfigBuilder().build(
+            from: makeVLESSProfile(),
+            routeOverrides: overrides,
+            dnsProtectionEnabled: true
+        )
+        let data = try XCTUnwrap(config.jsonString.data(using: .utf8))
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let dns = try XCTUnwrap(root["dns"] as? [String: Any])
+        let dnsServers = try XCTUnwrap(dns["servers"] as? [[String: Any]])
+        let rules = try XCTUnwrap(dns["rules"] as? [[String: Any]])
+        let forceRule = try XCTUnwrap(rules.first { ($0["server"] as? String) == "cloudflare" })
+        let providerRule = try XCTUnwrap(rules.first { ($0["server"] as? String) == "provider-yandex" })
+        let forceSuffixes = try XCTUnwrap(forceRule["domain_suffix"] as? [String])
+        let providerSuffixes = try XCTUnwrap(providerRule["domain_suffix"] as? [String])
+        let route = try XCTUnwrap(root["route"] as? [String: Any])
+        let routeRules = try XCTUnwrap(route["rules"] as? [[String: Any]])
+        let directIPCIDRs = routeRules
+            .filter { ($0["outbound"] as? String) == "direct" }
+            .compactMap { $0["ip_cidr"] as? [String] }
+            .flatMap { $0 }
+
+        XCTAssertTrue(dnsServers.contains { ($0["tag"] as? String) == "provider-yandex" && ($0["server"] as? String) == "77.88.8.88" })
+        XCTAssertTrue(dnsServers.contains { ($0["tag"] as? String) == "provider-yandex-backup" && ($0["server"] as? String) == "77.88.8.2" })
+        XCTAssertTrue(directIPCIDRs.contains("77.88.8.88/32"))
+        XCTAssertTrue(directIPCIDRs.contains("77.88.8.2/32"))
+        XCTAssertEqual(forceSuffixes, ["2ip.ru"])
+        XCTAssertTrue(providerSuffixes.contains("ru"))
+        XCTAssertTrue(providerSuffixes.contains("local"))
+        XCTAssertTrue(providerSuffixes.contains("mos.ru"))
+        XCTAssertTrue(providerSuffixes.contains("example.local"))
+        XCTAssertTrue(providerSuffixes.contains("yandex.ru"))
+        XCTAssertFalse(providerSuffixes.contains("2ip.ru"))
+    }
+
+    func testSingBoxDNSProtectionCanBeDisabled() throws {
+        let overrides = SingBoxRouteOverrides(
+            forceVPNDomainSuffixes: ["2ip.ru"],
+            bypassVPNDomainSuffixes: ["mos.ru"]
+        )
+
+        let config = try SingBoxConfigBuilder().build(
+            from: makeVLESSProfile(),
+            routeOverrides: overrides,
+            dnsProtectionEnabled: false
+        )
+        let data = try XCTUnwrap(config.jsonString.data(using: .utf8))
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let dns = try XCTUnwrap(root["dns"] as? [String: Any])
+        let dnsServers = try XCTUnwrap(dns["servers"] as? [[String: Any]])
+
+        XCTAssertEqual(dnsServers.count, 1)
+        XCTAssertEqual(dnsServers.first?["tag"] as? String, "cloudflare")
+        XCTAssertEqual(dnsServers.first?["detour"] as? String, "proxy")
+        XCTAssertNil(dns["rules"])
     }
 
     func testSingBoxRouteOverridesNormalizeRawIPAddressExceptions() throws {
-        let profile = ShadowrocketVLESSConfig(
-            title: "DE Reality",
-            regionCode: "DE",
-            host: "example-vless.test",
-            port: 47538,
-            uuid: "02d97ea8-7018-48ea-add8-9f6634e43e85",
-            peer: "example.com",
-            publicKey: "test-public-key",
-            shortID: "d8a1ea76",
-            flow: "xtls-rprx-vision",
-            fingerprint: "chrome",
-            spiderX: "",
-            udp: true
-        )
+        let profile = makeVLESSProfile()
         let overrides = SingBoxRouteOverrides(
             forceVPNIPCIDRs: ["1.1.1.1"],
             bypassVPNIPCIDRs: ["212.11.151.58", "bad-hostname"],
@@ -294,6 +349,23 @@ final class AmneziaConfigDecoderTests: XCTestCase {
         XCTAssertTrue(allIPCIDRs.contains("1.1.1.1/32"))
         XCTAssertTrue(allIPCIDRs.contains("212.11.151.58/32"))
         XCTAssertFalse(allIPCIDRs.contains("bad-hostname"))
+    }
+
+    private func makeVLESSProfile() -> ShadowrocketVLESSConfig {
+        ShadowrocketVLESSConfig(
+            title: "DE Reality",
+            regionCode: "DE",
+            host: "example-vless.test",
+            port: 47538,
+            uuid: "02d97ea8-7018-48ea-add8-9f6634e43e85",
+            peer: "example.com",
+            publicKey: "test-public-key",
+            shortID: "d8a1ea76",
+            flow: "xtls-rprx-vision",
+            fingerprint: "chrome",
+            spiderX: "",
+            udp: true
+        )
     }
 
     private func makeVPNURL(payload: Data, declaredSize: Int? = nil) throws -> String {

@@ -259,6 +259,11 @@ final class iOSDashboardModel: ObservableObject {
             UserDefaults.standard.set(killSwitchEnabled, forKey: "ios.killSwitchEnabled")
         }
     }
+    @Published var dnsProtectionEnabled = UserDefaults.standard.object(forKey: "ios.dnsProtectionEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(dnsProtectionEnabled, forKey: "ios.dnsProtectionEnabled")
+        }
+    }
 
     private let decoder = AmneziaConfigDecoder()
     private let shadowrocketParser = ShadowrocketVLESSConfigParser()
@@ -375,6 +380,18 @@ final class iOSDashboardModel: ObservableObject {
         }
 
         return "Best check: \(best.targetID) · \(Int((best.reliabilityScore * 100).rounded()))% reliable."
+    }
+
+    var dnsPolicyDiagnostic: String {
+        guard dnsProtectionEnabled else {
+            return "Profile DNS only"
+        }
+
+        guard displayedProfile?.kind == .singBoxVLESSReality else {
+            return "Profile DNS only · split-dns-provider-lane unavailable for AWG"
+        }
+
+        return "Provider DNS lane: Yandex DNS"
     }
 
     var recoveryTitle: String {
@@ -551,6 +568,32 @@ final class iOSDashboardModel: ObservableObject {
         } catch {
             NSLog("RealAiVPN iOS reconnectProfile failed: %@", error.localizedDescription)
             message = "Could not reconnect profile: \(error.localizedDescription)"
+        }
+    }
+
+    func reconnectVPNWithKillSwitch() {
+        guard vpnStatus != .connecting, vpnStatus != .disconnecting else {
+            return
+        }
+        guard let activeProfile else {
+            message = "Import an AmneziaWG .conf profile first."
+            return
+        }
+
+        killSwitchEnabled = true
+        message = vpnStatus.isConnectedOrConnecting
+            ? "Reconnecting \(activeProfile.displayName) with Kill Switch..."
+            : "Connecting \(activeProfile.displayName) with Kill Switch..."
+
+        if vpnStatus.isConnectedOrConnecting {
+            suppressExpectedDisconnectNotification = true
+            vpnManager.disconnect()
+            Task {
+                try? await Task.sleep(for: .seconds(1))
+                connect()
+            }
+        } else {
+            connect()
         }
     }
 
@@ -771,6 +814,8 @@ final class iOSDashboardModel: ObservableObject {
         connectedProfileID = nil
         observedExitIP = nil
         observedExitCountry = nil
+        tunnelDiagnostic = tunnelDiagnosticsStore.load()
+        refreshStatusMessage()
 
         if suppressExpectedDisconnectNotification {
             suppressExpectedDisconnectNotification = false
@@ -806,7 +851,8 @@ final class iOSDashboardModel: ObservableObject {
             providerBundleIdentifier: providerBundleIdentifier(for: profile),
             serverID: profile?.id ?? "real-ai-vpn-ios",
             regionCode: profile?.regionCode ?? "ZZ",
-            killSwitchEnabled: killSwitchEnabled
+            killSwitchEnabled: killSwitchEnabled,
+            dnsProtectionEnabled: dnsProtectionEnabled
         )
     }
 
@@ -1310,7 +1356,7 @@ struct iOSDashboardView: View {
             .tag(iOSMainTab.profiles)
 
             NavigationStack {
-                iOSRouteScreen(model: model)
+                iOSRoutingExceptionsScreen(model: model)
             }
             .tabItem {
                 Label("Route", systemImage: "arrow.triangle.swap")
@@ -1509,6 +1555,11 @@ private struct iOSHomeScreen: View {
             }
             .padding(13)
             .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            Text(model.dnsPolicyDiagnostic)
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(AppTheme.secondaryText)
+                .lineLimit(2)
 
             Label("All systems operational", systemImage: "checkmark.circle.fill")
                 .font(.callout.weight(.semibold))
@@ -1846,6 +1897,7 @@ private struct iOSSettingsScreen: View {
                 settingsSection("GENERAL") {
                     settingNavigationRow(title: "Appearance", value: appearanceMode, systemImage: "circle.lefthalf.filled")
                     settingToggleRow(title: "Kill Switch", systemImage: "shield.fill", isOn: $model.killSwitchEnabled)
+                    settingToggleRow(title: "DNS Protection", systemImage: "network", isOn: $model.dnsProtectionEnabled)
                     settingNavigationRow(title: "Language", value: "English", systemImage: "globe")
                 }
 
@@ -2254,6 +2306,10 @@ private struct LegacyiOSDashboardView: View {
                 Text(model.recoveryDetail)
                     .font(.callout)
                     .foregroundStyle(AppTheme.secondaryText)
+                Text(model.dnsPolicyDiagnostic)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(2)
                 Text(model.probeReliabilityDetail)
                     .font(.footnote.weight(.medium))
                     .foregroundStyle(AppTheme.secondaryText)
@@ -2767,6 +2823,21 @@ private struct iOSRoutingExceptionsScreen: View {
         .background(AppTheme.background.ignoresSafeArea())
         .navigationTitle("Routing")
         .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    model.reconnectVPNWithKillSwitch()
+                } label: {
+                    Label("Reconnect", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .disabled(reconnectDisabled)
+                .accessibilityLabel("Reconnect VPN with Kill Switch")
+            }
+        }
+    }
+
+    private var reconnectDisabled: Bool {
+        model.vpnStatus == .connecting || model.vpnStatus == .disconnecting || model.activeProfile == nil
     }
 
     private var routingForm: some View {

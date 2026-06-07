@@ -64,6 +64,16 @@ public struct SingBoxConfig: Codable, Equatable, Sendable {
 }
 
 public struct SingBoxRouteOverrides: Equatable, Sendable {
+    public static let providerDNSServers = ["77.88.8.88", "77.88.8.2"]
+    public static let providerDNSDomainSuffixes = [
+        "ru",
+        "local",
+        "lan",
+        "localhost",
+        "in-addr.arpa",
+        "ip6.arpa"
+    ]
+
     public var forceVPNDomainSuffixes: [String]
     public var bypassVPNDomainSuffixes: [String]
     public var forceVPNIPCIDRs: [String]
@@ -336,7 +346,8 @@ public struct SingBoxConfigBuilder: Sendable {
 
     public func build(
         from profile: ShadowrocketVLESSConfig,
-        routeOverrides: SingBoxRouteOverrides = SingBoxRouteOverrides()
+        routeOverrides: SingBoxRouteOverrides = SingBoxRouteOverrides(),
+        dnsProtectionEnabled: Bool = true
     ) throws -> SingBoxConfig {
         var outbound: [String: Any] = [
             "type": "vless",
@@ -363,10 +374,19 @@ public struct SingBoxConfigBuilder: Sendable {
             outbound["flow"] = flow
         }
 
-        var routeRules: [[String: Any]] = []
+        var routeRules: [[String: Any]] = [
+            [
+                "inbound": "tun-in",
+                "action": "sniff"
+            ]
+        ]
+        let forceVPNDomainSuffixes = routeOverrides.forceVPNDomainSuffixes
+            .map(normalizedDomainSuffix)
+            .filter { !$0.isEmpty }
+            .uniqued()
         appendRouteRules(
             to: &routeRules,
-            domainSuffixes: routeOverrides.forceVPNDomainSuffixes,
+            domainSuffixes: forceVPNDomainSuffixes,
             ipCIDRs: routeOverrides.forceVPNIPCIDRs,
             outbound: "proxy"
         )
@@ -379,6 +399,8 @@ public struct SingBoxConfigBuilder: Sendable {
                 "169.254.0.0/16",
                 "172.16.0.0/12",
                 "192.168.0.0/16",
+                "77.88.8.88/32",
+                "77.88.8.2/32",
                 "fc00::/7",
                 "fe80::/10"
             ] + routeOverrides.bypassVPNIPCIDRs,
@@ -409,17 +431,7 @@ public struct SingBoxConfigBuilder: Sendable {
                 "level": "warn",
                 "timestamp": true
             ],
-            "dns": [
-                "servers": [
-                    [
-                        "tag": "cloudflare",
-                        "type": "tls",
-                        "server": "1.1.1.1",
-                        "server_port": 853
-                    ]
-                ],
-                "final": "cloudflare"
-            ],
+            "dns": dnsConfiguration(routeOverrides: routeOverrides, dnsProtectionEnabled: dnsProtectionEnabled),
             "inbounds": [
                 tunInbound
             ],
@@ -439,6 +451,68 @@ public struct SingBoxConfigBuilder: Sendable {
 
         let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
         return SingBoxConfig(jsonString: String(decoding: data, as: UTF8.self))
+    }
+
+    private func dnsConfiguration(
+        routeOverrides: SingBoxRouteOverrides,
+        dnsProtectionEnabled: Bool
+    ) -> [String: Any] {
+        var servers: [[String: Any]] = [
+            [
+                "tag": "cloudflare",
+                "type": "tls",
+                "server": "1.1.1.1",
+                "server_port": 853,
+                "detour": "proxy"
+            ]
+        ]
+
+        guard dnsProtectionEnabled else {
+            return [
+                "servers": servers,
+                "final": "cloudflare"
+            ]
+        }
+
+        servers.append([
+            "tag": "provider-yandex",
+            "type": "udp",
+            "server": SingBoxRouteOverrides.providerDNSServers[0]
+        ])
+        servers.append([
+            "tag": "provider-yandex-backup",
+            "type": "udp",
+            "server": SingBoxRouteOverrides.providerDNSServers[1]
+        ])
+
+        let forceVPNSuffixes = routeOverrides.forceVPNDomainSuffixes
+            .map(normalizedDomainSuffix)
+            .filter { !$0.isEmpty }
+            .uniqued()
+        let providerSuffixes = (SingBoxRouteOverrides.providerDNSDomainSuffixes + routeOverrides.bypassVPNDomainSuffixes)
+            .map(normalizedDomainSuffix)
+            .filter { !$0.isEmpty && !forceVPNSuffixes.contains($0) }
+            .uniqued()
+
+        var rules: [[String: Any]] = []
+        if !forceVPNSuffixes.isEmpty {
+            rules.append([
+                "domain_suffix": forceVPNSuffixes,
+                "server": "cloudflare"
+            ])
+        }
+        if !providerSuffixes.isEmpty {
+            rules.append([
+                "domain_suffix": providerSuffixes,
+                "server": "provider-yandex"
+            ])
+        }
+
+        return [
+            "servers": servers,
+            "rules": rules,
+            "final": "cloudflare"
+        ]
     }
 
     private func appendRouteRules(

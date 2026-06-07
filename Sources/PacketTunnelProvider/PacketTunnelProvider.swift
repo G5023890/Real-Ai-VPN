@@ -50,6 +50,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             (options?["routingExceptions"] as? String) ?? (options?["routingExceptions"] as? NSString).map(String.init)
         )
         let killSwitchEnabled = (options?["killSwitchEnabled"] as? NSNumber)?.boolValue ?? false
+        let dnsProtectionEnabled = (options?["dnsProtectionEnabled"] as? NSNumber)?.boolValue ?? true
+        let localNetworkAccessEnabled = (options?["localNetworkAccessEnabled"] as? NSNumber)?.boolValue ?? true
+        let ipv6LeakProtectionEnabled = (options?["ipv6LeakProtectionEnabled"] as? NSNumber)?.boolValue ?? true
 
         guard let importedConfig, !importedConfig.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             packetTunnelLogger.error("Missing transient Amnezia config")
@@ -63,7 +66,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             saveDiagnostic(stage: "decoded-vless", message: shadowrocketConfig.redactedSummary)
             NSLog("RealAiVPN PacketTunnel decoded Shadowrocket profile=%@", shadowrocketConfig.redactedSummary)
             do {
-                try await startSingBoxTunnel(with: shadowrocketConfig, routingExceptions: routingExceptions, killSwitchEnabled: killSwitchEnabled)
+                try await startSingBoxTunnel(
+                    with: shadowrocketConfig,
+                    routingExceptions: routingExceptions,
+                    killSwitchEnabled: killSwitchEnabled,
+                    dnsProtectionEnabled: dnsProtectionEnabled,
+                    localNetworkAccessEnabled: localNetworkAccessEnabled,
+                    ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
+                )
                 saveDiagnostic(stage: "started-vless", message: "sing-box tunnel start returned successfully.")
             } catch {
                 saveDiagnostic(stage: "vless-failed", message: error.localizedDescription)
@@ -90,7 +100,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         do {
-            try await startAmneziaWireGuardTunnel(with: config, routingExceptions: routingExceptions, killSwitchEnabled: killSwitchEnabled)
+            if dnsProtectionEnabled {
+                saveDiagnostic(
+                    stage: "split-dns-provider-lane-unavailable",
+                    message: "split-dns-provider-lane unavailable for AWG; using profile DNS only."
+                )
+            }
+            try await startAmneziaWireGuardTunnel(
+                with: config,
+                routingExceptions: routingExceptions,
+                killSwitchEnabled: killSwitchEnabled,
+                localNetworkAccessEnabled: localNetworkAccessEnabled,
+                ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
+            )
             saveDiagnostic(stage: "started-awg", message: "AmneziaWG tunnel start returned successfully.")
         } catch {
             saveDiagnostic(stage: "awg-failed", message: error.localizedDescription)
@@ -118,7 +140,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func startAmneziaWireGuardTunnel(
         with config: AmneziaWireGuardConfig,
         routingExceptions: RoutingExceptionCollection,
-        killSwitchEnabled: Bool
+        killSwitchEnabled: Bool,
+        localNetworkAccessEnabled: Bool,
+        ipv6LeakProtectionEnabled: Bool
     ) async throws {
 #if SINGBOX_TUNNEL
         throw PacketTunnelProviderError.invalidAmneziaConfig
@@ -126,7 +150,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let tunnelConfiguration = try config.makeTunnelConfiguration(
             named: "Real Ai VPN",
             routingExceptions: routingExceptions,
-            killSwitchEnabled: killSwitchEnabled
+            killSwitchEnabled: killSwitchEnabled,
+            localNetworkAccessEnabled: localNetworkAccessEnabled,
+            ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
         )
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -145,18 +171,35 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func startSingBoxTunnel(
         with config: ShadowrocketVLESSConfig,
         routingExceptions: RoutingExceptionCollection,
-        killSwitchEnabled: Bool
+        killSwitchEnabled: Bool,
+        dnsProtectionEnabled: Bool,
+        localNetworkAccessEnabled: Bool,
+        ipv6LeakProtectionEnabled: Bool
     ) async throws {
         let singBoxConfig = try SingBoxConfigBuilder().build(
             from: config,
-            routeOverrides: singBoxRouteOverrides(from: routingExceptions)
+            routeOverrides: singBoxRouteOverrides(
+                from: routingExceptions,
+                localNetworkAccessEnabled: localNetworkAccessEnabled,
+                ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
+            ),
+            dnsProtectionEnabled: dnsProtectionEnabled
         )
         packetTunnelLogger.info("Prepared sing-box config for \(config.endpoint, privacy: .public), bytes=\(singBoxConfig.jsonString.utf8.count, privacy: .public)")
-        saveDiagnostic(stage: "singbox-config-built", message: "Config bytes: \(singBoxConfig.jsonString.utf8.count).")
+        saveDiagnostic(
+            stage: "singbox-config-built",
+            message: dnsProtectionEnabled
+                ? "Config bytes: \(singBoxConfig.jsonString.utf8.count). Provider DNS lane: Yandex DNS."
+                : "Config bytes: \(singBoxConfig.jsonString.utf8.count). Profile DNS only."
+        )
         try await singBoxRuntime.start(configJSON: singBoxConfig.jsonString, killSwitchEnabled: killSwitchEnabled)
     }
 
-    private func singBoxRouteOverrides(from routingExceptions: RoutingExceptionCollection) -> SingBoxRouteOverrides {
+    private func singBoxRouteOverrides(
+        from routingExceptions: RoutingExceptionCollection,
+        localNetworkAccessEnabled: Bool,
+        ipv6LeakProtectionEnabled: Bool
+    ) -> SingBoxRouteOverrides {
         var overrides = SingBoxRouteOverrides()
         var forceHostRoutes: [String] = []
         for rule in routingExceptions.enabledRules {
@@ -183,17 +226,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        let localProviderRanges = [
-            "127.0.0.0/8",
-            "10.0.0.0/8",
-            "100.64.0.0/10",
-            "169.254.0.0/16",
-            "172.16.0.0/12",
-            "192.168.0.0/16",
-            "::1/128",
-            "fc00::/7",
-            "fe80::/10"
-        ]
+        let localProviderRanges = localRouteExcludes(
+            localNetworkAccessEnabled: localNetworkAccessEnabled,
+            ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
+        )
         let ruRanges = subtract(forceHostRoutes: forceHostRoutes, from: loadBundledCIDRs(resource: "ru-aggregated", extension: "zone"))
         overrides.systemRouteExcludeIPCIDRs = localProviderRanges + ruRanges + overrides.bypassVPNIPCIDRs
         packetTunnelLogger.info("Applying sing-box system route excludes: local=\(localProviderRanges.count, privacy: .public) ru=\(ruRanges.count, privacy: .public)")
@@ -203,6 +239,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func stopTunnel(with reason: NEProviderStopReason) async {
         packetTunnelLogger.info("Stopping packet tunnel, reason: \(reason.rawValue)")
+        saveDiagnostic(
+            stage: "stopTunnel",
+            message: "reason=\(reason.diagnosticName) raw=\(reason.rawValue)"
+        )
         await singBoxRuntime.stop()
 #if !SINGBOX_TUNNEL
         await withCheckedContinuation { continuation in
@@ -272,6 +312,51 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 }
 
+private extension NEProviderStopReason {
+    var diagnosticName: String {
+        switch self {
+        case .none:
+            return "none"
+        case .userInitiated:
+            return "userInitiated"
+        case .providerFailed:
+            return "providerFailed"
+        case .noNetworkAvailable:
+            return "noNetworkAvailable"
+        case .unrecoverableNetworkChange:
+            return "unrecoverableNetworkChange"
+        case .providerDisabled:
+            return "providerDisabled"
+        case .authenticationCanceled:
+            return "authenticationCanceled"
+        case .configurationFailed:
+            return "configurationFailed"
+        case .idleTimeout:
+            return "idleTimeout"
+        case .configurationDisabled:
+            return "configurationDisabled"
+        case .configurationRemoved:
+            return "configurationRemoved"
+        case .superceded:
+            return "superceded"
+        case .userLogout:
+            return "userLogout"
+        case .userSwitch:
+            return "userSwitch"
+        case .connectionFailed:
+            return "connectionFailed"
+        case .sleep:
+            return "sleep"
+        case .appUpdate:
+            return "appUpdate"
+        case .internalError:
+            return "internalError"
+        @unknown default:
+            return "unknown"
+        }
+    }
+}
+
 enum PacketTunnelProviderError: LocalizedError {
     case missingAmneziaKey
     case invalidAmneziaConfig
@@ -335,12 +420,42 @@ private func subtract(forceHostRoutes: [String], from cidrs: [String]) -> [Strin
     }
 }
 
+private func localRouteExcludes(
+    localNetworkAccessEnabled: Bool,
+    ipv6LeakProtectionEnabled: Bool
+) -> [String] {
+    guard localNetworkAccessEnabled else {
+        return []
+    }
+
+    let ipv4LocalRanges = [
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16"
+    ]
+
+    guard !ipv6LeakProtectionEnabled else {
+        return ipv4LocalRanges
+    }
+
+    return ipv4LocalRanges + [
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10"
+    ]
+}
+
 #if !SINGBOX_TUNNEL
 private extension AmneziaWireGuardConfig {
     func makeTunnelConfiguration(
         named name: String,
         routingExceptions: RoutingExceptionCollection,
-        killSwitchEnabled: Bool
+        killSwitchEnabled: Bool,
+        localNetworkAccessEnabled: Bool,
+        ipv6LeakProtectionEnabled: Bool
     ) throws -> TunnelConfiguration {
         guard let privateKey = PrivateKey(base64Key: privateKey) else {
             throw PacketTunnelProviderError.invalidWireGuardConfig("invalid private key")
@@ -388,7 +503,11 @@ private extension AmneziaWireGuardConfig {
             let compiledRules = RoutingExceptionCompiler.compile(routingExceptions.enabledRules)
             let forceHostRoutes = compiledRules.forceVPN.filter(\.isHostRoute)
             peer.allowedIPs.append(contentsOf: compiledRules.forceVPN)
-            peer.excludeIPs = splitTunnelBypassRanges(excludingForceHostRoutes: forceHostRoutes)
+            peer.excludeIPs = splitTunnelBypassRanges(
+                excludingForceHostRoutes: forceHostRoutes,
+                localNetworkAccessEnabled: localNetworkAccessEnabled,
+                ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
+            )
             peer.excludeIPs.append(contentsOf: compiledRules.bypassVPN)
         }
         peer.persistentKeepAlive = persistentKeepalive.flatMap(UInt16.init(exactly:))
@@ -423,20 +542,15 @@ private extension AmneziaWireGuardConfig {
         return UInt16(value)
     }
 
-    private func splitTunnelBypassRanges(excludingForceHostRoutes forceHostRoutes: [IPAddressRange]) -> [IPAddressRange] {
-        let localProviderRanges = [
-            // Local/provider networks must never hairpin through the VPN tunnel.
-            "127.0.0.0/8",
-            "10.0.0.0/8",
-            "100.64.0.0/10",
-            "169.254.0.0/16",
-            "172.16.0.0/12",
-            "192.168.0.0/16",
-            "::1/128",
-            "fc00::/7",
-            "fe80::/10"
-        ]
-
+    private func splitTunnelBypassRanges(
+        excludingForceHostRoutes forceHostRoutes: [IPAddressRange],
+        localNetworkAccessEnabled: Bool,
+        ipv6LeakProtectionEnabled: Bool
+    ) -> [IPAddressRange] {
+        let localProviderRanges = localRouteExcludes(
+            localNetworkAccessEnabled: localNetworkAccessEnabled,
+            ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
+        )
         let ruRanges = subtract(
             forceHostRoutes: forceHostRoutes.map(\.stringRepresentation),
             from: loadBundledCIDRs(resource: "ru-aggregated", extension: "zone")

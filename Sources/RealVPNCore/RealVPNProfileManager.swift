@@ -32,19 +32,28 @@ public struct VPNProfileConfiguration: Hashable, Codable, Sendable {
     public var serverID: String
     public var regionCode: String
     public var killSwitchEnabled: Bool
+    public var dnsProtectionEnabled: Bool
+    public var localNetworkAccessEnabled: Bool
+    public var ipv6LeakProtectionEnabled: Bool
 
     public init(
         localizedDescription: String = "Real Ai VPN",
         providerBundleIdentifier: String = "com.codex.RealAiVPN.PacketTunnel",
         serverID: String,
         regionCode: String,
-        killSwitchEnabled: Bool = false
+        killSwitchEnabled: Bool = false,
+        dnsProtectionEnabled: Bool = true,
+        localNetworkAccessEnabled: Bool = true,
+        ipv6LeakProtectionEnabled: Bool = true
     ) {
         self.localizedDescription = localizedDescription
         self.providerBundleIdentifier = providerBundleIdentifier
         self.serverID = serverID
         self.regionCode = regionCode
         self.killSwitchEnabled = killSwitchEnabled
+        self.dnsProtectionEnabled = dnsProtectionEnabled
+        self.localNetworkAccessEnabled = localNetworkAccessEnabled
+        self.ipv6LeakProtectionEnabled = ipv6LeakProtectionEnabled
     }
 }
 
@@ -139,6 +148,9 @@ public final class RealVPNProfileManager: ObservableObject {
                 options["routingExceptions"] = encodedExceptions as NSString
             }
             options["killSwitchEnabled"] = NSNumber(value: configuration.killSwitchEnabled)
+            options["dnsProtectionEnabled"] = NSNumber(value: configuration.dnsProtectionEnabled)
+            options["localNetworkAccessEnabled"] = NSNumber(value: configuration.localNetworkAccessEnabled)
+            options["ipv6LeakProtectionEnabled"] = NSNumber(value: configuration.ipv6LeakProtectionEnabled)
             try manager.connection.startVPNTunnel(options: options)
             await waitForSettledStatus()
             vpnProfileLogger.info("startVPNTunnel returned status=\(self.status.rawValue, privacy: .public)")

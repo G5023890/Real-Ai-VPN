@@ -3,6 +3,7 @@ import AppKit
 import Combine
 import Network
 import RealVPNCore
+import ServiceManagement
 import SwiftUI
 import SmartServerSelection
 import UniformTypeIdentifiers
@@ -460,6 +461,37 @@ final class DashboardModel: ObservableObject {
             UserDefaults.standard.set(killSwitchEnabled, forKey: "killSwitchEnabled")
         }
     }
+    @Published var dnsProtectionEnabled = UserDefaults.standard.object(forKey: "dnsProtectionEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(dnsProtectionEnabled, forKey: "dnsProtectionEnabled")
+        }
+    }
+    @Published var showFailoverNotifications = UserDefaults.standard.object(forKey: "showFailoverNotifications") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(showFailoverNotifications, forKey: "showFailoverNotifications")
+        }
+    }
+    @Published var localNetworkAccessEnabled = UserDefaults.standard.object(forKey: "localNetworkAccessEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(localNetworkAccessEnabled, forKey: "localNetworkAccessEnabled")
+        }
+    }
+    @Published var ipv6LeakProtectionEnabled = UserDefaults.standard.object(forKey: "ipv6LeakProtectionEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(ipv6LeakProtectionEnabled, forKey: "ipv6LeakProtectionEnabled")
+        }
+    }
+    @Published var launchAtLoginEnabled = UserDefaults.standard.object(forKey: "launchAtLogin") as? Bool ?? false {
+        didSet {
+            UserDefaults.standard.set(launchAtLoginEnabled, forKey: "launchAtLogin")
+            configureLaunchAtLogin(launchAtLoginEnabled)
+        }
+    }
+    @Published var preferredLanguage = UserDefaults.standard.string(forKey: "preferredLanguage") ?? "English" {
+        didSet {
+            UserDefaults.standard.set(preferredLanguage, forKey: "preferredLanguage")
+        }
+    }
     @Published var activeConfigProfileID: String? {
         didSet {
             guard activeConfigProfileID != oldValue else {
@@ -532,6 +564,7 @@ final class DashboardModel: ObservableObject {
         loadQualityHistory()
         loadProbeReliabilityHistory()
         startMonitoring()
+        configureLaunchAtLogin(launchAtLoginEnabled)
         Task {
             await vpnManager.prepareProfile(configuration: vpnConfiguration)
         }
@@ -642,6 +675,18 @@ final class DashboardModel: ObservableObject {
         }
 
         return "Best check \(best.targetID) · \(Int((best.reliabilityScore * 100).rounded()))% reliable"
+    }
+
+    var dnsPolicyDiagnostic: String {
+        guard dnsProtectionEnabled else {
+            return "Profile DNS only"
+        }
+
+        guard displayedConfigProfile?.kind == .singBoxVLESSReality else {
+            return "Profile DNS only · split-dns-provider-lane unavailable for AWG"
+        }
+
+        return "Provider DNS lane: Yandex DNS"
     }
 
     var activeProfileDisplayName: String {
@@ -838,6 +883,14 @@ final class DashboardModel: ObservableObject {
             try? await Task.sleep(for: .seconds(2))
             connectVPN()
         }
+    }
+
+    func reconnectVPNWithKillSwitch() {
+        killSwitchEnabled = true
+        monitorStatus = vpnStatus.isConnectedOrConnecting
+            ? "Reconnecting with Kill Switch"
+            : "Connecting with Kill Switch"
+        reconnectVPN()
     }
 
     func toggleVPN() {
@@ -1165,7 +1218,10 @@ final class DashboardModel: ObservableObject {
             providerBundleIdentifier: providerBundleIdentifier(for: profile),
             serverID: profile?.id ?? server.id,
             regionCode: profile?.regionCode ?? server.region.rawValue,
-            killSwitchEnabled: killSwitchEnabled
+            killSwitchEnabled: killSwitchEnabled,
+            dnsProtectionEnabled: dnsProtectionEnabled,
+            localNetworkAccessEnabled: localNetworkAccessEnabled,
+            ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
         )
     }
 
@@ -1607,6 +1663,10 @@ final class DashboardModel: ObservableObject {
     }
 
     private func notifyFailover(from oldProfile: String, to newProfile: String, reason: String) {
+        guard showFailoverNotifications else {
+            return
+        }
+
         let content = UNMutableNotificationContent()
         content.title = "Real Ai VPN switched profile"
         content.body = "\(oldProfile) → \(newProfile). \(reason)"
@@ -1618,6 +1678,24 @@ final class DashboardModel: ObservableObject {
             trigger: nil
         )
         UNUserNotificationCenter.current().add(request)
+    }
+
+    private func configureLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
+                }
+            } else if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            UserDefaults.standard.set(false, forKey: "launchAtLogin")
+            if launchAtLoginEnabled {
+                launchAtLoginEnabled = false
+            }
+            vpnErrorMessage = "Could not update Launch at Login: \(error.localizedDescription)"
+        }
     }
 
     private func probes(for scenario: ProbeScenario) -> [ConnectivityProbeResult] {
@@ -1635,6 +1713,7 @@ final class DashboardModel: ObservableObject {
 private enum MacSidebarPage: String, CaseIterable, Identifiable {
     case dashboard = "Dashboard"
     case profiles = "VPN Profiles"
+    case routing = "Routing"
     case settings = "Settings"
     case about = "About"
 
@@ -1646,6 +1725,8 @@ private enum MacSidebarPage: String, CaseIterable, Identifiable {
             return "house"
         case .profiles:
             return "server.rack"
+        case .routing:
+            return "arrow.triangle.branch"
         case .settings:
             return "gearshape"
         case .about:
@@ -1657,7 +1738,6 @@ private enum MacSidebarPage: String, CaseIterable, Identifiable {
 private enum MacSettingsSection: String, CaseIterable, Identifiable {
     case general = "General"
     case connection = "Connection"
-    case routing = "Routing"
     case regions = "Regions"
     case security = "Security"
 
@@ -1669,8 +1749,6 @@ private enum MacSettingsSection: String, CaseIterable, Identifiable {
             return "sparkles"
         case .connection:
             return "network"
-        case .routing:
-            return "arrow.triangle.branch"
         case .regions:
             return "globe"
         case .security:
@@ -1789,9 +1867,22 @@ struct DashboardView: View {
         }
         .background(theme.background.ignoresSafeArea())
         .foregroundStyle(theme.primaryText)
-        .sheet(isPresented: $showSettings) {
-            SettingsView(model: model)
+        .onAppear {
+            openSettingsPageIfRequested()
         }
+        .onChange(of: showSettings) { _, _ in
+            openSettingsPageIfRequested()
+        }
+    }
+
+    private func openSettingsPageIfRequested() {
+        guard showSettings else {
+            return
+        }
+
+        selectedPage = .settings
+        selectedSettingsSection = .general
+        showSettings = false
     }
 
     private func sidebar(theme: MacLiquidTheme, compact: Bool) -> some View {
@@ -1928,6 +2019,9 @@ struct DashboardView: View {
                     .padding(compact ? 14 : 24)
             case .profiles:
                 MacProfilesWorkspace(model: model, theme: theme)
+                    .padding(compact ? 14 : 24)
+            case .routing:
+                MacRoutingWorkspace(model: model, theme: theme)
                     .padding(compact ? 14 : 24)
             case .settings:
                 MacSettingsWorkspace(
@@ -2132,6 +2226,11 @@ private struct MacDashboardHome: View {
             MacHealthMiniRow(title: "Provider", report: model.healthAssessment.directPath, theme: theme)
             MacHealthMiniRow(title: "Tunnel", report: model.healthAssessment.vpnPath, theme: theme)
             MacHealthStatusRow(title: "Auto Recovery", value: autoRecoveryStatus, color: autoRecoveryColor, theme: theme)
+
+            Text(model.dnsPolicyDiagnostic)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(theme.secondaryText)
+                .lineLimit(2)
 
             Spacer()
 
@@ -2433,6 +2532,123 @@ private struct MacHealthStatusRow: View {
     }
 }
 
+private struct MacRoutingWorkspace: View {
+    @ObservedObject var model: DashboardModel
+    let theme: MacLiquidTheme
+    @State private var forceVPNException = ""
+    @State private var bypassVPNException = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+                Text("Routing")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(theme.primaryText)
+
+                Spacer()
+
+                Button {
+                    model.reconnectVPNWithKillSwitch()
+                } label: {
+                    Label("Reconnect", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .tint(.teal)
+                .disabled(reconnectDisabled)
+                .help("Reconnect VPN with Kill Switch")
+            }
+
+            VStack(spacing: 16) {
+                MacSettingsSectionCard(title: "Bypass VPN", theme: theme) {
+                    routingInput("Domain or CIDR", text: $bypassVPNException, mode: .bypassVPN)
+                    routingRules(mode: .bypassVPN)
+                }
+
+                MacSettingsSectionCard(title: "Through VPN", theme: theme) {
+                    routingInput("Domain or CIDR", text: $forceVPNException, mode: .forceVPN)
+                    routingRules(mode: .forceVPN)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private var reconnectDisabled: Bool {
+        model.vpnStatus == .connecting || model.vpnStatus == .disconnecting
+    }
+
+    private func routingInput(_ placeholder: String, text: Binding<String>, mode: RoutingExceptionMode) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                routingTextField(placeholder, text: text)
+                    .frame(maxWidth: .infinity)
+                routingAddButton(text: text, mode: mode)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                routingTextField(placeholder, text: text)
+                routingAddButton(text: text, mode: mode)
+            }
+        }
+    }
+
+    private func routingTextField(_ placeholder: String, text: Binding<String>) -> some View {
+        TextField(placeholder, text: text)
+            .textFieldStyle(.plain)
+            .font(.system(size: 12, design: .monospaced))
+            .padding(9)
+            .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func routingAddButton(text: Binding<String>, mode: RoutingExceptionMode) -> some View {
+        Button {
+            model.addRoutingException(value: text.wrappedValue, mode: mode)
+            text.wrappedValue = ""
+        } label: {
+            Label("Add Item", systemImage: "plus")
+        }
+        .buttonStyle(.bordered)
+        .tint(.teal)
+        .disabled(text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
+    private func routingRules(mode: RoutingExceptionMode) -> some View {
+        VStack(spacing: 0) {
+            ForEach(model.routingExceptions.rules.filter { $0.mode == mode }) { rule in
+                HStack {
+                    Image(systemName: "globe")
+                        .foregroundStyle(theme.secondaryText)
+                    Text(rule.value)
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundStyle(theme.primaryText)
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { rule.isEnabled },
+                        set: { model.setRoutingExceptionEnabled(id: rule.id, isEnabled: $0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    Button(role: .destructive) {
+                        model.deleteRoutingException(id: rule.id)
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.red)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                Divider().opacity(0.35)
+                    .padding(.leading, 12)
+            }
+        }
+        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
 private struct MacProfilesWorkspace: View {
     @ObservedObject var model: DashboardModel
     let theme: MacLiquidTheme
@@ -2462,14 +2678,7 @@ private struct MacSettingsWorkspace: View {
     @Binding var selectedSection: MacSettingsSection
     let theme: MacLiquidTheme
     @AppStorage("appVisibilityMode") private var appVisibilityModeRaw = AppVisibilityMode.dockAndMenuBar.rawValue
-    @AppStorage("launchAtLogin") private var launchAtLogin = false
-    @AppStorage("showFailoverNotifications") private var showFailoverNotifications = true
-    @AppStorage("dnsProtectionEnabled") private var dnsProtectionEnabled = true
-    @AppStorage("localNetworkAccessEnabled") private var localNetworkAccessEnabled = true
-    @AppStorage("ipv6LeakProtectionEnabled") private var ipv6LeakProtectionEnabled = true
     @State private var amneziaKey = ""
-    @State private var forceVPNException = ""
-    @State private var bypassVPNException = ""
     @State private var message: String?
     @State private var showConfigImporter = false
 
@@ -2565,8 +2774,6 @@ private struct MacSettingsWorkspace: View {
             generalSettings
         case .connection:
             connectionSettings
-        case .routing:
-            routingSettings
         case .regions:
             regionsSettings
         case .security:
@@ -2597,16 +2804,16 @@ private struct MacSettingsWorkspace: View {
                             : AppVisibilityMode.menuBarOnly.rawValue
                     }
                 ))
-                settingsToggle("Launch at Login", isOn: $launchAtLogin)
+                settingsToggle("Launch at Login", isOn: $model.launchAtLoginEnabled)
             }
 
             MacSettingsSectionCard(title: "Behavior", theme: theme) {
                 settingsToggle("Auto-switch when connection is unstable", isOn: $model.automaticFailoverEnabled)
-                settingsToggle("Show notification after switch", isOn: $showFailoverNotifications)
+                settingsToggle("Show notification after switch", isOn: $model.showFailoverNotifications)
             }
 
             MacSettingsSectionCard(title: "Language", theme: theme) {
-                Picker("Language", selection: .constant("English")) {
+                Picker("Language", selection: $model.preferredLanguage) {
                     Text("English").tag("English")
                     Text("Русский").tag("Русский")
                 }
@@ -2669,19 +2876,6 @@ private struct MacSettingsWorkspace: View {
         }
     }
 
-    private var routingSettings: some View {
-        VStack(spacing: 16) {
-            MacSettingsSectionCard(title: "Bypass VPN", theme: theme) {
-                routingInput("Domain or CIDR", text: $bypassVPNException, mode: .bypassVPN)
-                routingRules(mode: .bypassVPN)
-            }
-            MacSettingsSectionCard(title: "Through VPN", theme: theme) {
-                routingInput("Domain or CIDR", text: $forceVPNException, mode: .forceVPN)
-                routingRules(mode: .forceVPN)
-            }
-        }
-    }
-
     private var regionsSettings: some View {
         VStack(spacing: 16) {
             MacSettingsSectionCard(title: "Current Regions", theme: theme) {
@@ -2709,17 +2903,17 @@ private struct MacSettingsWorkspace: View {
         VStack(spacing: 16) {
             MacSettingsSectionCard(title: "Security", theme: theme) {
                 settingsToggle("Kill Switch", isOn: $model.killSwitchEnabled)
-                settingsToggle("DNS Protection", isOn: $dnsProtectionEnabled)
-                settingsToggle("Local Network Access", isOn: $localNetworkAccessEnabled)
-                settingsToggle("IPv6 Leak Protection", isOn: $ipv6LeakProtectionEnabled)
+                settingsToggle("DNS Protection", isOn: $model.dnsProtectionEnabled)
+                settingsToggle("Local Network Access", isOn: $model.localNetworkAccessEnabled)
+                settingsToggle("IPv6 Leak Protection", isOn: $model.ipv6LeakProtectionEnabled)
                 settingsToggle("Auto Recovery", isOn: $model.automaticFailoverEnabled)
             }
 
             Button(role: .destructive) {
                 model.killSwitchEnabled = false
-                dnsProtectionEnabled = true
-                localNetworkAccessEnabled = true
-                ipv6LeakProtectionEnabled = true
+                model.dnsProtectionEnabled = true
+                model.localNetworkAccessEnabled = true
+                model.ipv6LeakProtectionEnabled = true
                 model.automaticFailoverEnabled = true
             } label: {
                 Label("Reset Security Settings", systemImage: "arrow.counterclockwise")
@@ -2746,76 +2940,6 @@ private struct MacSettingsWorkspace: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 3)
-    }
-
-    private func routingInput(_ placeholder: String, text: Binding<String>, mode: RoutingExceptionMode) -> some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 10) {
-                routingTextField(placeholder, text: text)
-                    .frame(maxWidth: .infinity)
-                routingAddButton(text: text, mode: mode)
-            }
-
-            VStack(alignment: .leading, spacing: 8) {
-                routingTextField(placeholder, text: text)
-                routingAddButton(text: text, mode: mode)
-            }
-        }
-    }
-
-    private func routingTextField(_ placeholder: String, text: Binding<String>) -> some View {
-        TextField(placeholder, text: text)
-            .textFieldStyle(.plain)
-            .font(.system(size: 12, design: .monospaced))
-            .padding(9)
-            .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-
-    private func routingAddButton(text: Binding<String>, mode: RoutingExceptionMode) -> some View {
-        Button {
-            model.addRoutingException(value: text.wrappedValue, mode: mode)
-            text.wrappedValue = ""
-        } label: {
-            Label("Add Item", systemImage: "plus")
-        }
-        .buttonStyle(.bordered)
-        .tint(.teal)
-        .disabled(text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-    }
-
-    private func routingRules(mode: RoutingExceptionMode) -> some View {
-        VStack(spacing: 0) {
-            ForEach(model.routingExceptions.rules.filter { $0.mode == mode }) { rule in
-                HStack {
-                    Image(systemName: "globe")
-                        .foregroundStyle(theme.secondaryText)
-                    Text(rule.value)
-                        .font(.system(size: 12, weight: .medium, design: .monospaced))
-                        .foregroundStyle(theme.primaryText)
-                    Spacer()
-                    Toggle("", isOn: Binding(
-                        get: { rule.isEnabled },
-                        set: { model.setRoutingExceptionEnabled(id: rule.id, isEnabled: $0) }
-                    ))
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    Button(role: .destructive) {
-                        model.deleteRoutingException(id: rule.id)
-                    } label: {
-                        Image(systemName: "trash")
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.red)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                Divider().opacity(0.35)
-                    .padding(.leading, 12)
-            }
-        }
-        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private func regionRow(_ title: String, value: String) -> some View {
@@ -3029,6 +3153,12 @@ struct HealthPanel: View {
                 Text(model.monitorStatus)
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.white.opacity(0.48))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                Text(model.dnsPolicyDiagnostic)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.48))
+                    .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                 Text(model.probeReliabilityDetail)
