@@ -141,6 +141,24 @@ private struct StoredProbeReliabilityHistory: Codable {
     var probes: [ConnectivityProbeResult]
 }
 
+struct iOSVPNChannelStatistics: Identifiable {
+    var id: String
+    var displayName: String
+    var regionCode: String
+    var protocolKind: VPNProtocolKind
+    var sampleCount: Int
+    var averageLatencyMilliseconds: Double?
+    var averagePacketLoss: Double
+    var averageHandshakeMilliseconds: Double?
+    var successRate: Double
+    var failureCount: Int
+    var lastSeen: Date?
+    var reliabilitySummary: ProbeReliabilitySummary?
+    var ranking: RankedServer?
+    var isActive: Bool
+    var isConnected: Bool
+}
+
 private struct LocalProfileQualityHistoryStore {
     private let key = "ios.profileQualityHistory.v1"
     private let maxSamples = 240
@@ -380,6 +398,51 @@ final class iOSDashboardModel: ObservableObject {
         }
 
         return "Best check: \(best.targetID) · \(Int((best.reliabilityScore * 100).rounded()))% reliable."
+    }
+
+    var channelStatistics: [iOSVPNChannelStatistics] {
+        effectiveServers.map { server in
+            let samples = qualitySamples
+                .filter { $0.serverID == server.id }
+                .sorted { $0.timestamp < $1.timestamp }
+            let recentSamples = Array(samples.suffix(60))
+            let successSamples = recentSamples.filter { $0.packetLoss < 1 }
+            let reliability = probeReliabilityAnalyzer.bestSummary(
+                from: probeReliabilitySamples,
+                serverID: server.id,
+                targetKind: .vpnProtectedEndpoint
+            )
+            let ranking = rankedServers.first { $0.server.id == server.id }
+            let activeID = displayedProfile?.id ?? activeProfile?.id
+            let connectedID = connectedProfile?.id
+
+            return iOSVPNChannelStatistics(
+                id: server.id,
+                displayName: server.displayName,
+                regionCode: server.region.rawValue,
+                protocolKind: server.protocolKind,
+                sampleCount: recentSamples.count,
+                averageLatencyMilliseconds: average(recentSamples.map(\.latencyMilliseconds)),
+                averagePacketLoss: average(recentSamples.map(\.packetLoss)) ?? 0,
+                averageHandshakeMilliseconds: average(recentSamples.map(\.handshakeMilliseconds)),
+                successRate: recentSamples.isEmpty ? 0 : Double(successSamples.count) / Double(recentSamples.count),
+                failureCount: recentSamples.reduce(0) { $0 + $1.recentFailureCount },
+                lastSeen: recentSamples.last?.timestamp ?? reliability?.lastSeen,
+                reliabilitySummary: reliability,
+                ranking: ranking,
+                isActive: server.id == activeID,
+                isConnected: vpnStatus.isConnectedOrConnecting && server.id == connectedID
+            )
+        }
+        .sorted { lhs, rhs in
+            if lhs.isConnected != rhs.isConnected {
+                return lhs.isConnected
+            }
+            if lhs.isActive != rhs.isActive {
+                return lhs.isActive
+            }
+            return (lhs.ranking?.score ?? lhs.successRate) > (rhs.ranking?.score ?? rhs.successRate)
+        }
     }
 
     var dnsPolicyDiagnostic: String {
@@ -940,6 +1003,14 @@ final class iOSDashboardModel: ObservableObject {
         qualitySamples.last { $0.serverID == profileID }?.latencyMilliseconds
     }
 
+    private func average(_ values: [Double]) -> Double? {
+        guard !values.isEmpty else {
+            return nil
+        }
+
+        return values.reduce(0, +) / Double(values.count)
+    }
+
     private func loadQualityHistory() {
         qualitySamples = qualityHistoryStore.load()
         qualitySamples.forEach { selector.record($0) }
@@ -1327,6 +1398,7 @@ private enum iOSMainTab: Hashable {
     case profiles
     case route
     case settings
+    case statistics
 }
 
 struct iOSDashboardView: View {
@@ -1370,6 +1442,14 @@ struct iOSDashboardView: View {
                 Label("Settings", systemImage: "gearshape.fill")
             }
             .tag(iOSMainTab.settings)
+
+            NavigationStack {
+                iOSStatisticsScreen(model: model)
+            }
+            .tabItem {
+                Label("Stat", systemImage: "chart.line.uptrend.xyaxis")
+            }
+            .tag(iOSMainTab.statistics)
         }
         .tint(AppTheme.accent)
         .background(AppTheme.background.ignoresSafeArea())
@@ -1883,6 +1963,219 @@ private struct iOSRouteScreen: View {
         .padding(16)
         .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+    }
+}
+
+private struct iOSStatisticsScreen: View {
+    @ObservedObject var model: iOSDashboardModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                liveHealthCard
+                channelsCard
+            }
+            .padding(16)
+            .padding(.bottom, 24)
+        }
+        .background(AppTheme.background.ignoresSafeArea())
+        .navigationTitle("Stat")
+        .navigationBarTitleDisplayMode(.large)
+    }
+
+    private var liveHealthCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("Live Health", systemImage: "waveform.path.ecg")
+                .font(.headline)
+                .foregroundStyle(AppTheme.secondaryText)
+
+            HStack(spacing: 12) {
+                healthTile(title: "Provider", report: model.healthAssessment.directPath)
+                healthTile(title: "Tunnel", report: model.healthAssessment.vpnPath)
+            }
+
+            Text(model.probeReliabilityDetail)
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(AppTheme.secondaryText)
+                .lineLimit(2)
+        }
+        .padding(18)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+    }
+
+    private var channelsCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("Channels", systemImage: "chart.line.uptrend.xyaxis")
+                .font(.headline)
+                .foregroundStyle(AppTheme.secondaryText)
+
+            if model.channelStatistics.isEmpty {
+                Text("No channel statistics yet.")
+                    .font(.callout)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 8)
+            } else {
+                VStack(spacing: 10) {
+                    ForEach(model.channelStatistics) { channel in
+                        channelRow(channel)
+                    }
+                }
+            }
+        }
+        .padding(18)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+    }
+
+    private func healthTile(title: String, report: PathHealthReport) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(AppTheme.primaryText)
+            Text("\(Int((report.successRate * 100).rounded()))%")
+                .font(.title3.bold())
+                .foregroundStyle(color(for: report.state))
+            Text("\(formatLatency(report.averageLatencyMilliseconds)) · \(formatPercent(report.averagePacketLoss)) loss")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(AppTheme.secondaryText)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private func channelRow(_ channel: iOSVPNChannelStatistics) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: channel.isConnected ? "checkmark.shield.fill" : "server.rack")
+                    .foregroundStyle(channel.isConnected ? AppTheme.success : (channel.isActive ? AppTheme.accent : AppTheme.secondaryText))
+                    .frame(width: 22)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 7) {
+                        Text(channel.displayName)
+                            .font(.headline)
+                            .foregroundStyle(AppTheme.primaryText)
+                            .lineLimit(1)
+                        if channel.isConnected {
+                            channelBadge("Connected", color: AppTheme.success)
+                        } else if channel.isActive {
+                            channelBadge("Active", color: AppTheme.accent)
+                        }
+                    }
+                    Text("\(channel.regionCode) · \(protocolLabel(channel.protocolKind)) · \(channel.sampleCount) samples")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(channel.ranking.map { "\(Int(($0.score * 100).rounded()))" } ?? "--")
+                        .font(.title3.bold())
+                        .foregroundStyle(AppTheme.accent)
+                    Text("score")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
+            }
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
+                channelMetric("Latency", formatLatency(channel.averageLatencyMilliseconds))
+                channelMetric("Loss", formatPercent(channel.averagePacketLoss))
+                channelMetric("Success", formatPercent(channel.successRate))
+                channelMetric("Handshake", formatLatency(channel.averageHandshakeMilliseconds))
+                channelMetric("Failures", "\(channel.failureCount)")
+                channelMetric("Last", relativeTime(channel.lastSeen))
+            }
+        }
+        .padding(12)
+        .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private func channelBadge(_ title: String, color: Color) -> some View {
+        Text(title)
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(AppTheme.pill, in: Capsule())
+    }
+
+    private func channelMetric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(AppTheme.secondaryText)
+            Text(value)
+                .font(.caption.monospacedDigit().weight(.semibold))
+                .foregroundStyle(AppTheme.primaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(AppTheme.card.opacity(0.55), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func formatLatency(_ value: Double?) -> String {
+        guard let value else {
+            return "--"
+        }
+
+        return "\(Int(value.rounded())) ms"
+    }
+
+    private func formatPercent(_ value: Double) -> String {
+        "\(Int((value * 100).rounded()))%"
+    }
+
+    private func relativeTime(_ date: Date?) -> String {
+        guard let date else {
+            return "--"
+        }
+
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        if seconds < 60 {
+            return "\(seconds)s"
+        }
+        let minutes = seconds / 60
+        if minutes < 60 {
+            return "\(minutes)m"
+        }
+        return "\(minutes / 60)h"
+    }
+
+    private func protocolLabel(_ protocolKind: VPNProtocolKind) -> String {
+        switch protocolKind {
+        case .amneziaWG:
+            return "AmneziaWG"
+        case .wireGuard:
+            return "WireGuard"
+        case .singBox:
+            return "sing-box"
+        case .xray:
+            return "Xray"
+        case .openVPN:
+            return "OpenVPN"
+        case .unknown:
+            return "VPN"
+        }
+    }
+
+    private func color(for state: PathHealthState) -> Color {
+        switch state {
+        case .healthy:
+            return AppTheme.success
+        case .degradedSoft, .degradedHard:
+            return AppTheme.warning
+        case .stalled, .down, .connectedButUnusable:
+            return .red
+        }
     }
 }
 

@@ -231,6 +231,24 @@ struct StoredProbeReliabilityHistory: Codable {
     var probes: [ConnectivityProbeResult]
 }
 
+struct VPNChannelStatistics: Identifiable {
+    var id: String
+    var displayName: String
+    var regionCode: String
+    var protocolKind: VPNProtocolKind
+    var sampleCount: Int
+    var averageLatencyMilliseconds: Double?
+    var averagePacketLoss: Double
+    var averageHandshakeMilliseconds: Double?
+    var successRate: Double
+    var failureCount: Int
+    var lastSeen: Date?
+    var reliabilitySummary: ProbeReliabilitySummary?
+    var ranking: RankedServer?
+    var isActive: Bool
+    var isConnected: Bool
+}
+
 struct LocalProfileQualityHistoryStore {
     private let maxSamples = 240
 
@@ -675,6 +693,52 @@ final class DashboardModel: ObservableObject {
         }
 
         return "Best check \(best.targetID) · \(Int((best.reliabilityScore * 100).rounded()))% reliable"
+    }
+
+    var channelStatistics: [VPNChannelStatistics] {
+        effectiveServers.map { server in
+            let samples = qualitySamples
+                .filter { $0.serverID == server.id }
+                .sorted { $0.timestamp < $1.timestamp }
+            let recentSamples = Array(samples.suffix(60))
+            let successSamples = recentSamples.filter { $0.packetLoss < 1 }
+            let reliability = probeReliabilityAnalyzer.bestSummary(
+                from: probeReliabilitySamples,
+                serverID: server.id,
+                targetKind: .vpnProtectedEndpoint
+            )
+            let ranking = rankedServers.first { $0.server.id == server.id }
+                ?? routeDecision.rankedServers.first { $0.server.id == server.id }
+            let activeID = displayedConfigProfile?.id ?? activeConfigProfile?.id ?? activeServerID
+            let connectedID = connectedConfigProfile?.id
+
+            return VPNChannelStatistics(
+                id: server.id,
+                displayName: server.displayName,
+                regionCode: server.region.rawValue,
+                protocolKind: server.protocolKind,
+                sampleCount: recentSamples.count,
+                averageLatencyMilliseconds: average(recentSamples.map(\.latencyMilliseconds)),
+                averagePacketLoss: average(recentSamples.map(\.packetLoss)) ?? 0,
+                averageHandshakeMilliseconds: average(recentSamples.map(\.handshakeMilliseconds)),
+                successRate: recentSamples.isEmpty ? 0 : Double(successSamples.count) / Double(recentSamples.count),
+                failureCount: recentSamples.reduce(0) { $0 + $1.recentFailureCount },
+                lastSeen: recentSamples.last?.timestamp ?? reliability?.lastSeen,
+                reliabilitySummary: reliability,
+                ranking: ranking,
+                isActive: server.id == activeID,
+                isConnected: vpnStatus.isConnectedOrConnecting && server.id == connectedID
+            )
+        }
+        .sorted { lhs, rhs in
+            if lhs.isConnected != rhs.isConnected {
+                return lhs.isConnected
+            }
+            if lhs.isActive != rhs.isActive {
+                return lhs.isActive
+            }
+            return (lhs.ranking?.score ?? lhs.successRate) > (rhs.ranking?.score ?? rhs.successRate)
+        }
     }
 
     var dnsPolicyDiagnostic: String {
@@ -1256,6 +1320,14 @@ final class DashboardModel: ObservableObject {
         qualitySamples.last { $0.serverID == profileID }?.latencyMilliseconds
     }
 
+    private func average(_ values: [Double]) -> Double? {
+        guard !values.isEmpty else {
+            return nil
+        }
+
+        return values.reduce(0, +) / Double(values.count)
+    }
+
     private func switchToProfileOrServer(id: String) {
         if configProfiles.contains(where: { $0.id == id }) {
             selectConfigProfile(id: id)
@@ -1715,6 +1787,7 @@ private enum MacSidebarPage: String, CaseIterable, Identifiable {
     case profiles = "VPN Profiles"
     case routing = "Routing"
     case settings = "Settings"
+    case statistics = "Stat"
     case about = "About"
 
     var id: String { rawValue }
@@ -1729,6 +1802,8 @@ private enum MacSidebarPage: String, CaseIterable, Identifiable {
             return "arrow.triangle.branch"
         case .settings:
             return "gearshape"
+        case .statistics:
+            return "chart.line.uptrend.xyaxis"
         case .about:
             return "info.circle"
         }
@@ -1737,7 +1812,6 @@ private enum MacSidebarPage: String, CaseIterable, Identifiable {
 
 private enum MacSettingsSection: String, CaseIterable, Identifiable {
     case general = "General"
-    case connection = "Connection"
     case regions = "Regions"
     case security = "Security"
 
@@ -1747,8 +1821,6 @@ private enum MacSettingsSection: String, CaseIterable, Identifiable {
         switch self {
         case .general:
             return "sparkles"
-        case .connection:
-            return "network"
         case .regions:
             return "globe"
         case .security:
@@ -2030,6 +2102,9 @@ struct DashboardView: View {
                     theme: theme
                 )
                 .padding(compact ? 14 : 24)
+            case .statistics:
+                MacStatisticsWorkspace(model: model, theme: theme)
+                    .padding(compact ? 14 : 24)
             case .about:
                 MacAboutWorkspace(buildLabel: buildLabel, theme: theme)
                     .padding(compact ? 14 : 24)
@@ -2673,6 +2748,220 @@ private struct MacProfilesWorkspace: View {
     }
 }
 
+private struct MacStatisticsWorkspace: View {
+    @ObservedObject var model: DashboardModel
+    let theme: MacLiquidTheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Stat")
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(theme.primaryText)
+
+            MacSettingsSectionCard(title: "Live Health", theme: theme) {
+                HStack(spacing: 10) {
+                    statisticsHealthTile(title: "Provider", report: model.healthAssessment.directPath)
+                    statisticsHealthTile(title: "Tunnel", report: model.healthAssessment.vpnPath)
+                    statisticsMetricTile(title: "Last Check", value: lastCheckText)
+                }
+                Text(model.probeReliabilityDetail)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(theme.secondaryText)
+                    .lineLimit(2)
+            }
+
+            MacSettingsSectionCard(title: "Channels", theme: theme) {
+                if model.channelStatistics.isEmpty {
+                    Text("No channel statistics yet.")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(theme.secondaryText)
+                } else {
+                    VStack(spacing: 10) {
+                        ForEach(model.channelStatistics) { channel in
+                            channelStatisticsRow(channel)
+                        }
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private func statisticsHealthTile(title: String, report: PathHealthReport) -> some View {
+        statisticsMetricTile(
+            title: title,
+            value: "\(Int((report.successRate * 100).rounded()))%",
+            detail: "\(formatLatency(report.averageLatencyMilliseconds)) · \(formatPercent(report.averagePacketLoss)) loss",
+            color: healthColor(report.state)
+        )
+    }
+
+    private func statisticsMetricTile(
+        title: String,
+        value: String,
+        detail: String? = nil,
+        color: Color = .teal
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(theme.secondaryText)
+            Text(value)
+                .font(.system(size: 18, weight: .bold, design: .rounded))
+                .foregroundStyle(color)
+                .lineLimit(1)
+            if let detail {
+                Text(detail)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(theme.tertiaryText)
+                    .lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func channelStatisticsRow(_ channel: VPNChannelStatistics) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: channel.isConnected ? "checkmark.shield.fill" : "server.rack")
+                    .foregroundStyle(channel.isConnected ? .green : (channel.isActive ? .teal : theme.secondaryText))
+                    .frame(width: 18)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 7) {
+                        Text(channel.displayName)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(theme.primaryText)
+                            .lineLimit(1)
+                        if channel.isConnected {
+                            channelBadge("Connected", color: .green)
+                        } else if channel.isActive {
+                            channelBadge("Active", color: .teal)
+                        }
+                    }
+                    Text("\(channel.regionCode) · \(protocolLabel(channel.protocolKind)) · \(channel.sampleCount) samples")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(theme.secondaryText)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                VStack(alignment: .trailing, spacing: 3) {
+                    Text(channel.ranking.map { "\(Int(($0.score * 100).rounded()))" } ?? "--")
+                        .font(.system(size: 18, weight: .bold, design: .rounded))
+                        .foregroundStyle(.teal)
+                    Text("score")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(theme.tertiaryText)
+                }
+                .frame(width: 44, alignment: .trailing)
+            }
+
+            HStack(spacing: 8) {
+                channelMetric("Latency", formatLatency(channel.averageLatencyMilliseconds))
+                channelMetric("Loss", formatPercent(channel.averagePacketLoss))
+                channelMetric("Success", formatPercent(channel.successRate))
+                channelMetric("Handshake", formatLatency(channel.averageHandshakeMilliseconds))
+                channelMetric("Failures", "\(channel.failureCount)")
+                channelMetric("Last", relativeTime(channel.lastSeen))
+            }
+        }
+        .padding(12)
+        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func channelBadge(_ title: String, color: Color) -> some View {
+        Text(title)
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.14), in: Capsule())
+    }
+
+    private func channelMetric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(theme.tertiaryText)
+                .lineLimit(1)
+            Text(value)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(theme.primaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var lastCheckText: String {
+        guard let date = model.lastProbeDate else {
+            return "--"
+        }
+
+        return relativeTime(date)
+    }
+
+    private func formatLatency(_ value: Double?) -> String {
+        guard let value else {
+            return "--"
+        }
+
+        return "\(Int(value.rounded())) ms"
+    }
+
+    private func formatPercent(_ value: Double) -> String {
+        "\(Int((value * 100).rounded()))%"
+    }
+
+    private func relativeTime(_ date: Date?) -> String {
+        guard let date else {
+            return "--"
+        }
+
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        if seconds < 60 {
+            return "\(seconds)s"
+        }
+        let minutes = seconds / 60
+        if minutes < 60 {
+            return "\(minutes)m"
+        }
+        return "\(minutes / 60)h"
+    }
+
+    private func protocolLabel(_ protocolKind: VPNProtocolKind) -> String {
+        switch protocolKind {
+        case .amneziaWG:
+            return "AmneziaWG"
+        case .wireGuard:
+            return "WireGuard"
+        case .singBox:
+            return "sing-box"
+        case .xray:
+            return "Xray"
+        case .openVPN:
+            return "OpenVPN"
+        case .unknown:
+            return "VPN"
+        }
+    }
+
+    private func healthColor(_ state: PathHealthState) -> Color {
+        switch state {
+        case .healthy:
+            return .green
+        case .degradedSoft, .degradedHard:
+            return .orange
+        case .stalled, .down, .connectedButUnusable:
+            return .red
+        }
+    }
+}
+
 private struct MacSettingsWorkspace: View {
     @ObservedObject var model: DashboardModel
     @Binding var selectedSection: MacSettingsSection
@@ -2772,8 +3061,6 @@ private struct MacSettingsWorkspace: View {
         switch selectedSection {
         case .general:
             generalSettings
-        case .connection:
-            connectionSettings
         case .regions:
             regionsSettings
         case .security:
@@ -3811,7 +4098,7 @@ struct SettingsView: View {
     @AppStorage("appVisibilityMode") private var appVisibilityModeRaw = AppVisibilityMode.dockAndMenuBar.rawValue
     @State private var amneziaKey = ""
     @State private var message: String?
-    @State private var selectedTab: SettingsTab = .connection
+    @State private var selectedTab: SettingsTab = .app
     @State private var showConfigImporter = false
     @State private var forceVPNException = ""
     @State private var bypassVPNException = ""
@@ -3852,7 +4139,6 @@ struct SettingsView: View {
                 }
 
                 Picker("", selection: $selectedTab) {
-                    Text("Connection").tag(SettingsTab.connection)
                     Text("App").tag(SettingsTab.app)
                     Text("Routing").tag(SettingsTab.routing)
                     Text("Regions").tag(SettingsTab.regions)
@@ -3864,8 +4150,6 @@ struct SettingsView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
                         switch selectedTab {
-                        case .connection:
-                            connectionSettings
                         case .app:
                             appSettings
                         case .routing:
@@ -4230,7 +4514,6 @@ struct SettingsView: View {
 }
 
 private enum SettingsTab: Hashable {
-    case connection
     case app
     case routing
     case regions
