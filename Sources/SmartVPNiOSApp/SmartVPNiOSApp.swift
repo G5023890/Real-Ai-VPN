@@ -272,6 +272,18 @@ final class iOSDashboardModel: ObservableObject {
             UserDefaults.standard.set(automaticFailoverEnabled, forKey: "ios.automaticFailoverEnabled")
         }
     }
+    @Published var connectOnStartEnabled = UserDefaults.standard.object(forKey: "ios.connectOnStartEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(connectOnStartEnabled, forKey: "ios.connectOnStartEnabled")
+            Task { await vpnManager.prepareProfile(configuration: vpnConfiguration) }
+        }
+    }
+    @Published var reconnectAfterDropEnabled = UserDefaults.standard.object(forKey: "ios.reconnectAfterDropEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(reconnectAfterDropEnabled, forKey: "ios.reconnectAfterDropEnabled")
+            Task { await vpnManager.prepareProfile(configuration: vpnConfiguration) }
+        }
+    }
     @Published var killSwitchEnabled = UserDefaults.standard.object(forKey: "ios.killSwitchEnabled") as? Bool ?? false {
         didSet {
             UserDefaults.standard.set(killSwitchEnabled, forKey: "ios.killSwitchEnabled")
@@ -303,6 +315,11 @@ final class iOSDashboardModel: ObservableObject {
     private var vpnHardDegradedSince: Date?
     private var profileQuarantineUntil: [String: Date] = [:]
     private var suppressExpectedDisconnectNotification = false
+    private var dropRecoveryTask: Task<Void, Never>?
+    private var dropRecoveryProfileID: String?
+    private var dropRecoveryAttempt = 0
+    private let maxDropReconnectAttempts = 5
+    private let dropReconnectDelaySeconds: UInt64 = 2
 
     init() {
         vpnManager.$status
@@ -336,11 +353,13 @@ final class iOSDashboardModel: ObservableObject {
         startMonitoring()
         Task {
             await vpnManager.prepareProfile(configuration: vpnConfiguration)
+            await connectOnStartIfNeeded()
         }
     }
 
     deinit {
         monitoringTask?.cancel()
+        dropRecoveryTask?.cancel()
     }
 
     var isConnectedOrConnecting: Bool {
@@ -590,6 +609,7 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     func setActiveProfile(id: String) {
+        cancelDropRecovery()
         NSLog("RealAiVPN iOS setActiveProfile id=%@", id)
         do {
             try profileStore.setActiveProfile(id: id)
@@ -606,6 +626,7 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     func reconnectProfile(id: String) {
+        cancelDropRecovery()
         NSLog("RealAiVPN iOS reconnectProfile id=%@", id)
         let wasConnectedOrConnecting = vpnStatus.isConnectedOrConnecting
         do {
@@ -620,9 +641,12 @@ final class iOSDashboardModel: ObservableObject {
                 : "Connecting \(selected.displayName)..."
             if wasConnectedOrConnecting {
                 suppressExpectedDisconnectNotification = true
+                message = killSwitchEnabled
+                    ? "Reconnecting \(selected.displayName) with Kill Switch..."
+                    : "Reconnecting \(selected.displayName)..."
                 vpnManager.disconnect()
                 Task {
-                    try? await Task.sleep(for: .seconds(1))
+                    await waitUntilVPNIsDisconnected()
                     connect()
                 }
             } else {
@@ -635,6 +659,7 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     func reconnectVPNWithKillSwitch() {
+        cancelDropRecovery()
         guard vpnStatus != .connecting, vpnStatus != .disconnecting else {
             return
         }
@@ -652,7 +677,7 @@ final class iOSDashboardModel: ObservableObject {
             suppressExpectedDisconnectNotification = true
             vpnManager.disconnect()
             Task {
-                try? await Task.sleep(for: .seconds(1))
+                await waitUntilVPNIsDisconnected()
                 connect()
             }
         } else {
@@ -689,7 +714,7 @@ final class iOSDashboardModel: ObservableObject {
                 suppressExpectedDisconnectNotification = true
                 vpnManager.disconnect()
                 Task {
-                    try? await Task.sleep(for: .seconds(1))
+                    await waitUntilVPNIsDisconnected()
                     connect()
                 }
                 message = "Deleted \(deletedName). Reconnecting \(activeProfile?.displayName ?? "profile")."
@@ -718,6 +743,9 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     func connect() {
+        if dropRecoveryTask == nil {
+            cancelDropRecovery()
+        }
         NSLog("RealAiVPN iOS connect() entered connectedOrConnecting=%@", isConnectedOrConnecting ? "true" : "false")
         guard let activeProfile else {
             NSLog("RealAiVPN iOS connect() no active profile")
@@ -748,10 +776,162 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     func disconnect() {
+        cancelDropRecovery()
         NSLog("RealAiVPN iOS disconnect() entered")
         suppressExpectedDisconnectNotification = true
-        vpnManager.disconnect()
         message = "Disconnecting..."
+        Task {
+            await vpnManager.disconnectDisablingOnDemand()
+        }
+    }
+
+    private func connectOnStartIfNeeded() async {
+        guard connectOnStartEnabled else {
+            return
+        }
+
+        try? await Task.sleep(for: .seconds(1))
+        guard !vpnStatus.isConnectedOrConnecting, activeProfile != nil else {
+            return
+        }
+
+        message = "Connecting VPN on app start..."
+        connect()
+    }
+
+    private func cancelDropRecovery() {
+        dropRecoveryTask?.cancel()
+        clearDropRecoveryState()
+    }
+
+    private func clearDropRecoveryState() {
+        dropRecoveryTask = nil
+        dropRecoveryProfileID = nil
+        dropRecoveryAttempt = 0
+    }
+
+    private func reconnectAfterUnexpectedDrop(profileID: String?, profileName: String) {
+        guard reconnectAfterDropEnabled,
+              dropRecoveryTask == nil,
+              let profileID,
+              profiles.contains(where: { $0.id == profileID }) else {
+            return
+        }
+
+        dropRecoveryProfileID = profileID
+        dropRecoveryTask = Task { @MainActor [weak self] in
+            await self?.runDropRecovery(profileID: profileID, profileName: profileName)
+        }
+    }
+
+    private func runDropRecovery(profileID: String, profileName: String) async {
+        defer {
+            clearDropRecoveryState()
+        }
+
+        for attempt in 1...maxDropReconnectAttempts {
+            if Task.isCancelled {
+                return
+            }
+
+            guard profiles.contains(where: { $0.id == profileID }) else {
+                message = "Last VPN failed after 5 attempts. No healthy fallback profile."
+                return
+            }
+
+            dropRecoveryAttempt = attempt
+            do {
+                try profileStore.setActiveProfile(id: profileID)
+                reloadProfiles()
+            } catch {
+                message = "Could not reconnect \(profileName): \(error.localizedDescription)"
+                return
+            }
+
+            message = "Reconnecting \(profileName) after drop/reset (\(attempt)/\(maxDropReconnectAttempts))..."
+            vpnLastError = nil
+            connect()
+
+            if await waitForDropRecoveryConnection(profileID: profileID) {
+                message = "Connected to \(profileName)."
+                refreshRoutePreview()
+                return
+            }
+
+            if attempt < maxDropReconnectAttempts {
+                try? await Task.sleep(for: .seconds(dropReconnectDelaySeconds))
+            }
+        }
+
+        await applyDropRecoveryFailover(failedProfileID: profileID, failedProfileName: profileName)
+    }
+
+    private func waitForDropRecoveryConnection(profileID: String, timeoutSeconds: Double = 10) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        repeat {
+            if Task.isCancelled {
+                return false
+            }
+            if (vpnStatus == .connected || vpnStatus == .reasserting),
+               connectedProfileID == profileID {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(300))
+        } while Date() < deadline
+
+        return false
+    }
+
+    private func waitUntilVPNIsDisconnected(timeoutSeconds: Double = 3) async {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if vpnStatus == .disconnected || vpnStatus == .invalid || vpnStatus == .unknown {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+    }
+
+    private func applyDropRecoveryFailover(failedProfileID: String, failedProfileName: String) async {
+        guard automaticFailoverEnabled else {
+            message = "Last VPN failed after 5 attempts. Auto-switch is disabled."
+            refreshRoutePreview()
+            return
+        }
+
+        quarantineProfile(id: failedProfileID)
+        message = "Switching after failed reconnect attempts..."
+        refreshRoutePreview()
+
+        let recommendedID: String?
+        if case .switchServer(_, let to, _) = healthAssessment.recommendedAction,
+           to != failedProfileID,
+           profiles.contains(where: { $0.id == to }) {
+            recommendedID = to
+        } else {
+            recommendedID = rankedServers
+                .map(\.server.id)
+                .first { id in
+                    id != failedProfileID && profiles.contains(where: { $0.id == id })
+                }
+        }
+
+        guard let recommendedID else {
+            message = "Last VPN failed after 5 attempts. No healthy fallback profile."
+            refreshRoutePreview()
+            return
+        }
+
+        do {
+            try profileStore.setActiveProfile(id: recommendedID)
+            reloadProfiles()
+            lastAutomaticFailoverDate = Date()
+            notifyFailover(from: failedProfileName, to: activeProfile?.displayName ?? "profile", reason: "drop-reset-retry-exhausted")
+            connect()
+        } catch {
+            message = "Could not switch profile: \(error.localizedDescription)"
+            refreshRoutePreview()
+        }
     }
 
     func addRoutingException(value: String, mode: RoutingExceptionMode) {
@@ -863,6 +1043,8 @@ final class iOSDashboardModel: ObservableObject {
 
     private func handleVPNStatusChange(_ status: VPNConnectionStatus) {
         let previousStatus = vpnStatus
+        let droppedProfileID = connectedProfileID ?? displayedProfile?.id ?? activeProfile?.id
+        let droppedProfileName = displayedProfile?.displayName ?? activeProfile?.displayName ?? "profile"
         vpnStatus = status
 
         if status == .connected {
@@ -886,13 +1068,14 @@ final class iOSDashboardModel: ObservableObject {
         }
 
         if previousStatus == .connected || previousStatus == .reasserting {
-            notifyTunnelDropped(profile: activeProfile?.displayName ?? "profile")
+            notifyTunnelDropped(profile: droppedProfileName)
+            reconnectAfterUnexpectedDrop(profileID: droppedProfileID, profileName: droppedProfileName)
         }
     }
 
     private func notifyTunnelDropped(profile: String) {
         let content = UNMutableNotificationContent()
-        content.title = "Real Ai VPN disconnected"
+        content.title = "Real Ai Router disconnected"
         content.body = "Tunnel dropped or reset for \(profile)."
         content.sound = .default
 
@@ -915,12 +1098,13 @@ final class iOSDashboardModel: ObservableObject {
             serverID: profile?.id ?? "real-ai-vpn-ios",
             regionCode: profile?.regionCode ?? "ZZ",
             killSwitchEnabled: killSwitchEnabled,
-            dnsProtectionEnabled: dnsProtectionEnabled
+            dnsProtectionEnabled: dnsProtectionEnabled,
+            autoReconnectOnDemandEnabled: reconnectAfterDropEnabled
         )
     }
 
     private func localizedVPNDescription(for profile: StoredAmneziaConfigProfile?) -> String {
-        profile?.kind == .singBoxVLESSReality ? "Real Ai VPN VLESS" : "Real Ai VPN AWG"
+        profile?.kind == .singBoxVLESSReality ? "Real Ai Router VLESS" : "Real Ai Router AWG"
     }
 
     private func providerBundleIdentifier(for profile: StoredAmneziaConfigProfile?) -> String {
@@ -1279,8 +1463,9 @@ final class iOSDashboardModel: ObservableObject {
             lastAutomaticFailoverDate = Date()
             notifyFailover(from: oldProfile, to: activeProfile?.displayName ?? "profile", reason: reason)
             suppressExpectedDisconnectNotification = true
-            disconnect()
-            try? await Task.sleep(for: .seconds(2))
+            message = killSwitchEnabled ? "Switching VPN with Kill Switch..." : "Switching VPN..."
+            vpnManager.disconnect()
+            await waitUntilVPNIsDisconnected()
             connect()
         } catch {
             message = "Could not switch profile: \(error.localizedDescription)"
@@ -1289,7 +1474,7 @@ final class iOSDashboardModel: ObservableObject {
 
     private func notifyFailover(from oldProfile: String, to newProfile: String, reason: String) {
         let content = UNMutableNotificationContent()
-        content.title = "Real Ai VPN switched profile"
+        content.title = "Real Ai Router switched profile"
         content.body = "\(oldProfile) → \(newProfile). \(reason)"
         content.sound = .default
 
@@ -1501,7 +1686,7 @@ private struct iOSHomeScreen: View {
                 .frame(width: 60, height: 60)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Real Ai VPN")
+                Text("Real Ai Router")
                     .font(.system(size: 34, weight: .bold, design: .rounded))
                     .foregroundStyle(AppTheme.primaryText)
                     .lineLimit(1)
@@ -1970,54 +2155,122 @@ private struct iOSStatisticsScreen: View {
     @ObservedObject var model: iOSDashboardModel
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                liveHealthCard
-                channelsCard
+        GeometryReader { geometry in
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 22) {
+                    topStatus
+                    liveHealthCard
+                    channelsCard
+                }
+                .frame(width: max(0, geometry.size.width - 32), alignment: .leading)
+                .padding(.horizontal, 16)
+                .safeAreaPadding(.top, 18)
+                .padding(.bottom, 128)
             }
-            .padding(16)
-            .padding(.bottom, 24)
+            .background(AppTheme.background.ignoresSafeArea())
         }
-        .background(AppTheme.background.ignoresSafeArea())
-        .navigationTitle("Stat")
-        .navigationBarTitleDisplayMode(.large)
+        .dynamicTypeSize(.medium ... .large)
+        .toolbar(.hidden, for: .navigationBar)
+    }
+
+    private var topStatus: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "checkmark.shield.fill")
+                .font(.system(size: 26, weight: .semibold))
+                .foregroundStyle(model.vpnStatus.isConnectedOrConnecting ? AppTheme.success : AppTheme.secondaryText)
+            Text(model.vpnStatus.rawValue.capitalized)
+                .font(.system(size: 22, weight: .bold))
+                .foregroundStyle(AppTheme.primaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Image(systemName: "chevron.down")
+                .font(.system(size: 15, weight: .bold))
+                .foregroundStyle(AppTheme.primaryText)
+            Spacer()
+            Button {} label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .frame(width: 52, height: 52)
+                    .background(AppTheme.floatingButton, in: Circle())
+                    .overlay(Circle().stroke(AppTheme.border, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+        }
+        .frame(maxWidth: .infinity)
     }
 
     private var liveHealthCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Label("Live Health", systemImage: "waveform.path.ecg")
-                .font(.headline)
-                .foregroundStyle(AppTheme.secondaryText)
-
+        VStack(alignment: .leading, spacing: 22) {
             HStack(spacing: 12) {
-                healthTile(title: "Provider", report: model.healthAssessment.directPath)
-                healthTile(title: "Tunnel", report: model.healthAssessment.vpnPath)
+                Image(systemName: "waveform.path.ecg")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
+                Text("Live Health")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(AppTheme.secondaryText)
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(AppTheme.secondaryText)
             }
 
-            Text(model.probeReliabilityDetail)
-                .font(.footnote.weight(.medium))
-                .foregroundStyle(AppTheme.secondaryText)
-                .lineLimit(2)
+            HStack(spacing: 12) {
+                healthTile(title: "Provider", report: model.healthAssessment.directPath, seed: 0.18)
+                healthTile(title: "Tunnel", report: model.healthAssessment.vpnPath, seed: 0.46)
+            }
+
+            HStack(spacing: 10) {
+                Image(systemName: "checkmark.shield")
+                    .font(.system(size: 23, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
+                Text(model.probeReliabilityDetail.replacingOccurrences(of: "Best check ", with: "Best check: "))
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+                Spacer()
+                Image(systemName: "info.circle")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(AppTheme.secondaryText)
+            }
         }
         .padding(18)
-        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+        .frame(maxWidth: .infinity)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+        .shadow(color: AppTheme.shadow, radius: 18, x: 0, y: 10)
     }
 
     private var channelsCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Label("Channels", systemImage: "chart.line.uptrend.xyaxis")
-                .font(.headline)
-                .foregroundStyle(AppTheme.secondaryText)
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(spacing: 12) {
+                Image(systemName: "chart.line.uptrend.xyaxis")
+                    .font(.system(size: 25, weight: .semibold))
+                    .foregroundStyle(AppTheme.secondaryText)
+                Text("Channels")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(AppTheme.secondaryText)
+                Spacer()
+                Button {} label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .frame(width: 50, height: 50)
+                        .background(AppTheme.floatingButton, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+            }
 
             if model.channelStatistics.isEmpty {
                 Text("No channel statistics yet.")
-                    .font(.callout)
+                    .font(.callout.weight(.semibold))
                     .foregroundStyle(AppTheme.secondaryText)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 8)
             } else {
-                VStack(spacing: 10) {
+                VStack(spacing: 18) {
                     ForEach(model.channelStatistics) { channel in
                         channelRow(channel)
                     }
@@ -2025,66 +2278,101 @@ private struct iOSStatisticsScreen: View {
             }
         }
         .padding(18)
-        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .frame(maxWidth: .infinity)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+        .shadow(color: AppTheme.shadow, radius: 18, x: 0, y: 10)
+    }
+
+    private func healthTile(title: String, report: PathHealthReport, seed: Double) -> some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(color(for: report.state))
+                    .frame(width: 12, height: 12)
+                Text(title)
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
+            }
+
+            HStack(alignment: .bottom, spacing: 8) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("\(Int((report.successRate * 100).rounded()))%")
+                        .font(.system(size: 30, weight: .bold, design: .rounded))
+                        .foregroundStyle(color(for: report.state))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.55)
+                    Text("\(formatLatency(report.averageLatencyMilliseconds)) · \(formatPercent(report.averagePacketLoss)) loss")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.65)
+                }
+                Spacer(minLength: 4)
+                iOSSparklineView(color: color(for: report.state), seed: seed)
+                    .frame(width: 56, height: 46)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: 118, alignment: .leading)
+        .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
     }
 
-    private func healthTile(title: String, report: PathHealthReport) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title)
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(AppTheme.primaryText)
-            Text("\(Int((report.successRate * 100).rounded()))%")
-                .font(.title3.bold())
-                .foregroundStyle(color(for: report.state))
-            Text("\(formatLatency(report.averageLatencyMilliseconds)) · \(formatPercent(report.averagePacketLoss)) loss")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(AppTheme.secondaryText)
-                .lineLimit(1)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-
     private func channelRow(_ channel: iOSVPNChannelStatistics) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 12) {
                 Image(systemName: channel.isConnected ? "checkmark.shield.fill" : "server.rack")
+                    .font(.system(size: 23, weight: .semibold))
                     .foregroundStyle(channel.isConnected ? AppTheme.success : (channel.isActive ? AppTheme.accent : AppTheme.secondaryText))
-                    .frame(width: 22)
+                    .frame(width: 48, height: 48)
+                    .background(AppTheme.card.opacity(0.68), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 7) {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text(regionMarker(channel.regionCode))
+                            .font(.system(size: 15, weight: .bold, design: .rounded))
+                            .foregroundStyle(AppTheme.primaryText)
                         Text(channel.displayName)
-                            .font(.headline)
+                            .font(.system(size: 19, weight: .bold))
                             .foregroundStyle(AppTheme.primaryText)
                             .lineLimit(1)
-                        if channel.isConnected {
-                            channelBadge("Connected", color: AppTheme.success)
-                        } else if channel.isActive {
-                            channelBadge("Active", color: AppTheme.accent)
-                        }
+                            .minimumScaleFactor(0.62)
+                    }
+                    if channel.isConnected {
+                        channelBadge("Connected", color: AppTheme.success)
+                    } else if channel.isActive {
+                        channelBadge("Active", color: AppTheme.accent)
                     }
                     Text("\(channel.regionCode) · \(protocolLabel(channel.protocolKind)) · \(channel.sampleCount) samples")
-                        .font(.caption.weight(.semibold))
+                        .font(.system(size: 15, weight: .bold))
                         .foregroundStyle(AppTheme.secondaryText)
                         .lineLimit(1)
+                        .minimumScaleFactor(0.7)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                Spacer()
-
-                VStack(alignment: .trailing, spacing: 2) {
+                VStack(alignment: .trailing, spacing: 1) {
                     Text(channel.ranking.map { "\(Int(($0.score * 100).rounded()))" } ?? "--")
-                        .font(.title3.bold())
+                        .font(.system(size: 27, weight: .bold, design: .rounded))
                         .foregroundStyle(AppTheme.accent)
+                        .lineLimit(1)
                     Text("score")
-                        .font(.caption2.weight(.bold))
+                        .font(.system(size: 15, weight: .bold))
                         .foregroundStyle(AppTheme.secondaryText)
                 }
+                .frame(width: 54, alignment: .trailing)
+
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 19, weight: .bold))
+                    .rotationEffect(.degrees(90))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .padding(.top, 6)
+                    .frame(width: 14)
             }
 
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 72), spacing: 10), count: 3), spacing: 10) {
                 channelMetric("Latency", formatLatency(channel.averageLatencyMilliseconds))
                 channelMetric("Loss", formatPercent(channel.averagePacketLoss))
                 channelMetric("Success", formatPercent(channel.successRate))
@@ -2093,33 +2381,38 @@ private struct iOSStatisticsScreen: View {
                 channelMetric("Last", relativeTime(channel.lastSeen))
             }
         }
-        .padding(12)
-        .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(16)
+        .frame(maxWidth: .infinity)
+        .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 
     private func channelBadge(_ title: String, color: Color) -> some View {
         Text(title)
-            .font(.caption2.weight(.bold))
+            .font(.system(size: 13, weight: .bold))
             .foregroundStyle(color)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
+            .lineLimit(1)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
             .background(AppTheme.pill, in: Capsule())
     }
 
     private func channelMetric(_ title: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 6) {
             Text(title)
-                .font(.caption2.weight(.bold))
+                .font(.system(size: 13, weight: .bold))
                 .foregroundStyle(AppTheme.secondaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.68)
             Text(value)
-                .font(.caption.monospacedDigit().weight(.semibold))
+                .font(.system(size: 16, weight: .bold, design: .rounded))
                 .foregroundStyle(AppTheme.primaryText)
                 .lineLimit(1)
-                .minimumScaleFactor(0.75)
+                .minimumScaleFactor(0.68)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(8)
-        .background(AppTheme.card.opacity(0.55), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+        .background(AppTheme.card.opacity(0.58), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     private func formatLatency(_ value: Double?) -> String {
@@ -2167,6 +2460,10 @@ private struct iOSStatisticsScreen: View {
         }
     }
 
+    private func regionMarker(_ regionCode: String) -> String {
+        String(regionCode.prefix(2)).uppercased()
+    }
+
     private func color(for state: PathHealthState) -> Color {
         switch state {
         case .healthy:
@@ -2175,6 +2472,66 @@ private struct iOSStatisticsScreen: View {
             return AppTheme.warning
         case .stalled, .down, .connectedButUnusable:
             return .red
+        }
+    }
+}
+
+private struct iOSSparklineView: View {
+    let color: Color
+    let seed: Double
+
+    var body: some View {
+        GeometryReader { proxy in
+            let points = sparkPoints(in: proxy.size)
+            ZStack {
+                sparkFill(points: points, size: proxy.size)
+                    .fill(
+                        LinearGradient(
+                            colors: [color.opacity(0.20), color.opacity(0.02)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                sparkLine(points: points)
+                    .stroke(color, style: StrokeStyle(lineWidth: 2.2, lineCap: .round, lineJoin: .round))
+            }
+        }
+    }
+
+    private func sparkPoints(in size: CGSize) -> [CGPoint] {
+        let values = (0..<12).map { index -> Double in
+            let wave = sin(Double(index) * 0.9 + seed * 8) * 0.14
+            let trend = Double(index) / 18
+            return min(0.9, max(0.20, 0.34 + wave + trend))
+        }
+        return values.enumerated().map { index, value in
+            CGPoint(
+                x: CGFloat(index) / CGFloat(max(values.count - 1, 1)) * size.width,
+                y: size.height - CGFloat(value) * size.height
+            )
+        }
+    }
+
+    private func sparkLine(points: [CGPoint]) -> Path {
+        Path { path in
+            guard let first = points.first else { return }
+            path.move(to: first)
+            for point in points.dropFirst() {
+                path.addLine(to: point)
+            }
+        }
+    }
+
+    private func sparkFill(points: [CGPoint], size: CGSize) -> Path {
+        Path { path in
+            guard let first = points.first, let last = points.last else { return }
+            path.move(to: CGPoint(x: first.x, y: size.height))
+            path.addLine(to: first)
+            for point in points.dropFirst() {
+                path.addLine(to: point)
+            }
+            path.addLine(to: CGPoint(x: last.x, y: size.height))
+            path.closeSubpath()
         }
     }
 }
@@ -2189,6 +2546,8 @@ private struct iOSSettingsScreen: View {
             VStack(alignment: .leading, spacing: 18) {
                 settingsSection("GENERAL") {
                     settingNavigationRow(title: "Appearance", value: appearanceMode, systemImage: "circle.lefthalf.filled")
+                    settingToggleRow(title: "Connect to start", systemImage: "power", isOn: $model.connectOnStartEnabled)
+                    settingToggleRow(title: "Reconnect after dropped/reset", systemImage: "arrow.clockwise", isOn: $model.reconnectAfterDropEnabled)
                     settingToggleRow(title: "Kill Switch", systemImage: "shield.fill", isOn: $model.killSwitchEnabled)
                     settingToggleRow(title: "DNS Protection", systemImage: "network", isOn: $model.dnsProtectionEnabled)
                     settingNavigationRow(title: "Language", value: "English", systemImage: "globe")
@@ -2201,7 +2560,7 @@ private struct iOSSettingsScreen: View {
 
                 settingsSection("ABOUT") {
                     settingNavigationRow(title: "Version", value: iOSBuildLabel, systemImage: "info.circle")
-                    settingNavigationRow(title: "About Real Ai VPN", value: "", systemImage: "lock.shield")
+                    settingNavigationRow(title: "About Real Ai Router", value: "", systemImage: "lock.shield")
                 }
             }
             .padding(16)
@@ -2327,7 +2686,7 @@ private struct LegacyiOSDashboardView: View {
                 .frame(width: 42, height: 42)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("Real Ai VPN")
+                Text("Real Ai Router")
                     .font(.largeTitle.bold())
                     .foregroundStyle(AppTheme.primaryText)
                     .lineLimit(1)
@@ -2872,7 +3231,7 @@ private struct iOSProfilesScreen: View {
                 deletingProfile = nil
             }
         } message: { profile in
-            Text("This removes \(profile.displayName) from Real Ai VPN. Other profiles and routing exceptions are kept.")
+            Text("This removes \(profile.displayName) from Real Ai Router. Other profiles and routing exceptions are kept.")
         }
         .fileImporter(
             isPresented: $importingConfProfile,

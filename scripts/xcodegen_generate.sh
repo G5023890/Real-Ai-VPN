@@ -4,6 +4,8 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
+"$PROJECT_DIR/scripts/prepare_third_party.sh"
+
 if [[ -d "$PROJECT_DIR/third_party/sing-box/Libbox.xcframework" ]]; then
   echo "[xcodegen] Generating project with Libbox.xcframework"
 else

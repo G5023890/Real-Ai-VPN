@@ -121,8 +121,8 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         MACOSX_DEPLOYMENT_TARGET: 14.0
-        MARKETING_VERSION: 0.92
-        CURRENT_PROJECT_VERSION: 75
+        MARKETING_VERSION: 0.93
+        CURRENT_PROJECT_VERSION: 76
   RealAiVPNPacketTunneliOS:
     type: app-extension
     platform: iOS
@@ -146,8 +146,8 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         IPHONEOS_DEPLOYMENT_TARGET: 17.0
-        MARKETING_VERSION: 0.92
-        CURRENT_PROJECT_VERSION: 75
+        MARKETING_VERSION: 0.93
+        CURRENT_PROJECT_VERSION: 76
   RealAiVPNSingBoxPacketTunnel:
     type: app-extension
     platform: macOS
@@ -185,8 +185,8 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         MACOSX_DEPLOYMENT_TARGET: 14.0
-        MARKETING_VERSION: 0.92
-        CURRENT_PROJECT_VERSION: 75
+        MARKETING_VERSION: 0.93
+        CURRENT_PROJECT_VERSION: 76
   RealAiVPNSingBoxPacketTunneliOS:
     type: app-extension
     platform: iOS
@@ -223,8 +223,8 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         IPHONEOS_DEPLOYMENT_TARGET: 17.0
-        MARKETING_VERSION: 0.92
-        CURRENT_PROJECT_VERSION: 75
+        MARKETING_VERSION: 0.93
+        CURRENT_PROJECT_VERSION: 76
   RealAiVPN:
     type: application
     platform: macOS
@@ -244,7 +244,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN
-        PRODUCT_NAME: Real Ai VPN
+        PRODUCT_NAME: Real Ai Router
         INFOPLIST_FILE: Config/RealAiVPN-Info.plist
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: Config/RealAiVPN.entitlements
@@ -252,8 +252,8 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         MACOSX_DEPLOYMENT_TARGET: 14.0
-        MARKETING_VERSION: 0.92
-        CURRENT_PROJECT_VERSION: 75
+        MARKETING_VERSION: 0.93
+        CURRENT_PROJECT_VERSION: 76
         ENABLE_HARDENED_RUNTIME: YES
   RealAiVPNiOS:
     type: application
@@ -274,7 +274,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.iOS
-        PRODUCT_NAME: Real Ai VPN
+        PRODUCT_NAME: Real Ai Router
         INFOPLIST_FILE: Config/RealAiVPN-iOS-Info.plist
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: Config/RealAiVPN-iOS.entitlements
@@ -283,5 +283,5 @@ targets:
         DEVELOPMENT_TEAM: 9FP39GTDT5
         IPHONEOS_DEPLOYMENT_TARGET: 17.0
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        MARKETING_VERSION: 0.92
-        CURRENT_PROJECT_VERSION: 75
+        MARKETING_VERSION: 0.93
+        CURRENT_PROJECT_VERSION: 76

@@ -4,7 +4,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
-APP_NAME="${APP_NAME:-Real Ai VPN}"
+APP_NAME="${APP_NAME:-Real Ai Router}"
 BUNDLE_ID="${BUNDLE_ID:-com.codex.RealAiVPN}"
 SCHEME="${SCHEME:-RealAiVPN}"
 CONFIGURATION="${CONFIGURATION:-Debug}"
@@ -16,7 +16,7 @@ TEAM_ID="${TEAM_ID:-9FP39GTDT5}"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 SKIP_SIGN="${SKIP_SIGN:-0}"
 LAUNCH_AFTER_INSTALL="${LAUNCH_AFTER_INSTALL:-1}"
-APP_VERSION="${APP_VERSION:-0.92}"
+APP_VERSION="${APP_VERSION:-0.93}"
 BUILD_STAMP="${BUILD_STAMP:-$(date '+%H%M%S%d%m%Y')}"
 BUILD_DISPLAY_STAMP="${BUILD_DISPLAY_STAMP:-$(date '+%H%M:%d%m:%y')}"
 BUILD_LABEL="${BUILD_LABEL:-${APP_VERSION} (${BUILD_DISPLAY_STAMP})}"
@@ -97,6 +97,8 @@ fi
 log "Build label: $BUILD_LABEL"
 
 mkdir -p "$DIST_DIR"
+
+"$PROJECT_DIR/scripts/prepare_third_party.sh"
 
 log "Building AmneziaWG userspace backend"
 make -C "$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo" \

@@ -35,16 +35,18 @@ public struct VPNProfileConfiguration: Hashable, Codable, Sendable {
     public var dnsProtectionEnabled: Bool
     public var localNetworkAccessEnabled: Bool
     public var ipv6LeakProtectionEnabled: Bool
+    public var autoReconnectOnDemandEnabled: Bool
 
     public init(
-        localizedDescription: String = "Real Ai VPN",
+        localizedDescription: String = "Real Ai Router",
         providerBundleIdentifier: String = "com.codex.RealAiVPN.PacketTunnel",
         serverID: String,
         regionCode: String,
         killSwitchEnabled: Bool = false,
         dnsProtectionEnabled: Bool = true,
         localNetworkAccessEnabled: Bool = true,
-        ipv6LeakProtectionEnabled: Bool = true
+        ipv6LeakProtectionEnabled: Bool = true,
+        autoReconnectOnDemandEnabled: Bool = false
     ) {
         self.localizedDescription = localizedDescription
         self.providerBundleIdentifier = providerBundleIdentifier
@@ -54,6 +56,7 @@ public struct VPNProfileConfiguration: Hashable, Codable, Sendable {
         self.dnsProtectionEnabled = dnsProtectionEnabled
         self.localNetworkAccessEnabled = localNetworkAccessEnabled
         self.ipv6LeakProtectionEnabled = ipv6LeakProtectionEnabled
+        self.autoReconnectOnDemandEnabled = autoReconnectOnDemandEnabled
     }
 }
 
@@ -114,6 +117,9 @@ public final class RealVPNProfileManager: ObservableObject {
                   configuration.providerBundleIdentifier,
                   configuration.serverID)
             manager = try await loadOrCreateManager(configuration: configuration)
+            if let manager {
+                try await save(manager)
+            }
             lastProviderBundleIdentifier = configuration.providerBundleIdentifier
             refreshStatus()
         } catch {
@@ -179,6 +185,24 @@ public final class RealVPNProfileManager: ObservableObject {
         refreshStatus()
     }
 
+    public func disconnectDisablingOnDemand() async {
+        vpnProfileLogger.info("Stopping VPN tunnel after disabling On Demand")
+        NSLog("RealAiVPN VPNProfileManager disconnectDisablingOnDemand")
+        if let manager {
+            do {
+                manager.isOnDemandEnabled = false
+                manager.onDemandRules = nil
+                try await save(manager)
+            } catch {
+                vpnProfileLogger.error("Could not disable On Demand before disconnect: \(error.localizedDescription, privacy: .public)")
+                NSLog("RealAiVPN VPNProfileManager disable On Demand failed: %@", error.localizedDescription)
+                lastErrorMessage = error.localizedDescription
+            }
+        }
+        manager?.connection.stopVPNTunnel()
+        refreshStatus()
+    }
+
     public func refreshStatus() {
         guard let manager else {
             status = .unknown
@@ -204,7 +228,7 @@ public final class RealVPNProfileManager: ObservableObject {
             }
             return protocolConfiguration.providerBundleIdentifier == configuration.providerBundleIdentifier
         } ?? managers.first {
-            guard $0.localizedDescription == "Real Ai VPN",
+            guard ["Real Ai Router", "Real Ai VPN"].contains($0.localizedDescription),
                   let protocolConfiguration = $0.protocolConfiguration as? NETunnelProviderProtocol else {
                 return false
             }
@@ -231,6 +255,17 @@ public final class RealVPNProfileManager: ObservableObject {
         manager.localizedDescription = configuration.localizedDescription
         manager.protocolConfiguration = protocolConfiguration
         manager.isEnabled = true
+        manager.isOnDemandEnabled = configuration.autoReconnectOnDemandEnabled
+        if configuration.autoReconnectOnDemandEnabled {
+            let connectRule = NEOnDemandRuleConnect()
+            connectRule.interfaceTypeMatch = .any
+            manager.onDemandRules = [connectRule]
+        } else {
+            manager.onDemandRules = nil
+        }
+        NSLog("RealAiVPN VPNProfileManager onDemand=%@ provider=%@",
+              configuration.autoReconnectOnDemandEnabled ? "true" : "false",
+              configuration.providerBundleIdentifier)
 
         return manager
     }

@@ -1,0 +1,40 @@
+diff --git a/Sources/WireGuardKit/InterfaceConfiguration.swift b/Sources/WireGuardKit/InterfaceConfiguration.swift
+index 7a142b9..054ca0d 100644
+--- a/Sources/WireGuardKit/InterfaceConfiguration.swift
++++ b/Sources/WireGuardKit/InterfaceConfiguration.swift
+@@ -22,6 +22,7 @@ public struct InterfaceConfiguration {
+     public var mtu: UInt16?
+     public var dns = [DNSServer]()
+     public var dnsSearch = [String]()
++    public var killSwitchEnabled = false
+     public var specialJunk1: String?
+     public var specialJunk2: String?
+     public var specialJunk3: String?
+@@ -44,6 +45,7 @@ extension InterfaceConfiguration: Equatable {
+             lhs.mtu == rhs.mtu &&
+             lhs.dns == rhs.dns &&
+             lhs.dnsSearch == rhs.dnsSearch &&
++            lhs.killSwitchEnabled == rhs.killSwitchEnabled &&
+             lhs.junkPacketCount == rhs.junkPacketCount &&
+             lhs.junkPacketMinSize == rhs.junkPacketMinSize &&
+             lhs.junkPacketMaxSize == rhs.junkPacketMaxSize &&
+diff --git a/Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift b/Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift
+index 5d3fd61..553925b 100644
+--- a/Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift
++++ b/Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift
+@@ -129,8 +129,14 @@ class PacketTunnelSettingsGenerator {
+          * which case, displaying a single one in settings doesn't really
+          * make sense. So, we fill it in with this placeholder, which is not
+          * a valid IP address that will actually route over the Internet.
+-         */
++        */
+         let networkSettings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
++        if tunnelConfiguration.interface.killSwitchEnabled {
++            if #available(iOS 27.0, macOS 27.0, *) {
++                networkSettings.includeAllNetworks = .any
++                networkSettings.enforceRoutes = true
++            }
++        }
+ 
+         if !tunnelConfiguration.interface.dnsSearch.isEmpty || !tunnelConfiguration.interface.dns.isEmpty {
+             let dnsServerStrings = tunnelConfiguration.interface.dns.map { $0.stringRepresentation }

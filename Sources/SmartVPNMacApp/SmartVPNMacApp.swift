@@ -82,7 +82,7 @@ struct SmartVPNMacApp: App {
     }
 
     var body: some Scene {
-        Window("Real Ai VPN", id: "main") {
+        Window("Real Ai Router", id: "main") {
             DashboardView(model: model, showSettings: $showSettings)
                 .frame(minWidth: 1080, minHeight: 720)
                 .onAppear {
@@ -213,12 +213,12 @@ struct ActiveMenuBarShieldIcon: View {
             Image(nsImage: image)
                 .resizable()
                 .scaledToFit()
-                .accessibilityLabel("Real Ai VPN connected")
+                .accessibilityLabel("Real Ai Router connected")
         } else {
             Image(systemName: "shield.fill")
                 .resizable()
                 .scaledToFit()
-                .accessibilityLabel("Real Ai VPN connected")
+                .accessibilityLabel("Real Ai Router connected")
         }
     }
 }
@@ -474,6 +474,18 @@ final class DashboardModel: ObservableObject {
             UserDefaults.standard.set(automaticFailoverEnabled, forKey: "automaticFailoverEnabled")
         }
     }
+    @Published var connectOnStartEnabled = UserDefaults.standard.object(forKey: "connectOnStartEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(connectOnStartEnabled, forKey: "connectOnStartEnabled")
+            Task { await vpnManager.prepareProfile(configuration: vpnConfiguration) }
+        }
+    }
+    @Published var reconnectAfterDropEnabled = UserDefaults.standard.object(forKey: "reconnectAfterDropEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(reconnectAfterDropEnabled, forKey: "reconnectAfterDropEnabled")
+            Task { await vpnManager.prepareProfile(configuration: vpnConfiguration) }
+        }
+    }
     @Published var killSwitchEnabled = UserDefaults.standard.object(forKey: "killSwitchEnabled") as? Bool ?? false {
         didSet {
             UserDefaults.standard.set(killSwitchEnabled, forKey: "killSwitchEnabled")
@@ -546,6 +558,11 @@ final class DashboardModel: ObservableObject {
     private var vpnHardDegradedSince: Date?
     private var profileQuarantineUntil: [String: Date] = [:]
     private var suppressExpectedDisconnectNotification = false
+    private var dropRecoveryTask: Task<Void, Never>?
+    private var dropRecoveryProfileID: String?
+    private var dropRecoveryAttempt = 0
+    private let maxDropReconnectAttempts = 5
+    private let dropReconnectDelaySeconds: UInt64 = 2
 
     init() {
         let directReport = PathHealthReport(
@@ -585,11 +602,13 @@ final class DashboardModel: ObservableObject {
         configureLaunchAtLogin(launchAtLoginEnabled)
         Task {
             await vpnManager.prepareProfile(configuration: vpnConfiguration)
+            await connectOnStartIfNeeded()
         }
     }
 
     deinit {
         monitoringTask?.cancel()
+        dropRecoveryTask?.cancel()
     }
 
     var activeConfigProfile: StoredAmneziaConfigProfile? {
@@ -805,12 +824,12 @@ final class DashboardModel: ObservableObject {
         case .switchServer(_, let to, _):
             switchToProfileOrServer(id: to)
             if wasConnected {
-                reconnectVPN()
+                reconnectVPN(reason: "Switching VPN profile")
             }
         case .reconnect(let serverID, _), .adjustParameters(let serverID, _, _):
             switchToProfileOrServer(id: serverID)
             if wasConnected {
-                reconnectVPN()
+                reconnectVPN(reason: "Reconnecting VPN profile")
             }
         case .refreshDirectDNS:
             URLCache.shared.removeAllCachedResponses()
@@ -852,10 +871,12 @@ final class DashboardModel: ObservableObject {
     }
 
     func selectConfigProfile(id: String?) {
+        cancelDropRecovery()
         activeConfigProfileID = id
     }
 
     func reconnectConfigProfile(id: String) {
+        cancelDropRecovery()
         let wasConnectedOrConnecting = vpnStatus.isConnectedOrConnecting
         selectConfigProfile(id: id)
 
@@ -873,7 +894,7 @@ final class DashboardModel: ObservableObject {
             suppressExpectedDisconnectNotification = true
             vpnManager.disconnect()
             Task {
-                try? await Task.sleep(for: .seconds(1))
+                await waitUntilVPNIsDisconnected()
                 connectVPN()
             }
         } else {
@@ -882,6 +903,9 @@ final class DashboardModel: ObservableObject {
     }
 
     func connectVPN() {
+        if dropRecoveryTask == nil {
+            cancelDropRecovery()
+        }
         guard !vpnStatus.isConnectedOrConnecting else {
             return
         }
@@ -925,16 +949,20 @@ final class DashboardModel: ObservableObject {
     }
 
     func disconnectVPN() {
+        cancelDropRecovery()
         guard vpnStatus.isConnectedOrConnecting else {
             return
         }
 
         suppressExpectedDisconnectNotification = true
         vpnStatus = .disconnecting
-        vpnManager.disconnect()
+        Task {
+            await vpnManager.disconnectDisablingOnDemand()
+        }
     }
 
-    func reconnectVPN() {
+    func reconnectVPN(reason: String = "Reconnecting VPN") {
+        cancelDropRecovery()
         guard vpnStatus.isConnectedOrConnecting else {
             connectVPN()
             return
@@ -942,9 +970,10 @@ final class DashboardModel: ObservableObject {
 
         vpnStatus = .disconnecting
         suppressExpectedDisconnectNotification = true
+        monitorStatus = killSwitchEnabled ? "\(reason) with Kill Switch" : reason
         vpnManager.disconnect()
         Task {
-            try? await Task.sleep(for: .seconds(2))
+            await waitUntilVPNIsDisconnected()
             connectVPN()
         }
     }
@@ -954,7 +983,7 @@ final class DashboardModel: ObservableObject {
         monitorStatus = vpnStatus.isConnectedOrConnecting
             ? "Reconnecting with Kill Switch"
             : "Connecting with Kill Switch"
-        reconnectVPN()
+        reconnectVPN(reason: "Reconnecting")
     }
 
     func toggleVPN() {
@@ -963,6 +992,140 @@ final class DashboardModel: ObservableObject {
         } else {
             connectVPN()
         }
+    }
+
+    private func connectOnStartIfNeeded() async {
+        guard connectOnStartEnabled else {
+            return
+        }
+
+        try? await Task.sleep(for: .seconds(1))
+        guard !vpnStatus.isConnectedOrConnecting, activeConfigProfile != nil else {
+            return
+        }
+
+        monitorStatus = "Connecting VPN on app start"
+        connectVPN()
+    }
+
+    private func cancelDropRecovery() {
+        dropRecoveryTask?.cancel()
+        clearDropRecoveryState()
+    }
+
+    private func clearDropRecoveryState() {
+        dropRecoveryTask = nil
+        dropRecoveryProfileID = nil
+        dropRecoveryAttempt = 0
+    }
+
+    private func reconnectAfterUnexpectedDrop(profileID: String?, profileName: String) {
+        guard reconnectAfterDropEnabled,
+              dropRecoveryTask == nil,
+              let profileID,
+              configProfiles.contains(where: { $0.id == profileID }) else {
+            return
+        }
+
+        dropRecoveryProfileID = profileID
+        dropRecoveryTask = Task { @MainActor [weak self] in
+            await self?.runDropRecovery(profileID: profileID, profileName: profileName)
+        }
+    }
+
+    private func runDropRecovery(profileID: String, profileName: String) async {
+        defer {
+            clearDropRecoveryState()
+        }
+
+        for attempt in 1...maxDropReconnectAttempts {
+            if Task.isCancelled {
+                return
+            }
+
+            guard configProfiles.contains(where: { $0.id == profileID }) else {
+                monitorStatus = "Last VPN failed after 5 attempts. No healthy fallback profile."
+                return
+            }
+
+            dropRecoveryAttempt = attempt
+            activeConfigProfileID = profileID
+            monitorStatus = "Reconnecting \(profileName) after drop/reset (\(attempt)/\(maxDropReconnectAttempts))..."
+            vpnErrorMessage = nil
+            connectVPN()
+
+            if await waitForDropRecoveryConnection(profileID: profileID) {
+                monitorStatus = "Connected to \(profileName)."
+                return
+            }
+
+            if attempt < maxDropReconnectAttempts {
+                try? await Task.sleep(for: .seconds(dropReconnectDelaySeconds))
+            }
+        }
+
+        await applyDropRecoveryFailover(failedProfileID: profileID, failedProfileName: profileName)
+    }
+
+    private func waitForDropRecoveryConnection(profileID: String, timeoutSeconds: Double = 10) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        repeat {
+            if Task.isCancelled {
+                return false
+            }
+            if (vpnStatus == .connected || vpnStatus == .reasserting),
+               connectedConfigProfileID == profileID {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(300))
+        } while Date() < deadline
+
+        return false
+    }
+
+    private func waitUntilVPNIsDisconnected(timeoutSeconds: Double = 3) async {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if vpnStatus == .disconnected || vpnStatus == .invalid || vpnStatus == .unknown {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+    }
+
+    private func applyDropRecoveryFailover(failedProfileID: String, failedProfileName: String) async {
+        guard automaticFailoverEnabled else {
+            monitorStatus = "Last VPN failed after 5 attempts. Auto-switch is disabled."
+            return
+        }
+
+        quarantineProfile(id: failedProfileID)
+        monitorStatus = "Switching after failed reconnect attempts..."
+        refresh()
+
+        let recommendedID: String?
+        if case .switchServer(_, let to, _) = healthAssessment.recommendedAction,
+           to != failedProfileID,
+           configProfiles.contains(where: { $0.id == to }) {
+            recommendedID = to
+        } else {
+            recommendedID = rankedServers
+                .map(\.server.id)
+                .first { id in
+                    id != failedProfileID && configProfiles.contains(where: { $0.id == id })
+                }
+        }
+
+        guard let recommendedID else {
+            monitorStatus = "Last VPN failed after 5 attempts. No healthy fallback profile."
+            return
+        }
+
+        let oldProfile = failedProfileName
+        switchToProfileOrServer(id: recommendedID)
+        lastAutomaticFailoverDate = Date()
+        notifyFailover(from: oldProfile, to: activeConfigSummary, reason: "drop-reset-retry-exhausted")
+        connectVPN()
     }
 
     func saveAmneziaPremiumKey(_ key: String) -> String? {
@@ -1185,6 +1348,7 @@ final class DashboardModel: ObservableObject {
 
     private func handleVPNStatusChange(_ status: VPNConnectionStatus) {
         let previousStatus = vpnStatus
+        let droppedProfileID = connectedConfigProfileID ?? displayedConfigProfile?.id ?? activeConfigProfile?.id
         let droppedProfile = activeProfileDisplayName
         vpnStatus = status
 
@@ -1208,6 +1372,7 @@ final class DashboardModel: ObservableObject {
 
         if previousStatus == .connected || previousStatus == .reasserting {
             notifyTunnelDropped(profile: droppedProfile)
+            reconnectAfterUnexpectedDrop(profileID: droppedProfileID, profileName: droppedProfile)
         }
     }
 
@@ -1285,12 +1450,13 @@ final class DashboardModel: ObservableObject {
             killSwitchEnabled: killSwitchEnabled,
             dnsProtectionEnabled: dnsProtectionEnabled,
             localNetworkAccessEnabled: localNetworkAccessEnabled,
-            ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
+            ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled,
+            autoReconnectOnDemandEnabled: reconnectAfterDropEnabled
         )
     }
 
     private func localizedVPNDescription(for profile: StoredAmneziaConfigProfile?) -> String {
-        profile?.kind == .singBoxVLESSReality ? "Real Ai VPN VLESS" : "Real Ai VPN AWG"
+        profile?.kind == .singBoxVLESSReality ? "Real Ai Router VLESS" : "Real Ai Router AWG"
     }
 
     private func providerBundleIdentifier(for profile: StoredAmneziaConfigProfile?) -> String {
@@ -1715,14 +1881,16 @@ final class DashboardModel: ObservableObject {
         notifyFailover(from: oldProfile, to: activeConfigSummary, reason: reason)
 
         suppressExpectedDisconnectNotification = true
-        disconnectVPN()
-        try? await Task.sleep(for: .seconds(2))
+        vpnStatus = .disconnecting
+        monitorStatus = killSwitchEnabled ? "Switching VPN with Kill Switch" : "Switching VPN"
+        vpnManager.disconnect()
+        await waitUntilVPNIsDisconnected()
         connectVPN()
     }
 
     private func notifyTunnelDropped(profile: String) {
         let content = UNMutableNotificationContent()
-        content.title = "Real Ai VPN disconnected"
+        content.title = "Real Ai Router disconnected"
         content.body = "Tunnel dropped or reset for \(profile)."
         content.sound = .default
 
@@ -1740,7 +1908,7 @@ final class DashboardModel: ObservableObject {
         }
 
         let content = UNMutableNotificationContent()
-        content.title = "Real Ai VPN switched profile"
+        content.title = "Real Ai Router switched profile"
         content.body = "\(oldProfile) → \(newProfile). \(reason)"
         content.sound = .default
 
@@ -1967,7 +2135,7 @@ struct DashboardView: View {
                     .padding(.top, 46)
             } else {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Real AI Router")
+                    Text("Real Ai Router")
                         .font(.system(size: 18, weight: .semibold))
                         .foregroundStyle(theme.primaryText)
                     Text("Smart VPN Routing")
@@ -2753,146 +2921,240 @@ private struct MacStatisticsWorkspace: View {
     let theme: MacLiquidTheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 20) {
             Text("Stat")
-                .font(.system(size: 22, weight: .semibold))
+                .font(.system(size: 26, weight: .bold))
                 .foregroundStyle(theme.primaryText)
 
-            MacSettingsSectionCard(title: "Live Health", theme: theme) {
-                HStack(spacing: 10) {
-                    statisticsHealthTile(title: "Provider", report: model.healthAssessment.directPath)
-                    statisticsHealthTile(title: "Tunnel", report: model.healthAssessment.vpnPath)
-                    statisticsMetricTile(title: "Last Check", value: lastCheckText)
-                }
-                Text(model.probeReliabilityDetail)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(theme.secondaryText)
-                    .lineLimit(2)
-            }
-
-            MacSettingsSectionCard(title: "Channels", theme: theme) {
-                if model.channelStatistics.isEmpty {
-                    Text("No channel statistics yet.")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(theme.secondaryText)
-                } else {
-                    VStack(spacing: 10) {
-                        ForEach(model.channelStatistics) { channel in
-                            channelStatisticsRow(channel)
-                        }
-                    }
-                }
-            }
+            liveHealthPanel
+            channelsPanel
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
-    private func statisticsHealthTile(title: String, report: PathHealthReport) -> some View {
-        statisticsMetricTile(
-            title: title,
-            value: "\(Int((report.successRate * 100).rounded()))%",
-            detail: "\(formatLatency(report.averageLatencyMilliseconds)) · \(formatPercent(report.averagePacketLoss)) loss",
-            color: healthColor(report.state)
-        )
-    }
+    private var liveHealthPanel: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            Text("Live Health")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(theme.primaryText)
 
-    private func statisticsMetricTile(
-        title: String,
-        value: String,
-        detail: String? = nil,
-        color: Color = .teal
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(theme.secondaryText)
-            Text(value)
-                .font(.system(size: 18, weight: .bold, design: .rounded))
-                .foregroundStyle(color)
-                .lineLimit(1)
-            if let detail {
-                Text(detail)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(theme.tertiaryText)
+            HStack(spacing: 18) {
+                healthTile(title: "Provider", report: model.healthAssessment.directPath, seed: 0.18)
+                healthTile(title: "Tunnel", report: model.healthAssessment.vpnPath, seed: 0.46)
+                lastCheckTile
+                    .frame(width: 270)
+            }
+
+            HStack(spacing: 14) {
+                Image(systemName: "checkmark.shield")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(theme.secondaryText)
+                Text(model.probeReliabilityDetail.replacingOccurrences(of: "Best check ", with: "Best check: "))
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(theme.secondaryText)
                     .lineLimit(1)
+                Image(systemName: "info.circle")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(theme.tertiaryText)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(24)
+        .macLiquidCard(theme, radius: 16)
     }
 
-    private func channelStatisticsRow(_ channel: VPNChannelStatistics) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                Image(systemName: channel.isConnected ? "checkmark.shield.fill" : "server.rack")
-                    .foregroundStyle(channel.isConnected ? .green : (channel.isActive ? .teal : theme.secondaryText))
-                    .frame(width: 18)
-
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 7) {
-                        Text(channel.displayName)
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(theme.primaryText)
-                            .lineLimit(1)
-                        if channel.isConnected {
-                            channelBadge("Connected", color: .green)
-                        } else if channel.isActive {
-                            channelBadge("Active", color: .teal)
-                        }
-                    }
-                    Text("\(channel.regionCode) · \(protocolLabel(channel.protocolKind)) · \(channel.sampleCount) samples")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(theme.secondaryText)
-                        .lineLimit(1)
-                }
+    private var channelsPanel: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack {
+                Text("Channels")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(theme.primaryText)
 
                 Spacer()
 
-                VStack(alignment: .trailing, spacing: 3) {
-                    Text(channel.ranking.map { "\(Int(($0.score * 100).rounded()))" } ?? "--")
-                        .font(.system(size: 18, weight: .bold, design: .rounded))
-                        .foregroundStyle(.teal)
-                    Text("score")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(theme.tertiaryText)
+                Menu {
+                    Button("All Channels") {}
+                    Button("Active") {}
+                    Button("Connected") {}
+                } label: {
+                    HStack(spacing: 8) {
+                        Text("All Channels")
+                        Image(systemName: "chevron.down")
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(theme.primaryText)
+                    .padding(.horizontal, 14)
+                    .frame(height: 34)
+                    .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.stroke, lineWidth: 1))
                 }
-                .frame(width: 44, alignment: .trailing)
+                .menuStyle(.borderlessButton)
+
+                Button {} label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(theme.secondaryText)
+                        .frame(width: 34, height: 34)
+                        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.stroke, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
             }
 
-            HStack(spacing: 8) {
-                channelMetric("Latency", formatLatency(channel.averageLatencyMilliseconds))
-                channelMetric("Loss", formatPercent(channel.averagePacketLoss))
-                channelMetric("Success", formatPercent(channel.successRate))
-                channelMetric("Handshake", formatLatency(channel.averageHandshakeMilliseconds))
-                channelMetric("Failures", "\(channel.failureCount)")
-                channelMetric("Last", relativeTime(channel.lastSeen))
+            if model.channelStatistics.isEmpty {
+                Text("No channel statistics yet.")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(theme.secondaryText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 20)
+            } else {
+                VStack(spacing: 10) {
+                    ForEach(model.channelStatistics) { channel in
+                        channelStatisticsRow(channel)
+                    }
+                }
+
+                Text("\(model.channelStatistics.count) channels total")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(theme.secondaryText)
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 6)
             }
         }
-        .padding(12)
-        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(24)
+        .macLiquidCard(theme, radius: 16)
+    }
+
+    private func healthTile(title: String, report: PathHealthReport, seed: Double) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(healthColor(report.state))
+                        .frame(width: 9, height: 9)
+                    Text(title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(theme.secondaryText)
+                }
+                Spacer()
+            }
+
+            HStack(alignment: .bottom) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("\(Int((report.successRate * 100).rounded()))%")
+                        .font(.system(size: 28, weight: .bold, design: .rounded))
+                        .foregroundStyle(healthColor(report.state))
+                    Text("\(formatLatency(report.averageLatencyMilliseconds))  •  \(formatPercent(report.averagePacketLoss)) loss")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(theme.secondaryText)
+                        .lineLimit(1)
+                }
+                Spacer()
+                MacSparklineView(color: healthColor(report.state), seed: seed, fill: true)
+                    .frame(width: 150, height: 54)
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, minHeight: 106, alignment: .leading)
+        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(theme.stroke, lineWidth: 1))
+    }
+
+    private var lastCheckTile: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Last Check", systemImage: "clock")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(theme.secondaryText)
+            Text(lastCheckText)
+                .font(.system(size: 28, weight: .bold, design: .rounded))
+                .foregroundStyle(.blue)
+            Text(model.lastProbeDate == nil ? "Waiting for probes" : "Updated just now")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(theme.secondaryText)
+        }
+        .padding(18)
+        .frame(minHeight: 106, alignment: .leading)
+        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(theme.stroke, lineWidth: 1))
+    }
+
+    private func channelStatisticsRow(_ channel: VPNChannelStatistics) -> some View {
+        HStack(spacing: 18) {
+            Image(systemName: "circle.grid.3x3.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(theme.tertiaryText)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 10) {
+                    Text(regionMarker(channel.regionCode))
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundStyle(theme.primaryText)
+                        .frame(width: 28, height: 20)
+                        .background(theme.selectedFill, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    Text(channel.displayName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(theme.primaryText)
+                        .lineLimit(1)
+                    if channel.isConnected {
+                        channelBadge("Connected", color: .green)
+                    } else if channel.isActive {
+                        channelBadge("Active", color: .teal)
+                    }
+                }
+                Text("\(channel.regionCode) · \(protocolLabel(channel.protocolKind)) · \(channel.sampleCount) samples")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(theme.secondaryText)
+                    .lineLimit(1)
+            }
+            .frame(minWidth: 230, maxWidth: 290, alignment: .leading)
+
+            channelMetric("Latency", formatLatency(channel.averageLatencyMilliseconds), sparkSeed: 0.18)
+            channelMetric("Loss", formatPercent(channel.averagePacketLoss), sparkSeed: 0.30)
+            channelMetric("Success", formatPercent(channel.successRate), sparkSeed: 0.44)
+            channelMetric("Handshake", formatLatency(channel.averageHandshakeMilliseconds), sparkSeed: 0.58)
+            channelMetric("Failures", "\(channel.failureCount)", sparkSeed: nil)
+            channelMetric("Last", relativeTime(channel.lastSeen), sparkSeed: nil)
+
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(channel.ranking.map { "\(Int(($0.score * 100).rounded()))" } ?? "--")
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                    .foregroundStyle(.teal)
+                Text("score")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(theme.secondaryText)
+            }
+            .frame(width: 50, alignment: .trailing)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 16)
+        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.stroke, lineWidth: 1))
     }
 
     private func channelBadge(_ title: String, color: Color) -> some View {
         Text(title)
-            .font(.system(size: 9, weight: .bold))
+            .font(.system(size: 10, weight: .bold))
             .foregroundStyle(color)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
             .background(color.opacity(0.14), in: Capsule())
     }
 
-    private func channelMetric(_ title: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+    private func channelMetric(_ title: String, _ value: String, sparkSeed: Double?) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
             Text(title)
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(theme.tertiaryText)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(theme.secondaryText)
                 .lineLimit(1)
             Text(value)
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .font(.system(size: 13, weight: .semibold, design: .monospaced))
                 .foregroundStyle(theme.primaryText)
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
+            if let sparkSeed {
+                MacSparklineView(color: .green, seed: sparkSeed, fill: false)
+                    .frame(width: 48, height: 14)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -2950,6 +3212,10 @@ private struct MacStatisticsWorkspace: View {
         }
     }
 
+    private func regionMarker(_ regionCode: String) -> String {
+        String(regionCode.prefix(2)).uppercased()
+    }
+
     private func healthColor(_ state: PathHealthState) -> Color {
         switch state {
         case .healthy:
@@ -2958,6 +3224,70 @@ private struct MacStatisticsWorkspace: View {
             return .orange
         case .stalled, .down, .connectedButUnusable:
             return .red
+        }
+    }
+}
+
+private struct MacSparklineView: View {
+    let color: Color
+    let seed: Double
+    var fill: Bool
+
+    var body: some View {
+        GeometryReader { proxy in
+            let points = sparkPoints(in: proxy.size)
+            ZStack {
+                if fill {
+                    sparkFill(points: points, size: proxy.size)
+                        .fill(
+                            LinearGradient(
+                                colors: [color.opacity(0.20), color.opacity(0.02)],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                }
+                sparkLine(points: points)
+                    .stroke(color, style: StrokeStyle(lineWidth: fill ? 2 : 1.5, lineCap: .round, lineJoin: .round))
+            }
+        }
+    }
+
+    private func sparkPoints(in size: CGSize) -> [CGPoint] {
+        let values = (0..<16).map { index -> Double in
+            let wave = sin(Double(index) * 0.72 + seed * 8) * 0.18
+            let trend = Double(index) / 20
+            let bump = index > 10 ? 0.18 : 0
+            return min(0.92, max(0.12, 0.38 + wave + trend + bump))
+        }
+        return values.enumerated().map { index, value in
+            CGPoint(
+                x: CGFloat(index) / CGFloat(max(values.count - 1, 1)) * size.width,
+                y: size.height - CGFloat(value) * size.height
+            )
+        }
+    }
+
+    private func sparkLine(points: [CGPoint]) -> Path {
+        Path { path in
+            guard let first = points.first else { return }
+            path.move(to: first)
+            for point in points.dropFirst() {
+                path.addLine(to: point)
+            }
+        }
+    }
+
+    private func sparkFill(points: [CGPoint], size: CGSize) -> Path {
+        Path { path in
+            guard let first = points.first, let last = points.last else { return }
+            path.move(to: CGPoint(x: first.x, y: size.height))
+            path.addLine(to: first)
+            for point in points.dropFirst() {
+                path.addLine(to: point)
+            }
+            path.addLine(to: CGPoint(x: last.x, y: size.height))
+            path.closeSubpath()
         }
     }
 }
@@ -3095,6 +3425,8 @@ private struct MacSettingsWorkspace: View {
             }
 
             MacSettingsSectionCard(title: "Behavior", theme: theme) {
+                settingsToggle("Connect to start", isOn: $model.connectOnStartEnabled)
+                settingsToggle("Reconnect to VPN after dropped or reset", isOn: $model.reconnectAfterDropEnabled)
                 settingsToggle("Auto-switch when connection is unstable", isOn: $model.automaticFailoverEnabled)
                 settingsToggle("Show notification after switch", isOn: $model.showFailoverNotifications)
             }
@@ -3316,7 +3648,7 @@ private struct MacAboutWorkspace: View {
                 .font(.system(size: 24, weight: .semibold))
                 .foregroundStyle(theme.primaryText)
             VStack(alignment: .leading, spacing: 10) {
-                Text("Real Ai VPN")
+                Text("Real Ai Router")
                     .font(.system(size: 22, weight: .bold))
                 Text("v\(buildLabel)")
                     .foregroundStyle(theme.secondaryText)
@@ -3524,7 +3856,7 @@ struct ServerRankingPanel: View {
                 deletingProfile = nil
             }
         } message: { profile in
-            Text("If this profile is connected, Real Ai VPN will switch to the next available profile automatically.")
+            Text("If this profile is connected, Real Ai Router will switch to the next available profile automatically.")
         }
         .fileImporter(
             isPresented: $showConfImporter,
@@ -4311,7 +4643,7 @@ struct SettingsView: View {
     private var appSettings: some View {
         SettingsCard(title: "App Display") {
             VStack(alignment: .leading, spacing: 14) {
-                Picker("Show Real Ai VPN", selection: Binding(
+                Picker("Show Real Ai Router", selection: Binding(
                     get: { appVisibilityMode },
                     set: { appVisibilityModeRaw = $0.rawValue }
                 )) {
@@ -4331,7 +4663,7 @@ struct SettingsView: View {
                 Toggle("Auto-switch profile and show popup", isOn: $model.automaticFailoverEnabled)
                     .toggleStyle(.switch)
 
-                Text("When the active VPN path stalls, Real Ai VPN switches to the best imported profile, reconnects, and shows a confirmation popup.")
+                Text("When the active VPN path stalls, Real Ai Router switches to the best imported profile, reconnects, and shows a confirmation popup.")
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.58))
 

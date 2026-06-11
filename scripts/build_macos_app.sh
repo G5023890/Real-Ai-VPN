@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-APP_NAME="Real Ai VPN"
+APP_NAME="Real Ai Router"
 PRODUCT_NAME="SmartVPNMacApp"
 CONFIGURATION="${CONFIGURATION:-debug}"
 APP_DIR="$ROOT_DIR/dist/$APP_NAME.app"
@@ -33,7 +33,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.92</string>
+    <string>0.93</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>

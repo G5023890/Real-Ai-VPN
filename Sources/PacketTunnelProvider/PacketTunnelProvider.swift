@@ -39,7 +39,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 #endif
 
     override func startTunnel(options: [String: NSObject]?) async throws {
-        packetTunnelLogger.info("Starting Real Ai VPN packet tunnel")
+        packetTunnelLogger.info("Starting Real Ai Router packet tunnel")
         saveDiagnostic(stage: "startTunnel", message: "PacketTunnelProvider entered startTunnel.")
         NSLog("RealAiVPN PacketTunnel startTunnel optionsHasConfig=%@",
               (((options?["amneziaVPNURL"] as? String) ?? (options?["amneziaVPNURL"] as? NSString).map(String.init))?.isEmpty == false) ? "true" : "false")
@@ -148,7 +148,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         throw PacketTunnelProviderError.invalidAmneziaConfig
 #else
         let tunnelConfiguration = try config.makeTunnelConfiguration(
-            named: "Real Ai VPN",
+            named: "Real Ai Router",
             routingExceptions: routingExceptions,
             killSwitchEnabled: killSwitchEnabled,
             localNetworkAccessEnabled: localNetworkAccessEnabled,
@@ -272,7 +272,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         let content = UNMutableNotificationContent()
-        content.title = "Real Ai VPN disconnected"
+        content.title = "Real Ai Router disconnected"
         content.body = "Tunnel dropped or reset for \(activeProfileName())."
         content.sound = .default
 
@@ -367,7 +367,7 @@ enum PacketTunnelProviderError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .missingAmneziaKey:
-            return "Connect from Real Ai VPN after saving an Amnezia Premium vpn:// key or importing an AmneziaWG .conf in Settings."
+            return "Connect from Real Ai Router after saving an Amnezia Premium vpn:// key or importing an AmneziaWG .conf in Settings."
         case .invalidAmneziaConfig:
             return "The saved Amnezia Premium key could not be decoded into a tunnel configuration."
         case .invalidWireGuardConfig(let message):
@@ -472,6 +472,7 @@ private extension AmneziaWireGuardConfig {
         var interface = InterfaceConfiguration(privateKey: privateKey)
         interface.addresses = parseCommaList(address).compactMap(IPAddressRange.init(from:))
         interface.dns = parseCommaList(dns).compactMap(DNSServer.init(from:))
+        interface.killSwitchEnabled = killSwitchEnabled
         interface.mtu = mtu.flatMap(UInt16.init(exactly:))
         interface.junkPacketCount = parseUInt16(jc)
         interface.junkPacketMinSize = parseUInt16(jmin)

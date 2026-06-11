@@ -8,7 +8,7 @@ SCHEME="${SCHEME:-RealAiVPNiOS}"
 CONFIGURATION="${CONFIGURATION:-Debug}"
 TEAM_ID="${TEAM_ID:-9FP39GTDT5}"
 DERIVED_DATA_ROOT="${DERIVED_DATA_ROOT:-$PROJECT_DIR/.build/xcode-ios-device}"
-APP_VERSION="${APP_VERSION:-0.92}"
+APP_VERSION="${APP_VERSION:-0.93}"
 BUILD_STAMP="${BUILD_STAMP:-$(date '+%H%M%S%d%m%Y')}"
 BUILD_DISPLAY_STAMP="${BUILD_DISPLAY_STAMP:-$(date '+%H%M:%d%m:%y')}"
 BUILD_LABEL="${BUILD_LABEL:-${APP_VERSION} (${BUILD_DISPLAY_STAMP})}"
@@ -37,6 +37,7 @@ fi
 
 log "Preparing AmneziaWG userspace backend for iPhone"
 log "Build label: $BUILD_LABEL"
+"$PROJECT_DIR/scripts/prepare_third_party.sh"
 make -C "$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo" \
   ARCHS=arm64 \
   PLATFORM_NAME=iphoneos \

@@ -221,6 +221,12 @@ private final class SingBoxPlatformInterface: NSObject, LibboxPlatformInterfaceP
         }
 
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
+        if killSwitchEnabled {
+            if #available(iOS 27.0, macOS 27.0, *) {
+                settings.includeAllNetworks = .any
+                settings.enforceRoutes = true
+            }
+        }
         settings.mtu = NSNumber(value: options.getMTU())
 
         var dnsSettings: NEDNSSettings?
@@ -450,7 +456,7 @@ private final class SingBoxPlatformInterface: NSObject, LibboxPlatformInterfaceP
     func setSystemProxyEnabled(_: Bool) throws {}
 
     func triggerNativeCrash() throws {
-        fatalError("Real Ai VPN requested a sing-box native crash")
+        fatalError("Real Ai Router requested a sing-box native crash")
     }
 
     func send(_ notification: LibboxNotification?) throws {
