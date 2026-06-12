@@ -456,6 +456,418 @@ public struct RankedServer: Hashable, Codable, Sendable {
     }
 }
 
+public enum CoreMLRecommendedActionHint: String, Hashable, Codable, Sendable {
+    case keepCurrent
+    case reconnect
+    case switchServer
+    case quarantine
+    case askUser
+}
+
+public struct CoreMLServerScoringOutput: Hashable, Codable, Sendable {
+    public var channelScore: Double
+    public var degradationRisk: Double
+    public var recommendedActionHint: CoreMLRecommendedActionHint
+    public var confidence: Double
+
+    public init(
+        channelScore: Double,
+        degradationRisk: Double,
+        recommendedActionHint: CoreMLRecommendedActionHint,
+        confidence: Double
+    ) {
+        self.channelScore = min(max(channelScore, 0), 1)
+        self.degradationRisk = min(max(degradationRisk, 0), 1)
+        self.recommendedActionHint = recommendedActionHint
+        self.confidence = min(max(confidence, 0), 1)
+    }
+}
+
+public struct VPNChannelDailyReport: Identifiable, Hashable, Codable, Sendable {
+    public var id: String { serverID }
+    public var serverID: String
+    public var displayName: String
+    public var region: RegionCode
+    public var protocolKind: VPNProtocolKind
+    public var dayStart: Date
+    public var sampleCount: Int
+    public var probeCount: Int
+    public var averageLatencyMilliseconds: Double?
+    public var averageHandshakeMilliseconds: Double?
+    public var averagePacketLoss: Double
+    public var successRate: Double
+    public var failureCount: Int
+    public var lastSeen: Date?
+    public var channelScore: Double
+    public var degradationRisk: Double
+    public var recommendedActionHint: CoreMLRecommendedActionHint
+    public var confidence: Double
+    public var summaryText: String
+
+    public init(
+        serverID: String,
+        displayName: String,
+        region: RegionCode,
+        protocolKind: VPNProtocolKind,
+        dayStart: Date,
+        sampleCount: Int,
+        probeCount: Int,
+        averageLatencyMilliseconds: Double?,
+        averageHandshakeMilliseconds: Double?,
+        averagePacketLoss: Double,
+        successRate: Double,
+        failureCount: Int,
+        lastSeen: Date?,
+        channelScore: Double,
+        degradationRisk: Double,
+        recommendedActionHint: CoreMLRecommendedActionHint,
+        confidence: Double,
+        summaryText: String
+    ) {
+        self.serverID = serverID
+        self.displayName = displayName
+        self.region = region
+        self.protocolKind = protocolKind
+        self.dayStart = dayStart
+        self.sampleCount = max(0, sampleCount)
+        self.probeCount = max(0, probeCount)
+        self.averageLatencyMilliseconds = averageLatencyMilliseconds
+        self.averageHandshakeMilliseconds = averageHandshakeMilliseconds
+        self.averagePacketLoss = min(max(averagePacketLoss, 0), 1)
+        self.successRate = min(max(successRate, 0), 1)
+        self.failureCount = max(0, failureCount)
+        self.lastSeen = lastSeen
+        self.channelScore = min(max(channelScore, 0), 1)
+        self.degradationRisk = min(max(degradationRisk, 0), 1)
+        self.recommendedActionHint = recommendedActionHint
+        self.confidence = min(max(confidence, 0), 1)
+        self.summaryText = summaryText
+    }
+}
+
+public struct CoreMLServerFeatureVector: Hashable, Codable, Sendable {
+    public static let historyWindowDays = 21
+    public static let historyWindow: TimeInterval = TimeInterval(historyWindowDays * 24 * 60 * 60)
+    public static let recentSampleLimit = 12
+    public static let minimumModelConfidence = 0.25
+
+    public var currentRegion: RegionCode
+    public var homeRegion: RegionCode
+    public var serverRegion: RegionCode
+    public var networkKind: NetworkKind
+    public var protocolKind: VPNProtocolKind
+    public var hourOfDay: Int
+    public var isPreviousServer: Bool
+    public var sampleCount21d: Int
+    public var recentSampleCount: Int
+    public var recentLatencyMilliseconds: Double
+    public var longTermLatencyMilliseconds: Double
+    public var recentHandshakeMilliseconds: Double
+    public var longTermHandshakeMilliseconds: Double
+    public var recentPacketLoss: Double
+    public var longTermPacketLoss: Double
+    public var recentFailurePressure: Double
+    public var longTermFailurePressure: Double
+    public var estimatedSuccessRate: Double
+    public var dnsAvailability: Double
+    public var dohAvailability: Double
+    public var tcpEndpointReachability: Double
+    public var vpnEndpointReachability: Double
+    public var exitIPConsistency: Double
+    public var probeFreshnessSeconds: Double
+    public var heuristicScore: Double
+    public var degradationRisk: Double
+    public var confidence: Double
+
+    public var recommendedActionHint: CoreMLRecommendedActionHint {
+        if degradationRisk >= 0.8 {
+            return .switchServer
+        }
+        if degradationRisk >= 0.55 {
+            return .reconnect
+        }
+        return .keepCurrent
+    }
+}
+
+public struct CoreMLServerFeatureExtractor: Sendable {
+    public init() {}
+
+    public func vector(
+        for server: SmartVPNServer,
+        context: ServerSelectionContext,
+        samples: [ServerQualitySample],
+        probeHistory: [ConnectivityProbeResult],
+        now: Date = Date()
+    ) -> CoreMLServerFeatureVector {
+        let cutoff = now.addingTimeInterval(-CoreMLServerFeatureVector.historyWindow)
+        let windowSamples = samples
+            .filter { $0.timestamp >= cutoff }
+            .sorted { $0.timestamp < $1.timestamp }
+        let recentSamples = Array(windowSamples.suffix(CoreMLServerFeatureVector.recentSampleLimit))
+
+        let recentLatency = average(recentSamples.map(\.latencyMilliseconds)) ?? server.lastLatencyMilliseconds ?? 250
+        let longTermLatency = average(windowSamples.map(\.latencyMilliseconds)) ?? recentLatency
+        let recentHandshake = average(recentSamples.map(\.handshakeMilliseconds)) ?? 350
+        let longTermHandshake = average(windowSamples.map(\.handshakeMilliseconds)) ?? recentHandshake
+        let recentLoss = average(recentSamples.map(\.packetLoss)) ?? 0
+        let longTermLoss = average(windowSamples.map(\.packetLoss)) ?? recentLoss
+        let recentFailures = average(recentSamples.map { Double($0.recentFailureCount) }) ?? 0
+        let longTermFailures = average(windowSamples.map { Double($0.recentFailureCount) }) ?? recentFailures
+        let recentFailurePressure = min(max(recentFailures / 4, 0), 1)
+        let longTermFailurePressure = min(max(longTermFailures / 4, 0), 1)
+        let estimatedSuccessRate = min(max(1 - ((recentFailurePressure * 0.65) + (longTermFailurePressure * 0.35)), 0), 1)
+
+        let serverProbes = probeHistory
+            .filter { $0.serverID == server.id || ($0.serverID == nil && $0.targetKind == .dnsResolver) }
+            .filter { $0.timestamp >= cutoff }
+        let dnsAvailability = successRate(
+            serverProbes.filter { $0.method == .dnsQuery || $0.targetKind == .dnsResolver },
+            defaultValue: 1
+        )
+        let dohAvailability = successRate(
+            serverProbes.filter { $0.method == .httpGet && $0.targetID.lowercased().contains("dns-query") },
+            defaultValue: dnsAvailability
+        )
+        let tcpEndpointReachability = successRate(
+            serverProbes.filter { $0.method == .tcpConnect },
+            defaultValue: 1
+        )
+        let vpnEndpointReachability = successRate(
+            serverProbes.filter { $0.targetKind == .vpnServer },
+            defaultValue: tcpEndpointReachability
+        )
+        let exitIPConsistency = successRate(
+            serverProbes.filter { $0.targetKind == .vpnProtectedEndpoint },
+            defaultValue: estimatedSuccessRate
+        )
+        let lastProbe = serverProbes.map(\.timestamp).max()
+        let probeFreshness = lastProbe.map { max(0, now.timeIntervalSince($0)) } ?? CoreMLServerFeatureVector.historyWindow
+
+        var heuristicScore = 1.0
+        heuristicScore -= min(((recentLatency * 0.65) + (longTermLatency * 0.35)) / 900, 0.45)
+        heuristicScore -= min(((recentHandshake * 0.65) + (longTermHandshake * 0.35)) / 1_500, 0.2)
+        heuristicScore -= min(((recentLoss * 0.65) + (longTermLoss * 0.35)) * 1.7, 0.25)
+        heuristicScore -= min(((recentFailures * 0.65) + (longTermFailures * 0.35)) * 0.07, 0.25)
+        heuristicScore += min((dnsAvailability + tcpEndpointReachability + vpnEndpointReachability + exitIPConsistency - 3.2) * 0.08, 0.08)
+
+        if server.healthState == .degraded {
+            heuristicScore -= 0.12
+        }
+        if server.id == context.previousServerID {
+            heuristicScore += 0.04
+        }
+        if context.networkKind == .cellular {
+            heuristicScore -= min(recentHandshake / 4_000, 0.04)
+        }
+
+        heuristicScore = min(max(heuristicScore, 0), 1)
+        let pathRisk = 1 - min(dnsAvailability, dohAvailability, tcpEndpointReachability, vpnEndpointReachability, exitIPConsistency)
+        let qualityRisk = 1 - heuristicScore
+        let degradationRisk = min(max((qualityRisk * 0.7) + (pathRisk * 0.3), 0), 1)
+        let confidence = confidence(sampleCount: windowSamples.count, recentSampleCount: recentSamples.count, probeCount: serverProbes.count)
+
+        return CoreMLServerFeatureVector(
+            currentRegion: context.currentRegion,
+            homeRegion: context.homeRegion,
+            serverRegion: server.region,
+            networkKind: context.networkKind,
+            protocolKind: server.protocolKind,
+            hourOfDay: context.hourOfDay,
+            isPreviousServer: server.id == context.previousServerID,
+            sampleCount21d: windowSamples.count,
+            recentSampleCount: recentSamples.count,
+            recentLatencyMilliseconds: recentLatency,
+            longTermLatencyMilliseconds: longTermLatency,
+            recentHandshakeMilliseconds: recentHandshake,
+            longTermHandshakeMilliseconds: longTermHandshake,
+            recentPacketLoss: recentLoss,
+            longTermPacketLoss: longTermLoss,
+            recentFailurePressure: recentFailurePressure,
+            longTermFailurePressure: longTermFailurePressure,
+            estimatedSuccessRate: estimatedSuccessRate,
+            dnsAvailability: dnsAvailability,
+            dohAvailability: dohAvailability,
+            tcpEndpointReachability: tcpEndpointReachability,
+            vpnEndpointReachability: vpnEndpointReachability,
+            exitIPConsistency: exitIPConsistency,
+            probeFreshnessSeconds: probeFreshness,
+            heuristicScore: heuristicScore,
+            degradationRisk: degradationRisk,
+            confidence: confidence
+        )
+    }
+
+    public func trimToHistoryWindow(_ samples: [ServerQualitySample], now: Date = Date()) -> [ServerQualitySample] {
+        let cutoff = now.addingTimeInterval(-CoreMLServerFeatureVector.historyWindow)
+        return samples
+            .filter { $0.timestamp >= cutoff }
+            .sorted { $0.timestamp < $1.timestamp }
+    }
+
+    private func confidence(sampleCount: Int, recentSampleCount: Int, probeCount: Int) -> Double {
+        let historyConfidence = min(Double(sampleCount) / 48, 0.45)
+        let recentConfidence = min(Double(recentSampleCount) / Double(CoreMLServerFeatureVector.recentSampleLimit), 1) * 0.35
+        let probeConfidence = min(Double(probeCount) / 24, 1) * 0.15
+        return min(0.15 + historyConfidence + recentConfidence + probeConfidence, 0.95)
+    }
+
+    private func successRate(_ probes: [ConnectivityProbeResult], defaultValue: Double) -> Double {
+        guard !probes.isEmpty else {
+            return defaultValue
+        }
+
+        return Double(probes.filter(\.succeeded).count) / Double(probes.count)
+    }
+
+    private func average(_ values: [Double]) -> Double? {
+        guard !values.isEmpty else {
+            return nil
+        }
+
+        return values.reduce(0, +) / Double(values.count)
+    }
+}
+
+public struct VPNChannelDailyReportBuilder: Sendable {
+    private let featureExtractor: CoreMLServerFeatureExtractor
+
+    public init(featureExtractor: CoreMLServerFeatureExtractor = CoreMLServerFeatureExtractor()) {
+        self.featureExtractor = featureExtractor
+    }
+
+    public func reports(
+        for servers: [SmartVPNServer],
+        context: ServerSelectionContext,
+        samples: [ServerQualitySample],
+        probeHistory: [ConnectivityProbeResult],
+        rankedServers: [RankedServer],
+        date: Date = Date(),
+        calendar: Calendar = .current
+    ) -> [VPNChannelDailyReport] {
+        let dayStart = calendar.startOfDay(for: date)
+        let rankedByServerID = Dictionary(uniqueKeysWithValues: rankedServers.map { ($0.server.id, $0) })
+
+        return servers.map { server in
+            report(
+                for: server,
+                context: context,
+                samples: samples.filter { $0.serverID == server.id },
+                probeHistory: probeHistory,
+                rankedServer: rankedByServerID[server.id],
+                dayStart: dayStart
+            )
+        }
+        .sorted { lhs, rhs in
+            if lhs.channelScore != rhs.channelScore {
+                return lhs.channelScore > rhs.channelScore
+            }
+
+            return lhs.displayName < rhs.displayName
+        }
+    }
+
+    private func report(
+        for server: SmartVPNServer,
+        context: ServerSelectionContext,
+        samples: [ServerQualitySample],
+        probeHistory: [ConnectivityProbeResult],
+        rankedServer: RankedServer?,
+        dayStart: Date
+    ) -> VPNChannelDailyReport {
+        let todaySamples = samples
+            .filter { $0.timestamp >= dayStart }
+            .sorted { $0.timestamp < $1.timestamp }
+        let todayProbes = probeHistory
+            .filter { probe in
+                probe.timestamp >= dayStart
+                    && (probe.serverID == server.id || (probe.serverID == nil && probe.targetKind == .dnsResolver))
+            }
+            .sorted { $0.timestamp < $1.timestamp }
+        let successfulSamples = todaySamples.filter { $0.packetLoss < 1 }
+        let successfulProbes = todayProbes.filter(\.succeeded)
+        let vector = featureExtractor.vector(
+            for: server,
+            context: context,
+            samples: samples,
+            probeHistory: probeHistory
+        )
+        let score = rankedServer?.score ?? vector.heuristicScore
+        let confidence = max(rankedServer?.confidence ?? 0, vector.confidence)
+        let sampleSuccessRate = todaySamples.isEmpty ? nil : Double(successfulSamples.count) / Double(todaySamples.count)
+        let probeSuccessRate = todayProbes.isEmpty ? nil : Double(successfulProbes.count) / Double(todayProbes.count)
+        let successRate = sampleSuccessRate ?? probeSuccessRate ?? 0
+        let failureCount = todaySamples.reduce(0) { $0 + $1.recentFailureCount }
+            + todayProbes.filter { !$0.succeeded }.count
+        let lastSeen = (todaySamples.map(\.timestamp) + todayProbes.map(\.timestamp)).max()
+
+        return VPNChannelDailyReport(
+            serverID: server.id,
+            displayName: server.displayName,
+            region: server.region,
+            protocolKind: server.protocolKind,
+            dayStart: dayStart,
+            sampleCount: todaySamples.count,
+            probeCount: todayProbes.count,
+            averageLatencyMilliseconds: average(todaySamples.map(\.latencyMilliseconds))
+                ?? average(successfulProbes.compactMap(\.latencyMilliseconds)),
+            averageHandshakeMilliseconds: average(todaySamples.map(\.handshakeMilliseconds)),
+            averagePacketLoss: average(todaySamples.map(\.packetLoss)) ?? average(todayProbes.map(\.packetLoss)) ?? 0,
+            successRate: successRate,
+            failureCount: failureCount,
+            lastSeen: lastSeen,
+            channelScore: score,
+            degradationRisk: vector.degradationRisk,
+            recommendedActionHint: vector.recommendedActionHint,
+            confidence: confidence,
+            summaryText: summaryText(
+                server: server,
+                score: score,
+                risk: vector.degradationRisk,
+                successRate: successRate,
+                failureCount: failureCount,
+                sampleCount: todaySamples.count,
+                probeCount: todayProbes.count,
+                action: vector.recommendedActionHint
+            )
+        )
+    }
+
+    private func summaryText(
+        server: SmartVPNServer,
+        score: Double,
+        risk: Double,
+        successRate: Double,
+        failureCount: Int,
+        sampleCount: Int,
+        probeCount: Int,
+        action: CoreMLRecommendedActionHint
+    ) -> String {
+        let scorePercent = Int((score * 100).rounded())
+        let successPercent = Int((successRate * 100).rounded())
+        let riskPercent = Int((risk * 100).rounded())
+        let evidenceCount = sampleCount + probeCount
+
+        if evidenceCount == 0 {
+            return "\(server.displayName): no channel data today. CoreML baseline score \(scorePercent), risk \(riskPercent), action \(action.rawValue)."
+        }
+
+        if failureCount == 0 && risk < 0.35 {
+            return "\(server.displayName): stable today, \(successPercent)% success, score \(scorePercent), action \(action.rawValue)."
+        }
+
+        return "\(server.displayName): \(successPercent)% success, \(failureCount) failures, risk \(riskPercent), action \(action.rawValue)."
+    }
+
+    private func average(_ values: [Double]) -> Double? {
+        guard !values.isEmpty else {
+            return nil
+        }
+
+        return values.reduce(0, +) / Double(values.count)
+    }
+}
+
 public enum DestinationRegion: Hashable, Codable, Sendable {
     case current
     case home
@@ -496,9 +908,14 @@ public final class InMemoryServerQualityHistoryStore: ServerQualityHistoryStore,
     private let lock = NSLock()
     private var samplesByServerID: [String: [ServerQualitySample]] = [:]
     private let maxSamplesPerServer: Int
+    private let historyWindow: TimeInterval
 
-    public init(maxSamplesPerServer: Int = 64) {
+    public init(
+        maxSamplesPerServer: Int = 4_096,
+        historyWindow: TimeInterval = CoreMLServerFeatureVector.historyWindow
+    ) {
         self.maxSamplesPerServer = max(1, maxSamplesPerServer)
+        self.historyWindow = max(60, historyWindow)
     }
 
     public func samples(for serverID: String) -> [ServerQualitySample] {
@@ -511,6 +928,8 @@ public final class InMemoryServerQualityHistoryStore: ServerQualityHistoryStore,
         lock.withLock {
             var samples = samplesByServerID[sample.serverID] ?? []
             samples.append(sample)
+            let cutoff = sample.timestamp.addingTimeInterval(-historyWindow)
+            samples.removeAll { $0.timestamp < cutoff }
             if samples.count > maxSamplesPerServer {
                 samples.removeFirst(samples.count - maxSamplesPerServer)
             }
@@ -523,22 +942,28 @@ public protocol ServerScoring {
     func rank(
         servers: [SmartVPNServer],
         context: ServerSelectionContext,
-        historyStore: ServerQualityHistoryStore
+        historyStore: ServerQualityHistoryStore,
+        probeHistory: [ConnectivityProbeResult]
     ) -> [RankedServer]
 }
 
 public struct HeuristicServerScorer: ServerScoring, Sendable {
-    public init() {}
+    private let featureExtractor: CoreMLServerFeatureExtractor
+
+    public init(featureExtractor: CoreMLServerFeatureExtractor = CoreMLServerFeatureExtractor()) {
+        self.featureExtractor = featureExtractor
+    }
 
     public func rank(
         servers: [SmartVPNServer],
         context: ServerSelectionContext,
-        historyStore: ServerQualityHistoryStore
+        historyStore: ServerQualityHistoryStore,
+        probeHistory: [ConnectivityProbeResult] = []
     ) -> [RankedServer] {
         servers
             .filter { $0.healthState != .unhealthy }
             .map { server in
-                rank(server: server, context: context, historyStore: historyStore)
+                rank(server: server, context: context, historyStore: historyStore, probeHistory: probeHistory)
             }
             .sorted { lhs, rhs in
                 if lhs.score == rhs.score {
@@ -552,95 +977,96 @@ public struct HeuristicServerScorer: ServerScoring, Sendable {
     private func rank(
         server: SmartVPNServer,
         context: ServerSelectionContext,
-        historyStore: ServerQualityHistoryStore
+        historyStore: ServerQualityHistoryStore,
+        probeHistory: [ConnectivityProbeResult]
     ) -> RankedServer {
-        let samples = historyStore.samples(for: server.id)
-        let recentSamples = Array(samples.suffix(12))
-        let averageLatency = average(recentSamples.map(\.latencyMilliseconds)) ?? server.lastLatencyMilliseconds ?? 250
-        let averageHandshake = average(recentSamples.map(\.handshakeMilliseconds)) ?? 350
-        let averagePacketLoss = average(recentSamples.map(\.packetLoss)) ?? 0
-        let averageFailures = average(recentSamples.map { Double($0.recentFailureCount) }) ?? 0
-
-        var score = 1.0
-        score -= min(averageLatency / 900, 0.45)
-        score -= min(averageHandshake / 1_500, 0.2)
-        score -= min(averagePacketLoss * 1.7, 0.25)
-        score -= min(averageFailures * 0.07, 0.25)
-
-        if server.healthState == .degraded {
-            score -= 0.12
-        }
-
-        if server.id == context.previousServerID {
-            score += 0.04
-        }
-
-        if context.networkKind == .cellular {
-            score -= min(averageHandshake / 4_000, 0.04)
-        }
-
-        let confidence = min(0.35 + Double(recentSamples.count) / 12 * 0.55, 0.9)
-        let reason = "latency=\(Int(averageLatency))ms handshake=\(Int(averageHandshake))ms loss=\(Int(averagePacketLoss * 100))% samples=\(recentSamples.count)"
+        let vector = featureExtractor.vector(
+            for: server,
+            context: context,
+            samples: historyStore.samples(for: server.id),
+            probeHistory: probeHistory
+        )
+        let score = vector.heuristicScore
+        let confidence = vector.confidence
+        let reason = "latency=\(Int(vector.recentLatencyMilliseconds))ms long=\(Int(vector.longTermLatencyMilliseconds))ms handshake=\(Int(vector.recentHandshakeMilliseconds))ms loss=\(Int(vector.recentPacketLoss * 100))% samples21d=\(vector.sampleCount21d)"
 
         return RankedServer(server: server, score: score, confidence: confidence, reason: reason)
-    }
-
-    private func average(_ values: [Double]) -> Double? {
-        guard !values.isEmpty else {
-            return nil
-        }
-
-        return values.reduce(0, +) / Double(values.count)
     }
 }
 
 public struct CoreMLServerScorer: ServerScoring {
     private let fallback: any ServerScoring
+    private let featureExtractor: CoreMLServerFeatureExtractor
     #if canImport(CoreML)
     private let model: MLModel?
     #endif
 
+    public static func bundledModelURL(
+        resourceName: String = "RealAiVPNChannelScorer",
+        bundle: Bundle = .main
+    ) -> URL? {
+        #if canImport(CoreML)
+        if let compiledURL = bundle.url(forResource: resourceName, withExtension: "mlmodelc") {
+            return compiledURL
+        }
+        if let compiledURL = bundle.url(forResource: resourceName, withExtension: "mlmodelc", subdirectory: "CoreML") {
+            return compiledURL
+        }
+        if let sourceURL = bundle.url(forResource: resourceName, withExtension: "mlmodel") {
+            return sourceURL
+        }
+        if let sourceURL = bundle.url(forResource: resourceName, withExtension: "mlmodel", subdirectory: "CoreML") {
+            return sourceURL
+        }
+        #endif
+        return nil
+    }
+
     public init(
-        modelURL: URL? = nil,
-        fallback: any ServerScoring = HeuristicServerScorer()
+        modelURL: URL? = CoreMLServerScorer.bundledModelURL(),
+        fallback: any ServerScoring = HeuristicServerScorer(),
+        featureExtractor: CoreMLServerFeatureExtractor = CoreMLServerFeatureExtractor()
     ) {
         self.fallback = fallback
+        self.featureExtractor = featureExtractor
         #if canImport(CoreML)
-        if let modelURL {
-            self.model = try? MLModel(contentsOf: modelURL)
-        } else {
-            self.model = nil
-        }
+        self.model = Self.loadModel(from: modelURL)
         #endif
     }
 
     public func rank(
         servers: [SmartVPNServer],
         context: ServerSelectionContext,
-        historyStore: ServerQualityHistoryStore
+        historyStore: ServerQualityHistoryStore,
+        probeHistory: [ConnectivityProbeResult] = []
     ) -> [RankedServer] {
         #if canImport(CoreML)
         guard let model else {
-            return fallback.rank(servers: servers, context: context, historyStore: historyStore)
+            return fallback.rank(servers: servers, context: context, historyStore: historyStore, probeHistory: probeHistory)
         }
 
         let ranked = servers
             .filter { $0.healthState != .unhealthy }
             .compactMap { server -> RankedServer? in
-                guard let score = predictionScore(
+                let vector = featureExtractor.vector(
                     for: server,
                     context: context,
-                    historyStore: historyStore,
+                    samples: historyStore.samples(for: server.id),
+                    probeHistory: probeHistory
+                )
+                guard let output = predictionOutput(
+                    for: server,
+                    vector: vector,
                     model: model
-                ) else {
+                ), output.confidence >= CoreMLServerFeatureVector.minimumModelConfidence else {
                     return nil
                 }
 
                 return RankedServer(
                     server: server,
-                    score: score,
-                    confidence: confidence(for: server.id, historyStore: historyStore),
-                    reason: "coreml-score=\(String(format: "%.2f", score))"
+                    score: output.channelScore,
+                    confidence: output.confidence,
+                    reason: "coreml-score=\(String(format: "%.2f", output.channelScore)) risk=\(String(format: "%.2f", output.degradationRisk)) action=\(output.recommendedActionHint.rawValue) samples21d=\(vector.sampleCount21d)"
                 )
             }
             .sorted { lhs, rhs in
@@ -651,70 +1077,174 @@ public struct CoreMLServerScorer: ServerScoring {
                 return lhs.score > rhs.score
             }
 
-        return ranked.isEmpty ? fallback.rank(servers: servers, context: context, historyStore: historyStore) : ranked
+        return ranked.isEmpty ? fallback.rank(servers: servers, context: context, historyStore: historyStore, probeHistory: probeHistory) : ranked
         #else
-        return fallback.rank(servers: servers, context: context, historyStore: historyStore)
+        return fallback.rank(servers: servers, context: context, historyStore: historyStore, probeHistory: probeHistory)
         #endif
     }
 
     #if canImport(CoreML)
-    private func predictionScore(
-        for server: SmartVPNServer,
-        context: ServerSelectionContext,
-        historyStore: ServerQualityHistoryStore,
-        model: MLModel
-    ) -> Double? {
-        let recentSamples = Array(historyStore.samples(for: server.id).suffix(12))
-        let averageLatency = average(recentSamples.map(\.latencyMilliseconds)) ?? server.lastLatencyMilliseconds ?? 250
-        let averageHandshake = average(recentSamples.map(\.handshakeMilliseconds)) ?? 350
-        let averagePacketLoss = average(recentSamples.map(\.packetLoss)) ?? 0
-        let recentFailures = average(recentSamples.map { Double($0.recentFailureCount) }) ?? 0
-        let healthScore = approximateHealthScore(
-            latencyMilliseconds: averageLatency,
-            packetLoss: averagePacketLoss,
-            recentFailures: recentFailures
-        )
-
-        let features: [String: MLFeatureValue] = [
-            "currentRegion": MLFeatureValue(string: context.currentRegion.rawValue),
-            "homeRegion": MLFeatureValue(string: context.homeRegion.rawValue),
-            "serverRegion": MLFeatureValue(string: server.region.rawValue),
-            "networkKind": MLFeatureValue(string: context.networkKind.rawValue),
-            "latencyMilliseconds": MLFeatureValue(double: averageLatency),
-            "handshakeMilliseconds": MLFeatureValue(double: averageHandshake),
-            "packetLoss": MLFeatureValue(double: averagePacketLoss),
-            "recentFailures": MLFeatureValue(double: recentFailures),
-            "healthScore": MLFeatureValue(double: healthScore),
-            "isPreviousServer": MLFeatureValue(double: server.id == context.previousServerID ? 1 : 0),
-            "isQuarantined": MLFeatureValue(double: 0),
-            "sampleCount": MLFeatureValue(double: Double(recentSamples.count)),
-            "hourOfDay": MLFeatureValue(double: Double(context.hourOfDay))
-        ]
-
-        guard let provider = try? MLDictionaryFeatureProvider(dictionary: features),
-              let output = try? model.prediction(from: provider),
-              let scoreValue = output.featureValue(for: "score")?.doubleValue else {
+    private static func loadModel(from modelURL: URL?) -> MLModel? {
+        guard let modelURL else {
             return nil
         }
 
-        return min(max(scoreValue, 0), 1)
+        if modelURL.pathExtension == "mlmodel" {
+            guard let compiledURL = try? MLModel.compileModel(at: modelURL) else {
+                return nil
+            }
+            return try? MLModel(contentsOf: compiledURL)
+        }
+
+        return try? MLModel(contentsOf: modelURL)
+    }
+
+    private func predictionOutput(
+        for server: SmartVPNServer,
+        vector: CoreMLServerFeatureVector,
+        model: MLModel
+    ) -> CoreMLServerScoringOutput? {
+        guard let featureArray = featureArray(from: vector) else {
+            return nil
+        }
+
+        let allFeatures: [String: MLFeatureValue] = [
+            "features": MLFeatureValue(multiArray: featureArray),
+            "currentRegion": MLFeatureValue(string: vector.currentRegion.rawValue),
+            "homeRegion": MLFeatureValue(string: vector.homeRegion.rawValue),
+            "serverRegion": MLFeatureValue(string: server.region.rawValue),
+            "networkKind": MLFeatureValue(string: vector.networkKind.rawValue),
+            "protocolKind": MLFeatureValue(string: vector.protocolKind.rawValue),
+            "latencyMilliseconds": MLFeatureValue(double: vector.recentLatencyMilliseconds),
+            "handshakeMilliseconds": MLFeatureValue(double: vector.recentHandshakeMilliseconds),
+            "packetLoss": MLFeatureValue(double: vector.recentPacketLoss),
+            "recentFailures": MLFeatureValue(double: vector.recentFailurePressure * 4),
+            "healthScore": MLFeatureValue(double: vector.heuristicScore),
+            "isPreviousServer": MLFeatureValue(double: vector.isPreviousServer ? 1 : 0),
+            "isQuarantined": MLFeatureValue(double: 0),
+            "sampleCount": MLFeatureValue(double: Double(vector.recentSampleCount)),
+            "hourOfDay": MLFeatureValue(double: Double(vector.hourOfDay)),
+            "sampleCount21d": MLFeatureValue(double: Double(vector.sampleCount21d)),
+            "recentSampleCount": MLFeatureValue(double: Double(vector.recentSampleCount)),
+            "recentLatencyMilliseconds": MLFeatureValue(double: vector.recentLatencyMilliseconds),
+            "longTermLatencyMilliseconds": MLFeatureValue(double: vector.longTermLatencyMilliseconds),
+            "recentHandshakeMilliseconds": MLFeatureValue(double: vector.recentHandshakeMilliseconds),
+            "longTermHandshakeMilliseconds": MLFeatureValue(double: vector.longTermHandshakeMilliseconds),
+            "recentPacketLoss": MLFeatureValue(double: vector.recentPacketLoss),
+            "longTermPacketLoss": MLFeatureValue(double: vector.longTermPacketLoss),
+            "recentFailurePressure": MLFeatureValue(double: vector.recentFailurePressure),
+            "longTermFailurePressure": MLFeatureValue(double: vector.longTermFailurePressure),
+            "estimatedSuccessRate": MLFeatureValue(double: vector.estimatedSuccessRate),
+            "dnsAvailability": MLFeatureValue(double: vector.dnsAvailability),
+            "dohAvailability": MLFeatureValue(double: vector.dohAvailability),
+            "tcpEndpointReachability": MLFeatureValue(double: vector.tcpEndpointReachability),
+            "vpnEndpointReachability": MLFeatureValue(double: vector.vpnEndpointReachability),
+            "exitIPConsistency": MLFeatureValue(double: vector.exitIPConsistency),
+            "probeFreshnessSeconds": MLFeatureValue(double: vector.probeFreshnessSeconds),
+            "heuristicScore": MLFeatureValue(double: vector.heuristicScore),
+            "degradationRisk": MLFeatureValue(double: vector.degradationRisk),
+            "featureConfidence": MLFeatureValue(double: vector.confidence)
+        ]
+        let modelInputNames = Set(model.modelDescription.inputDescriptionsByName.keys)
+        let features = allFeatures.filter { modelInputNames.contains($0.key) }
+
+        guard let provider = try? MLDictionaryFeatureProvider(dictionary: features),
+              let output = try? model.prediction(from: provider) else {
+            return nil
+        }
+
+        guard let score = numericOutput(named: "channelScore", from: output)
+                ?? numericOutput(named: "score", from: output) else {
+            return nil
+        }
+
+        let degradationRisk = numericOutput(named: "degradationRisk", from: output) ?? vector.degradationRisk
+        let confidence = numericOutput(named: "confidence", from: output) ?? vector.confidence
+        let actionHint = actionHint(from: output) ?? vector.recommendedActionHint
+
+        return CoreMLServerScoringOutput(
+            channelScore: score,
+            degradationRisk: degradationRisk,
+            recommendedActionHint: actionHint,
+            confidence: confidence
+        )
+    }
+
+    private func featureArray(from vector: CoreMLServerFeatureVector) -> MLMultiArray? {
+        guard let array = try? MLMultiArray(shape: [12], dataType: .double) else {
+            return nil
+        }
+
+        let values = [
+            vector.heuristicScore,
+            1 - vector.degradationRisk,
+            vector.estimatedSuccessRate,
+            vector.dnsAvailability,
+            vector.dohAvailability,
+            vector.tcpEndpointReachability,
+            vector.vpnEndpointReachability,
+            vector.exitIPConsistency,
+            1 - min(vector.recentLatencyMilliseconds / 1_200, 1),
+            1 - min(vector.recentHandshakeMilliseconds / 2_500, 1),
+            1 - vector.recentPacketLoss,
+            1 - vector.recentFailurePressure
+        ]
+
+        for (index, value) in values.enumerated() {
+            array[index] = NSNumber(value: min(max(value, 0), 1))
+        }
+
+        return array
+    }
+
+    private func numericOutput(named name: String, from output: MLFeatureProvider) -> Double? {
+        guard let value = output.featureValue(for: name) else {
+            return nil
+        }
+
+        switch value.type {
+        case .double:
+            return value.doubleValue
+        case .int64:
+            return Double(value.int64Value)
+        case .multiArray:
+            guard let first = value.multiArrayValue?[0] else {
+                return nil
+            }
+            return first.doubleValue
+        default:
+            return nil
+        }
+    }
+
+    private func actionHint(from output: MLFeatureProvider) -> CoreMLRecommendedActionHint? {
+        guard let value = output.featureValue(for: "recommendedActionHint")
+                ?? output.featureValue(for: "recommendedAction") else {
+            return nil
+        }
+
+        if value.type == .string {
+            return CoreMLRecommendedActionHint(rawValue: value.stringValue)
+        }
+
+        if value.type == .int64 {
+            switch value.int64Value {
+            case 1:
+                return .reconnect
+            case 2:
+                return .switchServer
+            case 3:
+                return .quarantine
+            case 4:
+                return .askUser
+            default:
+                return .keepCurrent
+            }
+        }
+
+        return nil
     }
     #endif
-
-    private func confidence(for serverID: String, historyStore: ServerQualityHistoryStore) -> Double {
-        min(0.35 + Double(historyStore.samples(for: serverID).suffix(12).count) / 12 * 0.55, 0.9)
-    }
-
-    private func approximateHealthScore(
-        latencyMilliseconds: Double,
-        packetLoss: Double,
-        recentFailures: Double
-    ) -> Double {
-        let latencyScore = max(0, min(1, 1 - latencyMilliseconds / 3_000))
-        let lossScore = max(0, min(1, 1 - packetLoss))
-        let failureScore = max(0, min(1, 1 - recentFailures / 4))
-        return min(max(latencyScore * 0.35 + lossScore * 0.35 + failureScore * 0.3, 0), 1)
-    }
 
     private func average(_ values: [Double]) -> Double? {
         guard !values.isEmpty else {
@@ -730,7 +1260,7 @@ public struct SmartServerSelector {
     private let historyStore: ServerQualityHistoryStore
 
     public init(
-        scorer: ServerScoring = HeuristicServerScorer(),
+        scorer: ServerScoring = CoreMLServerScorer(),
         historyStore: ServerQualityHistoryStore = InMemoryServerQualityHistoryStore()
     ) {
         self.scorer = scorer
@@ -758,9 +1288,10 @@ public struct SmartServerSelector {
 
     public func rankedServers(
         context: ServerSelectionContext,
-        servers: [SmartVPNServer]
+        servers: [SmartVPNServer],
+        probeHistory: [ConnectivityProbeResult] = []
     ) -> [RankedServer] {
-        scorer.rank(servers: servers, context: context, historyStore: historyStore)
+        scorer.rank(servers: servers, context: context, historyStore: historyStore, probeHistory: probeHistory)
     }
 
     private func hardRule(
@@ -788,7 +1319,7 @@ public struct SmartServerSelector {
         source: String
     ) -> RouteDecision {
         let regionalServers = servers.filter { $0.region == region }
-        let ranked = scorer.rank(servers: regionalServers, context: context, historyStore: historyStore)
+        let ranked = scorer.rank(servers: regionalServers, context: context, historyStore: historyStore, probeHistory: [])
 
         guard let selected = ranked.first else {
             return RouteDecision(action: .ask(reason: "no-healthy-server-for-\(region.rawValue)"), source: source)
@@ -805,7 +1336,7 @@ public struct SmartServerSelector {
         context: ServerSelectionContext,
         servers: [SmartVPNServer]
     ) -> RouteDecision {
-        let ranked = scorer.rank(servers: servers, context: context, historyStore: historyStore)
+        let ranked = scorer.rank(servers: servers, context: context, historyStore: historyStore, probeHistory: [])
 
         guard let selected = ranked.first else {
             return RouteDecision(action: .ask(reason: "no-healthy-vpn-server"), source: "fastest-vpn-fallback")
@@ -853,7 +1384,7 @@ public struct PreventiveVPNHealthMonitor {
             for: reliabilityAnalyzer.filteredCurrentProbes(vpnProbes, using: probeHistory),
             vpnIsConnected: vpnIsConnected
         )
-        let ranked = selector.rankedServers(context: context, servers: servers)
+        let ranked = selector.rankedServers(context: context, servers: servers, probeHistory: probeHistory)
         let action = recoveryAction(
             directReport: directReport,
             vpnReport: vpnReport,

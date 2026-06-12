@@ -148,6 +148,157 @@ final class SmartServerSelectionTests: XCTestCase {
         XCTAssertTrue(ranked.first?.reason.contains("latency=") ?? false)
     }
 
+    func testCoreMLScorerUsesBundledModelWhenAvailable() throws {
+        #if canImport(CoreML)
+        let modelURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Resources/CoreML/RealAiVPNChannelScorer.mlmodel")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: modelURL.path))
+
+        let selector = SmartServerSelector(scorer: CoreMLServerScorer(modelURL: modelURL))
+        for offset in 0..<8 {
+            let timestamp = Date(timeIntervalSince1970: 1_800_000_000 + TimeInterval(offset))
+            selector.record(.sample(serverID: "il-1", region: "IL", latency: 650, handshake: 900, loss: 0.16, failures: 3, timestamp: timestamp))
+            selector.record(.sample(serverID: "de-1", region: "DE", latency: 45, handshake: 90, loss: 0, timestamp: timestamp))
+        }
+
+        let ranked = selector.rankedServers(
+            context: .ruInRussia,
+            servers: [.israelFast, .germanySlow]
+        )
+
+        XCTAssertEqual(ranked.first?.server.id, "de-1")
+        XCTAssertTrue(ranked.first?.reason.contains("coreml-score=") ?? false)
+        #endif
+    }
+
+    func testFeatureExtractorUsesOnlyTwentyOneDayHistoryWindow() {
+        let extractor = CoreMLServerFeatureExtractor()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let samples = [
+            ServerQualitySample.sample(
+                serverID: "de-1",
+                region: "DE",
+                latency: 30,
+                handshake: 80,
+                loss: 0,
+                timestamp: now.addingTimeInterval(-2 * 24 * 60 * 60)
+            ),
+            ServerQualitySample.sample(
+                serverID: "de-1",
+                region: "DE",
+                latency: 2_500,
+                handshake: 2_500,
+                loss: 0.4,
+                failures: 4,
+                timestamp: now.addingTimeInterval(-30 * 24 * 60 * 60)
+            )
+        ]
+
+        let vector = extractor.vector(
+            for: .germanySlow,
+            context: .ruInRussia,
+            samples: samples,
+            probeHistory: [],
+            now: now
+        )
+        let trimmed = extractor.trimToHistoryWindow(samples, now: now)
+
+        XCTAssertEqual(vector.sampleCount21d, 1)
+        XCTAssertEqual(trimmed.count, 1)
+        XCTAssertEqual(Int(vector.longTermLatencyMilliseconds), 30)
+    }
+
+    func testDailyReportUsesOnlyTodaySamplesAndProbeHistory() {
+        let builder = VPNChannelDailyReportBuilder()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let calendar = Calendar(identifier: .gregorian)
+        let dayStart = calendar.startOfDay(for: now)
+        let samples = [
+            ServerQualitySample.sample(
+                serverID: "de-1",
+                region: "DE",
+                latency: 50,
+                handshake: 90,
+                loss: 0,
+                timestamp: dayStart.addingTimeInterval(3_600)
+            ),
+            ServerQualitySample.sample(
+                serverID: "de-1",
+                region: "DE",
+                latency: 900,
+                handshake: 1_000,
+                loss: 1,
+                failures: 2,
+                timestamp: dayStart.addingTimeInterval(-300)
+            )
+        ]
+        let probes = [
+            ConnectivityProbeResult.probe(
+                targetID: "exit-ip",
+                targetKind: .vpnProtectedEndpoint,
+                serverID: "de-1",
+                method: .httpHead,
+                succeeded: false,
+                timestamp: dayStart.addingTimeInterval(3_900)
+            )
+        ]
+
+        let report = builder.reports(
+            for: [.germanySlow],
+            context: .ruInRussia,
+            samples: samples,
+            probeHistory: probes,
+            rankedServers: [RankedServer(server: .germanySlow, score: 0.72, confidence: 0.8, reason: "test")],
+            date: now,
+            calendar: calendar
+        )[0]
+
+        XCTAssertEqual(report.sampleCount, 1)
+        XCTAssertEqual(report.probeCount, 1)
+        XCTAssertEqual(report.failureCount, 1)
+        XCTAssertEqual(Int(report.averageLatencyMilliseconds ?? 0), 50)
+        XCTAssertEqual(report.channelScore, 0.72)
+        XCTAssertTrue(report.summaryText.contains("Germany 1"))
+    }
+
+    func testProbeHistoryInfluencesFallbackRankingWithoutBypassingQuarantine() {
+        let selector = SmartServerSelector()
+        selector.record(.sample(serverID: "il-1", region: "IL", latency: 60, handshake: 90, loss: 0))
+        selector.record(.sample(serverID: "de-1", region: "DE", latency: 60, handshake: 90, loss: 0))
+        let monitor = PreventiveVPNHealthMonitor(selector: selector)
+        let poorGermanProbes = [
+            ConnectivityProbeResult.probe(
+                targetID: "vpn-tcp",
+                targetKind: .vpnServer,
+                serverID: "de-1",
+                method: .tcpConnect,
+                succeeded: false
+            ),
+            ConnectivityProbeResult.probe(
+                targetID: "exit-ip",
+                targetKind: .vpnProtectedEndpoint,
+                serverID: "de-1",
+                method: .httpHead,
+                succeeded: false
+            )
+        ]
+
+        let assessment = monitor.assess(
+            probes: .healthyDirect + .downVPN(serverID: "il-1"),
+            activeServerID: "il-1",
+            context: .ruInRussia,
+            servers: [.israelFast, .germanySlow],
+            probeHistory: poorGermanProbes,
+            quarantinedServerIDs: ["de-1"]
+        )
+
+        XCTAssertEqual(assessment.rankedServers.first?.server.id, "il-1")
+        XCTAssertEqual(
+            assessment.recommendedAction,
+            .reconnect(serverID: "il-1", reason: "vpn-path-down-no-better-candidate")
+        )
+    }
+
     func testPreventiveMonitorKeepsHealthyVPN() {
         let monitor = PreventiveVPNHealthMonitor()
         let assessment = monitor.assess(
@@ -458,7 +609,8 @@ private extension ServerQualitySample {
         latency: Double,
         handshake: Double,
         loss: Double,
-        failures: Int = 0
+        failures: Int = 0,
+        timestamp: Date = Date(timeIntervalSince1970: 1_800_000_000)
     ) -> ServerQualitySample {
         ServerQualitySample(
             serverID: serverID,
@@ -469,7 +621,7 @@ private extension ServerQualitySample {
             packetLoss: loss,
             handshakeMilliseconds: handshake,
             recentFailureCount: failures,
-            timestamp: Date(timeIntervalSince1970: 1_800_000_000)
+            timestamp: timestamp
         )
     }
 }
@@ -536,7 +688,8 @@ private extension ConnectivityProbeResult {
         method: ProbeMethod,
         succeeded: Bool,
         latency: Double? = nil,
-        loss: Double = 0
+        loss: Double = 0,
+        timestamp: Date = Date(timeIntervalSince1970: 1_800_000_000)
     ) -> ConnectivityProbeResult {
         ConnectivityProbeResult(
             targetID: targetID,
@@ -546,7 +699,7 @@ private extension ConnectivityProbeResult {
             succeeded: succeeded,
             latencyMilliseconds: latency,
             packetLoss: loss,
-            timestamp: Date(timeIntervalSince1970: 1_800_000_000)
+            timestamp: timestamp
         )
     }
 }

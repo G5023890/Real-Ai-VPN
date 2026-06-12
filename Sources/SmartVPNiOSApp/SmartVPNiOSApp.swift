@@ -97,6 +97,23 @@ private enum ConnectivityProbeRunner {
         }
     }
 
+    static func httpGet(url: URL, headers: [String: String] = [:], timeout: TimeInterval = 5) async -> (succeeded: Bool, latency: Double?) {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = timeout
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        headers.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+        let start = Date()
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            return ((200..<400).contains(statusCode), Date().timeIntervalSince(start) * 1_000)
+        } catch {
+            return (false, nil)
+        }
+    }
+
     static func fetchText(url: URL, timeout: TimeInterval = 5) async -> String? {
         var request = URLRequest(url: url)
         request.timeoutInterval = timeout
@@ -155,13 +172,38 @@ struct iOSVPNChannelStatistics: Identifiable {
     var lastSeen: Date?
     var reliabilitySummary: ProbeReliabilitySummary?
     var ranking: RankedServer?
+    var dailyReport: VPNChannelDailyReport?
     var isActive: Bool
     var isConnected: Bool
+
+    var coreMLScore: Double {
+        dailyReport?.channelScore ?? ranking?.score ?? successRate
+    }
+
+    var coreMLRisk: Double? {
+        dailyReport?.degradationRisk
+    }
+
+    var coreMLConfidence: Double {
+        dailyReport?.confidence ?? ranking?.confidence ?? 0
+    }
+
+    var coreMLAction: CoreMLRecommendedActionHint? {
+        dailyReport?.recommendedActionHint
+    }
+
+    var coreMLSummary: String {
+        dailyReport?.summaryText ?? ranking?.reason ?? "CoreML is waiting for more channel data."
+    }
+
+    var coreMLEvidenceCount: Int {
+        (dailyReport?.sampleCount ?? sampleCount) + (dailyReport?.probeCount ?? 0)
+    }
 }
 
 private struct LocalProfileQualityHistoryStore {
     private let key = "ios.profileQualityHistory.v1"
-    private let maxSamples = 240
+    private let featureExtractor = CoreMLServerFeatureExtractor()
 
     func load() -> [ServerQualitySample] {
         guard let data = UserDefaults.standard.data(forKey: key),
@@ -169,11 +211,11 @@ private struct LocalProfileQualityHistoryStore {
             return []
         }
 
-        return Array(history.samples.suffix(maxSamples))
+        return featureExtractor.trimToHistoryWindow(history.samples)
     }
 
     func save(_ samples: [ServerQualitySample]) {
-        let history = StoredProfileQualityHistory(samples: Array(samples.suffix(maxSamples)))
+        let history = StoredProfileQualityHistory(samples: featureExtractor.trimToHistoryWindow(samples))
         guard let data = try? JSONEncoder().encode(history) else {
             return
         }
@@ -419,8 +461,29 @@ final class iOSDashboardModel: ObservableObject {
         return "Best check: \(best.targetID) · \(Int((best.reliabilityScore * 100).rounded()))% reliable."
     }
 
+    var context: ServerSelectionContext {
+        ServerSelectionContext(
+            currentRegion: RegionCode("RU"),
+            homeRegion: RegionCode("IL"),
+            networkKind: .wifi,
+            providerASN: nil,
+            hourOfDay: Calendar.current.component(.hour, from: Date()),
+            previousServerID: activeProfileID
+        )
+    }
+
     var channelStatistics: [iOSVPNChannelStatistics] {
-        effectiveServers.map { server in
+        let dailyReportsByServerID = VPNChannelDailyReportBuilder().reports(
+            for: effectiveServers,
+            context: context,
+            samples: qualitySamples,
+            probeHistory: probeReliabilitySamples,
+            rankedServers: rankedServers
+        ).reduce(into: [String: VPNChannelDailyReport]()) { reports, report in
+            reports[report.serverID] = report
+        }
+
+        return effectiveServers.map { server in
             let samples = qualitySamples
                 .filter { $0.serverID == server.id }
                 .sorted { $0.timestamp < $1.timestamp }
@@ -449,6 +512,7 @@ final class iOSDashboardModel: ObservableObject {
                 lastSeen: recentSamples.last?.timestamp ?? reliability?.lastSeen,
                 reliabilitySummary: reliability,
                 ranking: ranking,
+                dailyReport: dailyReportsByServerID[server.id],
                 isActive: server.id == activeID,
                 isConnected: vpnStatus.isConnectedOrConnecting && server.id == connectedID
             )
@@ -979,14 +1043,6 @@ final class iOSDashboardModel: ObservableObject {
 
     private func refreshRoutePreview() {
         let servers = effectiveServers
-        let context = ServerSelectionContext(
-            currentRegion: RegionCode("RU"),
-            homeRegion: RegionCode("IL"),
-            networkKind: .wifi,
-            providerASN: nil,
-            hourOfDay: Calendar.current.component(.hour, from: Date()),
-            previousServerID: activeProfileID
-        )
         let decision = selector.decideRoute(
             destinationRegion: .foreign,
             context: context,
@@ -1209,7 +1265,7 @@ final class iOSDashboardModel: ObservableObject {
     private func recordQualitySample(_ sample: ServerQualitySample) {
         selector.record(sample)
         qualitySamples.append(sample)
-        qualitySamples = Array(qualitySamples.suffix(240))
+        qualitySamples = CoreMLServerFeatureExtractor().trimToHistoryWindow(qualitySamples)
         qualityHistoryStore.save(qualitySamples)
     }
 
@@ -1316,10 +1372,15 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     private func directProviderProbes() async -> [ConnectivityProbeResult] {
+        let regional = [
+            ("ru-ya", ProbeTargetKind.directEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://ya.ru")!) }),
+            ("ru-mos", ProbeTargetKind.directEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.mos.ru")!) }),
+            ("ru-rbc", ProbeTargetKind.directEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.rbc.ru")!) }),
+            ("ru-gosuslugi", ProbeTargetKind.directEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.gosuslugi.ru")!) })
+        ]
         let targets: [(String, ProbeTargetKind, ProbeMethod, () async -> (succeeded: Bool, latency: Double?))] = [
-            ("ru-ya", .directEndpoint, .httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://ya.ru")!) }),
-            ("ru-mos", .directEndpoint, .httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.mos.ru")!) }),
-            ("provider-dns-tcp", .dnsResolver, .tcpConnect, { await ConnectivityProbeRunner.tcpConnect(host: "77.88.8.8", port: 53, timeout: 3) })
+            regional.randomElement()!,
+            ("provider-yandex-dns-tcp", .dnsResolver, .tcpConnect, { await ConnectivityProbeRunner.tcpConnect(host: "77.88.8.8", port: 53, timeout: 3) })
         ]
 
         var probes: [ConnectivityProbeResult] = []
@@ -1339,20 +1400,51 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     private func vpnProtectedProbes(serverID: String) async -> [ConnectivityProbeResult] {
-        let targets: [(String, ProbeMethod, () async -> (succeeded: Bool, latency: Double?))] = [
-            ("foreign-gstatic-204", .httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.gstatic.com/generate_204")!) }),
-            ("foreign-cloudflare-204", .httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://cp.cloudflare.com/generate_204")!) }),
-            ("foreign-cloudflare-tcp", .tcpConnect, { await ConnectivityProbeRunner.tcpConnect(host: "1.1.1.1", port: 443, timeout: 3) })
+        let lightweight = [
+            ("infra-cloudflare-trace", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpGet, { await ConnectivityProbeRunner.httpGet(url: URL(string: "https://www.cloudflare.com/cdn-cgi/trace")!) }),
+            ("infra-oneoneoneone-trace", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpGet, { await ConnectivityProbeRunner.httpGet(url: URL(string: "https://1.1.1.1/cdn-cgi/trace")!) }),
+            ("infra-example", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://example.com")!) }),
+            ("infra-iana", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.iana.org")!) })
+        ]
+        let publicWeb = [
+            ("public-wikipedia", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.wikipedia.org")!) }),
+            ("public-bing", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.bing.com")!) }),
+            ("public-duckduckgo", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://duckduckgo.com")!) }),
+            ("public-mozilla", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.mozilla.org")!) }),
+            ("public-debian", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.debian.org")!) }),
+            ("public-kernel", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.kernel.org")!) })
+        ]
+        let regional = [
+            ("regional-ya", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://ya.ru")!) }),
+            ("regional-mos", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.mos.ru")!) }),
+            ("regional-rbc", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.rbc.ru")!) }),
+            ("regional-gosuslugi", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpHead, { await ConnectivityProbeRunner.httpHead(url: URL(string: "https://www.gosuslugi.ru")!) })
+        ]
+        let tcp = [
+            ("tcp-cloudflare-443", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.tcpConnect, { await ConnectivityProbeRunner.tcpConnect(host: "1.1.1.1", port: 443, timeout: 3) }),
+            ("tcp-quad9-443", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.tcpConnect, { await ConnectivityProbeRunner.tcpConnect(host: "9.9.9.9", port: 443, timeout: 3) }),
+            ("tcp-opendns-443", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.tcpConnect, { await ConnectivityProbeRunner.tcpConnect(host: "208.67.222.222", port: 443, timeout: 3) })
+        ]
+        let doh = [
+            ("doh-cloudflare-ya", ProbeTargetKind.dnsResolver, ProbeMethod.dnsQuery, { await ConnectivityProbeRunner.httpGet(url: URL(string: "https://cloudflare-dns.com/dns-query?name=ya.ru&type=A")!, headers: ["Accept": "application/dns-json"]) }),
+            ("doh-quad9-ya", ProbeTargetKind.dnsResolver, ProbeMethod.dnsQuery, { await ConnectivityProbeRunner.httpGet(url: URL(string: "https://dns.quad9.net/dns-query?name=ya.ru&type=A")!, headers: ["Accept": "application/dns-json"]) })
+        ]
+        let targets: [(String, ProbeTargetKind, ProbeMethod, () async -> (succeeded: Bool, latency: Double?))] = [
+            lightweight.randomElement()!,
+            publicWeb.randomElement()!,
+            regional.randomElement()!,
+            tcp.randomElement()!,
+            doh.randomElement()!
         ]
 
         var probes: [ConnectivityProbeResult] = []
         for target in targets {
-            let result = await target.2()
+            let result = await target.3()
             probes.append(ConnectivityProbeResult(
                 targetID: target.0,
-                targetKind: .vpnProtectedEndpoint,
+                targetKind: target.1,
                 serverID: serverID,
-                method: target.1,
+                method: target.2,
                 succeeded: result.succeeded,
                 latencyMilliseconds: result.latency,
                 packetLoss: result.succeeded ? 0 : 1
@@ -2153,6 +2245,7 @@ private struct iOSRouteScreen: View {
 
 private struct iOSStatisticsScreen: View {
     @ObservedObject var model: iOSDashboardModel
+    @State private var expandedStandbyChannelID: String?
 
     var body: some View {
         GeometryReader { geometry in
@@ -2160,6 +2253,7 @@ private struct iOSStatisticsScreen: View {
                 VStack(alignment: .leading, spacing: 22) {
                     topStatus
                     liveHealthCard
+                    todayReportCard
                     channelsCard
                 }
                 .frame(width: max(0, geometry.size.width - 32), alignment: .leading)
@@ -2242,25 +2336,59 @@ private struct iOSStatisticsScreen: View {
         .shadow(color: AppTheme.shadow, radius: 18, x: 0, y: 10)
     }
 
+    private var todayReportCard: some View {
+        let reports = model.channelStatistics.compactMap(\.dailyReport)
+        let best = reports.max { $0.channelScore < $1.channelScore }
+        let averageScore = reports.isEmpty ? 0 : reports.reduce(0) { $0 + $1.channelScore } / Double(reports.count)
+        let averageRisk = reports.isEmpty ? 0 : reports.reduce(0) { $0 + $1.degradationRisk } / Double(reports.count)
+        let failures = reports.reduce(0) { $0 + $1.failureCount }
+        let samples = reports.reduce(0) { $0 + $1.sampleCount + $1.probeCount }
+
+        return VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 12) {
+                Image(systemName: "calendar.badge.clock")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
+                Text("Today Report")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(AppTheme.secondaryText)
+                Spacer()
+                Text("\(samples)")
+                    .font(.system(size: 18, weight: .bold, design: .rounded))
+                    .foregroundStyle(AppTheme.primaryText)
+                    .lineLimit(1)
+            }
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 74), spacing: 10), count: 2), spacing: 10) {
+                todayMetric("Score", "\(Int((averageScore * 100).rounded()))", color: AppTheme.accent)
+                todayMetric("Risk", formatPercent(averageRisk), color: riskColor(averageRisk))
+                todayMetric("Failures", "\(failures)", color: failures == 0 ? AppTheme.success : AppTheme.warning)
+                todayMetric("Best", best?.region.rawValue ?? "--", color: AppTheme.primaryText)
+            }
+
+            Text(best?.summaryText ?? "No VPN channel data has been collected today.")
+                .font(.system(size: 15, weight: .bold))
+                .foregroundStyle(AppTheme.secondaryText)
+                .lineLimit(3)
+                .minimumScaleFactor(0.72)
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+        .shadow(color: AppTheme.shadow, radius: 18, x: 0, y: 10)
+    }
+
     private var channelsCard: some View {
         VStack(alignment: .leading, spacing: 20) {
             HStack(spacing: 12) {
                 Image(systemName: "chart.line.uptrend.xyaxis")
                     .font(.system(size: 25, weight: .semibold))
                     .foregroundStyle(AppTheme.secondaryText)
-                Text("Channels")
+                Text("CoreML Channels")
                     .font(.system(size: 24, weight: .bold))
                     .foregroundStyle(AppTheme.secondaryText)
                 Spacer()
-                Button {} label: {
-                    Image(systemName: "slider.horizontal.3")
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .frame(width: 50, height: 50)
-                        .background(AppTheme.floatingButton, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
-                }
-                .buttonStyle(.plain)
             }
 
             if model.channelStatistics.isEmpty {
@@ -2270,11 +2398,17 @@ private struct iOSStatisticsScreen: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 8)
             } else {
-                VStack(spacing: 18) {
-                    ForEach(model.channelStatistics) { channel in
-                        channelRow(channel)
-                    }
+                if let currentChannel {
+                    currentCoreMLProfileCard(currentChannel)
+                } else {
+                    Text("Select or connect a VPN profile to see the current CoreML channel report.")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 8)
                 }
+
+                standbyRankingList
             }
         }
         .padding(18)
@@ -2282,6 +2416,162 @@ private struct iOSStatisticsScreen: View {
         .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
         .shadow(color: AppTheme.shadow, radius: 18, x: 0, y: 10)
+    }
+
+    private var currentChannel: iOSVPNChannelStatistics? {
+        model.channelStatistics.first(where: \.isConnected)
+            ?? model.channelStatistics.first(where: \.isActive)
+    }
+
+    private var standbyChannels: [iOSVPNChannelStatistics] {
+        let currentID = currentChannel?.id
+        return model.channelStatistics
+            .filter { $0.id != currentID }
+            .sorted { lhs, rhs in
+                if lhs.coreMLScore == rhs.coreMLScore {
+                    return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+                }
+                return lhs.coreMLScore > rhs.coreMLScore
+            }
+    }
+
+    private func currentCoreMLProfileCard(_ channel: iOSVPNChannelStatistics) -> some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 14) {
+                Image(systemName: channel.isConnected ? "checkmark.shield.fill" : "scope")
+                    .font(.system(size: 25, weight: .semibold))
+                    .foregroundStyle(channel.isConnected ? AppTheme.success : AppTheme.accent)
+                    .frame(width: 48, height: 48)
+                    .background(AppTheme.card.opacity(0.68), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("CoreML Current Profile")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                    Text(channel.displayName)
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(AppTheme.primaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.62)
+                    Text(channel.coreMLSummary)
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .lineLimit(3)
+                        .minimumScaleFactor(0.72)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(alignment: .trailing, spacing: 1) {
+                    Text(scoreText(channel))
+                        .font(.system(size: 34, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppTheme.accent)
+                        .lineLimit(1)
+                    Text("score")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
+                .frame(width: 58, alignment: .trailing)
+            }
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 72), spacing: 10), count: 3), spacing: 10) {
+                channelMetric("Risk", channel.coreMLRisk.map { formatPercent($0) } ?? "--")
+                channelMetric("Confidence", formatPercent(channel.coreMLConfidence))
+                channelMetric("Action", channel.coreMLAction.map { actionLabel($0) } ?? "--")
+                channelMetric("Success", formatPercent(channel.successRate))
+                channelMetric("Latency", formatLatency(channel.averageLatencyMilliseconds))
+                channelMetric("Handshake", formatLatency(channel.averageHandshakeMilliseconds))
+                channelMetric("Loss", formatPercent(channel.averagePacketLoss))
+                channelMetric("Failures", "\(channel.failureCount)")
+                channelMetric("Checks", "\(channel.coreMLEvidenceCount)")
+                channelMetric("Last", relativeTime(channel.lastSeen))
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity)
+        .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+    }
+
+    private var standbyRankingList: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Standby Ranking")
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(AppTheme.primaryText)
+                Spacer()
+                Text("\(standbyChannels.count)")
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                    .foregroundStyle(AppTheme.secondaryText)
+            }
+
+            if standbyChannels.isEmpty {
+                Text("No standby channels available.")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 8)
+            } else {
+                VStack(spacing: 12) {
+                    ForEach(standbyChannels) { channel in
+                        standbyRankingRow(channel)
+                    }
+                }
+            }
+        }
+    }
+
+    private func standbyRankingRow(_ channel: iOSVPNChannelStatistics) -> some View {
+        let isExpanded = expandedStandbyChannelID == channel.id
+
+        return VStack(alignment: .leading, spacing: 14) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    expandedStandbyChannelID = isExpanded ? nil : channel.id
+                }
+            } label: {
+                HStack(spacing: 12) {
+                    Text(channel.displayName)
+                        .font(.system(size: 17, weight: .bold))
+                        .foregroundStyle(AppTheme.primaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.62)
+                    Spacer(minLength: 8)
+                    Text(scoreText(channel))
+                        .font(.system(size: 24, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppTheme.accent)
+                        .frame(width: 48, alignment: .trailing)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                        .frame(width: 18)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 72), spacing: 10), count: 3), spacing: 10) {
+                    channelMetric("Risk", channel.coreMLRisk.map { formatPercent($0) } ?? "--")
+                    channelMetric("Confidence", formatPercent(channel.coreMLConfidence))
+                    channelMetric("Action", channel.coreMLAction.map { actionLabel($0) } ?? "--")
+                    channelMetric("Latency", formatLatency(channel.averageLatencyMilliseconds))
+                    channelMetric("Success", formatPercent(channel.successRate))
+                    channelMetric("Checks", "\(channel.coreMLEvidenceCount)")
+                    channelMetric("Last", relativeTime(channel.lastSeen))
+                }
+
+                Text(channel.coreMLSummary)
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(3)
+                    .minimumScaleFactor(0.72)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity)
+        .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
     }
 
     private func healthTile(title: String, report: PathHealthReport, seed: Double) -> some View {
@@ -2354,7 +2644,9 @@ private struct iOSStatisticsScreen: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 VStack(alignment: .trailing, spacing: 1) {
-                    Text(channel.ranking.map { "\(Int(($0.score * 100).rounded()))" } ?? "--")
+                    Text(channel.dailyReport.map { "\(Int(($0.channelScore * 100).rounded()))" }
+                        ?? channel.ranking.map { "\(Int(($0.score * 100).rounded()))" }
+                        ?? "--")
                         .font(.system(size: 27, weight: .bold, design: .rounded))
                         .foregroundStyle(AppTheme.accent)
                         .lineLimit(1)
@@ -2379,11 +2671,35 @@ private struct iOSStatisticsScreen: View {
                 channelMetric("Handshake", formatLatency(channel.averageHandshakeMilliseconds))
                 channelMetric("Failures", "\(channel.failureCount)")
                 channelMetric("Last", relativeTime(channel.lastSeen))
+                channelMetric("Risk", channel.dailyReport.map { formatPercent($0.degradationRisk) } ?? "--")
+                channelMetric("Action", channel.dailyReport.map { actionLabel($0.recommendedActionHint) } ?? "--")
             }
         }
         .padding(16)
         .frame(maxWidth: .infinity)
         .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    }
+
+    private func scoreText(_ channel: iOSVPNChannelStatistics) -> String {
+        "\(Int((channel.coreMLScore * 100).rounded()))"
+    }
+
+    private func todayMetric(_ title: String, _ value: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(AppTheme.secondaryText)
+                .lineLimit(1)
+            Text(value)
+                .font(.system(size: 22, weight: .bold, design: .rounded))
+                .foregroundStyle(color)
+                .lineLimit(1)
+                .minimumScaleFactor(0.68)
+        }
+        .frame(maxWidth: .infinity, minHeight: 68, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
     private func channelBadge(_ title: String, color: Color) -> some View {
@@ -2425,6 +2741,31 @@ private struct iOSStatisticsScreen: View {
 
     private func formatPercent(_ value: Double) -> String {
         "\(Int((value * 100).rounded()))%"
+    }
+
+    private func actionLabel(_ action: CoreMLRecommendedActionHint) -> String {
+        switch action {
+        case .keepCurrent:
+            return "Keep"
+        case .reconnect:
+            return "Reconnect"
+        case .switchServer:
+            return "Switch"
+        case .quarantine:
+            return "Quarantine"
+        case .askUser:
+            return "Ask"
+        }
+    }
+
+    private func riskColor(_ risk: Double) -> Color {
+        if risk >= 0.55 {
+            return .red
+        }
+        if risk >= 0.35 {
+            return AppTheme.warning
+        }
+        return AppTheme.success
     }
 
     private func relativeTime(_ date: Date?) -> String {

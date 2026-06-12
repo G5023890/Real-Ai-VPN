@@ -44,6 +44,7 @@ let package = Package(
                 "SmartServerSelection"
             ],
             resources: [
+                .copy("../../Resources/CoreML"),
                 .copy("../../Resources/MenuBarIcons")
             ]
         ),

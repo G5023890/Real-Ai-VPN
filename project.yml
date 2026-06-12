@@ -235,6 +235,8 @@ targets:
         buildPhase: resources
       - path: Resources/MenuBarIcons
         buildPhase: resources
+      - path: Resources/CoreML
+        buildPhase: resources
     dependencies:
       - target: AmneziaConfig
       - target: SmartServerSelection
@@ -264,6 +266,8 @@ targets:
       - path: Resources/Assets.xcassets
         buildPhase: resources
       - path: Resources/Icons/IconApp.png
+        buildPhase: resources
+      - path: Resources/CoreML
         buildPhase: resources
     dependencies:
       - target: AmneziaConfigiOS
