@@ -160,8 +160,6 @@ targets:
       - target: AmneziaConfig
       - target: RealVPNCore
       - framework: third_party/sing-box/Libbox.xcframework
-        embed: true
-        codeSign: true
       - sdk: CoreText.framework
       - sdk: SystemConfiguration.framework
       - sdk: CoreServices.framework
@@ -199,8 +197,6 @@ targets:
       - target: AmneziaConfigiOS
       - target: RealVPNCoreiOS
       - framework: third_party/sing-box/Libbox.xcframework
-        embed: true
-        codeSign: true
       - sdk: CoreText.framework
       - sdk: UIKit.framework
       - sdk: SystemConfiguration.framework
