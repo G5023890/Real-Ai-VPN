@@ -399,10 +399,13 @@ public struct SingBoxConfigBuilder: Sendable {
                 "169.254.0.0/16",
                 "172.16.0.0/12",
                 "192.168.0.0/16",
+                "224.0.0.0/4",
+                "255.255.255.255/32",
                 "77.88.8.88/32",
                 "77.88.8.2/32",
                 "fc00::/7",
-                "fe80::/10"
+                "fe80::/10",
+                "ff00::/8"
             ] + routeOverrides.bypassVPNIPCIDRs,
             outbound: "direct"
         )

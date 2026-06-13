@@ -13,12 +13,15 @@ DIST_DIR="${DIST_DIR:-$PROJECT_DIR/dist}"
 APP_DIST_PATH="${APP_DIST_PATH:-$DIST_DIR/${APP_NAME}.app}"
 ENTITLEMENTS="${ENTITLEMENTS:-$PROJECT_DIR/Config/RealAiVPN.entitlements}"
 TEAM_ID="${TEAM_ID:-9FP39GTDT5}"
+XCODE_DEVELOPER_DIR="${XCODE_DEVELOPER_DIR:-/Applications/Xcode-beta.app/Contents/Developer}"
+XCODEBUILD_BIN="${XCODEBUILD_BIN:-$XCODE_DEVELOPER_DIR/usr/bin/xcodebuild}"
+MACOS_SDKROOT="${MACOS_SDKROOT:-$XCODE_DEVELOPER_DIR/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk}"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 SKIP_SIGN="${SKIP_SIGN:-0}"
 LAUNCH_AFTER_INSTALL="${LAUNCH_AFTER_INSTALL:-1}"
-APP_VERSION="${APP_VERSION:-0.93}"
+APP_VERSION="${APP_VERSION:-0.94}"
 BUILD_STAMP="${BUILD_STAMP:-$(date '+%H%M%S%d%m%Y')}"
-BUILD_DISPLAY_STAMP="${BUILD_DISPLAY_STAMP:-$(date '+%H%M:%d%m:%y')}"
+BUILD_DISPLAY_STAMP="${BUILD_DISPLAY_STAMP:-$(date '+%H%M.%d.%y')}"
 BUILD_LABEL="${BUILD_LABEL:-${APP_VERSION} (${BUILD_DISPLAY_STAMP})}"
 RESOLVED_SIGN_IDENTITY=""
 DERIVED_DATA_ROOT="${DERIVED_DATA_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/real-ai-vpn-derived.XXXXXX")}"
@@ -104,7 +107,7 @@ log "Building AmneziaWG userspace backend"
 make -C "$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo" \
   ARCHS=arm64 \
   PLATFORM_NAME=macosx \
-  SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+  SDKROOT="$MACOS_SDKROOT" \
   CONFIGURATION_BUILD_DIR="$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo/out" \
   CONFIGURATION_TEMP_DIR="$PROJECT_DIR/.build/amneziawg-go-tmp" \
   build version-header
@@ -116,7 +119,7 @@ log "Generating Xcode project"
 "$PROJECT_DIR/scripts/xcodegen_generate.sh"
 
 log "Building app bundle with embedded Packet Tunnel Extension"
-xcodebuild \
+"$XCODEBUILD_BIN" \
   -project RealAiVPN.xcodeproj \
   -scheme "$SCHEME" \
   -configuration "$CONFIGURATION" \

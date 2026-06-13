@@ -28,7 +28,7 @@ final class SingBoxTunnelRuntime {
         LibboxReinstallCrashSignalHandlers()
     }
 
-    func start(configJSON: String, killSwitchEnabled: Bool) async throws {
+    func start(configJSON: String, killSwitchEnabled: Bool, localNetworkAccessEnabled: Bool) async throws {
         saveDiagnostic(stage: "singbox-start", message: "Starting sing-box runtime.")
         NSLog("RealAiVPN SingBoxTunnelRuntime start entered configBytes=%ld", configJSON.utf8.count)
         guard let provider else {
@@ -62,7 +62,11 @@ final class SingBoxTunnelRuntime {
         saveDiagnostic(stage: "singbox-setup-ok", message: "Libbox setup completed.")
         NSLog("RealAiVPN SingBoxTunnelRuntime setup ok")
 
-        let platformInterface = SingBoxPlatformInterface(provider: provider, killSwitchEnabled: killSwitchEnabled)
+        let platformInterface = SingBoxPlatformInterface(
+            provider: provider,
+            killSwitchEnabled: killSwitchEnabled,
+            localNetworkAccessEnabled: localNetworkAccessEnabled
+        )
         var commandServerError: NSError?
         guard let commandServer = LibboxNewCommandServer(platformInterface, platformInterface, &commandServerError) else {
             singBoxLogger.error("sing-box command server could not be created: \(commandServerError?.localizedDescription ?? "unknown", privacy: .public)")
@@ -197,13 +201,15 @@ private enum SingBoxTunnelRuntimeError: LocalizedError, CustomNSError {
 private final class SingBoxPlatformInterface: NSObject, LibboxPlatformInterfaceProtocol, LibboxCommandServerHandlerProtocol {
     private weak var provider: NEPacketTunnelProvider?
     private let killSwitchEnabled: Bool
+    private let localNetworkAccessEnabled: Bool
     private var networkSettings: NEPacketTunnelNetworkSettings?
     private var nwMonitor: NWPathMonitor?
     private let diagnosticsStore = TunnelDiagnosticsStore()
 
-    init(provider: NEPacketTunnelProvider, killSwitchEnabled: Bool) {
+    init(provider: NEPacketTunnelProvider, killSwitchEnabled: Bool, localNetworkAccessEnabled: Bool) {
         self.provider = provider
         self.killSwitchEnabled = killSwitchEnabled
+        self.localNetworkAccessEnabled = localNetworkAccessEnabled
     }
 
     func openTun(_ options: LibboxTunOptionsProtocol?, ret0_: UnsafeMutablePointer<Int32>?) throws {
@@ -224,6 +230,10 @@ private final class SingBoxPlatformInterface: NSObject, LibboxPlatformInterfaceP
         if killSwitchEnabled {
             if #available(iOS 27.0, macOS 27.0, *) {
                 settings.includeAllNetworks = .any
+                settings.excludeLocalNetworks = localNetworkAccessEnabled ? .any : .none
+                settings.excludeAPNs = true
+                settings.excludeCellularServices = true
+                settings.excludeDeviceCommunication = true
                 settings.enforceRoutes = true
             }
         }
@@ -547,7 +557,7 @@ private final class BlockingResultBox<T>: @unchecked Sendable {
 final class SingBoxTunnelRuntime {
     init(provider _: NEPacketTunnelProvider) {}
 
-    func start(configJSON _: String, killSwitchEnabled _: Bool) async throws {
+    func start(configJSON _: String, killSwitchEnabled _: Bool, localNetworkAccessEnabled _: Bool) async throws {
         throw PacketTunnelProviderError.singBoxRuntimeMissing
     }
 

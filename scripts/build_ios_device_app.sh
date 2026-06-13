@@ -7,10 +7,13 @@ cd "$PROJECT_DIR"
 SCHEME="${SCHEME:-RealAiVPNiOS}"
 CONFIGURATION="${CONFIGURATION:-Debug}"
 TEAM_ID="${TEAM_ID:-9FP39GTDT5}"
+XCODE_DEVELOPER_DIR="${XCODE_DEVELOPER_DIR:-/Applications/Xcode-beta.app/Contents/Developer}"
+XCODEBUILD_BIN="${XCODEBUILD_BIN:-$XCODE_DEVELOPER_DIR/usr/bin/xcodebuild}"
+IPHONEOS_SDKROOT="${IPHONEOS_SDKROOT:-$XCODE_DEVELOPER_DIR/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk}"
 DERIVED_DATA_ROOT="${DERIVED_DATA_ROOT:-$PROJECT_DIR/.build/xcode-ios-device}"
-APP_VERSION="${APP_VERSION:-0.93}"
+APP_VERSION="${APP_VERSION:-0.94}"
 BUILD_STAMP="${BUILD_STAMP:-$(date '+%H%M%S%d%m%Y')}"
-BUILD_DISPLAY_STAMP="${BUILD_DISPLAY_STAMP:-$(date '+%H%M:%d%m:%y')}"
+BUILD_DISPLAY_STAMP="${BUILD_DISPLAY_STAMP:-$(date '+%H%M.%d.%y')}"
 BUILD_LABEL="${BUILD_LABEL:-${APP_VERSION} (${BUILD_DISPLAY_STAMP})}"
 TOP_LEVEL_GO_OUT="$PROJECT_DIR/Sources/WireGuardKitGo/out"
 IOS_GO_OUT="$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo/out-iphoneos"
@@ -41,7 +44,7 @@ log "Build label: $BUILD_LABEL"
 make -C "$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo" \
   ARCHS=arm64 \
   PLATFORM_NAME=iphoneos \
-  SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+  SDKROOT="$IPHONEOS_SDKROOT" \
   DEPLOYMENT_TARGET_CLANG_FLAG_NAME=miphoneos-version-min \
   DEPLOYMENT_TARGET_CLANG_ENV_NAME=IPHONEOS_DEPLOYMENT_TARGET \
   IPHONEOS_DEPLOYMENT_TARGET=17.0 \
@@ -59,7 +62,7 @@ log "Generating Xcode project"
 "$PROJECT_DIR/scripts/xcodegen_generate.sh"
 
 log "Building iOS app for a real device destination"
-xcodebuild \
+"$XCODEBUILD_BIN" \
   -project RealAiVPN.xcodeproj \
   -scheme "$SCHEME" \
   -configuration "$CONFIGURATION" \

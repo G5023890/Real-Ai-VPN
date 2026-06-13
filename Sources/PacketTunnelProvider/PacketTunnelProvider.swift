@@ -192,7 +192,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 ? "Config bytes: \(singBoxConfig.jsonString.utf8.count). Provider DNS lane: Yandex DNS."
                 : "Config bytes: \(singBoxConfig.jsonString.utf8.count). Profile DNS only."
         )
-        try await singBoxRuntime.start(configJSON: singBoxConfig.jsonString, killSwitchEnabled: killSwitchEnabled)
+        try await singBoxRuntime.start(
+            configJSON: singBoxConfig.jsonString,
+            killSwitchEnabled: killSwitchEnabled,
+            localNetworkAccessEnabled: localNetworkAccessEnabled
+        )
     }
 
     private func singBoxRouteOverrides(
@@ -434,17 +438,24 @@ private func localRouteExcludes(
         "100.64.0.0/10",
         "169.254.0.0/16",
         "172.16.0.0/12",
-        "192.168.0.0/16"
+        "192.168.0.0/16",
+        "224.0.0.0/4",
+        "255.255.255.255/32"
     ]
 
     guard !ipv6LeakProtectionEnabled else {
-        return ipv4LocalRanges
+        return ipv4LocalRanges + [
+            "::1/128",
+            "fe80::/10",
+            "ff00::/8"
+        ]
     }
 
     return ipv4LocalRanges + [
         "::1/128",
         "fc00::/7",
-        "fe80::/10"
+        "fe80::/10",
+        "ff00::/8"
     ]
 }
 

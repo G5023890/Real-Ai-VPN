@@ -604,8 +604,11 @@ final class DashboardModel: ObservableObject {
     private var dropRecoveryTask: Task<Void, Never>?
     private var dropRecoveryProfileID: String?
     private var dropRecoveryAttempt = 0
+    private var dropRecoveryAttemptCounts: [String: Int] = [:]
+    private var dropRecoveryConnectedAt: [String: Date] = [:]
     private let maxDropReconnectAttempts = 5
     private let dropReconnectDelaySeconds: UInt64 = 2
+    private let stableConnectionResetSeconds: TimeInterval = 60
 
     init() {
         let directReport = PathHealthReport(
@@ -1065,6 +1068,8 @@ final class DashboardModel: ObservableObject {
     private func cancelDropRecovery() {
         dropRecoveryTask?.cancel()
         clearDropRecoveryState()
+        dropRecoveryAttemptCounts.removeAll()
+        dropRecoveryConnectedAt.removeAll()
     }
 
     private func clearDropRecoveryState() {
@@ -1092,8 +1097,14 @@ final class DashboardModel: ObservableObject {
             clearDropRecoveryState()
         }
 
-        for attempt in 1...maxDropReconnectAttempts {
+        for _ in 1...maxDropReconnectAttempts {
             if Task.isCancelled {
+                return
+            }
+
+            guard let reservedAttempt = reserveDropRecoveryAttempt(for: profileID) else {
+                NSLog("RealAiVPN macOS dropRecovery exhausted profileID=%@", profileID)
+                await applyDropRecoveryFailover(failedProfileID: profileID, failedProfileName: profileName)
                 return
             }
 
@@ -1102,9 +1113,13 @@ final class DashboardModel: ObservableObject {
                 return
             }
 
-            dropRecoveryAttempt = attempt
+            dropRecoveryAttempt = reservedAttempt
+            NSLog("RealAiVPN macOS dropRecovery attempt=%ld/%ld profileID=%@",
+                  reservedAttempt,
+                  maxDropReconnectAttempts,
+                  profileID)
             activeConfigProfileID = profileID
-            monitorStatus = "Reconnecting \(profileName) after drop/reset (\(attempt)/\(maxDropReconnectAttempts))..."
+            monitorStatus = "Reconnecting \(profileName) after drop/reset (\(reservedAttempt)/\(maxDropReconnectAttempts))..."
             vpnErrorMessage = nil
             connectVPN()
 
@@ -1113,12 +1128,35 @@ final class DashboardModel: ObservableObject {
                 return
             }
 
-            if attempt < maxDropReconnectAttempts {
+            if reservedAttempt < maxDropReconnectAttempts {
                 try? await Task.sleep(for: .seconds(dropReconnectDelaySeconds))
             }
         }
 
         await applyDropRecoveryFailover(failedProfileID: profileID, failedProfileName: profileName)
+    }
+
+    private func reserveDropRecoveryAttempt(for profileID: String) -> Int? {
+        let usedAttempts = dropRecoveryAttemptCounts[profileID, default: 0]
+        guard usedAttempts < maxDropReconnectAttempts else {
+            return nil
+        }
+
+        let nextAttempt = usedAttempts + 1
+        dropRecoveryAttemptCounts[profileID] = nextAttempt
+        return nextAttempt
+    }
+
+    private func resetDropRecoveryAttemptsIfConnectionWasStable(profileID: String?, now: Date = Date()) {
+        guard let profileID,
+              let connectedAt = dropRecoveryConnectedAt[profileID] else {
+            return
+        }
+
+        dropRecoveryConnectedAt[profileID] = nil
+        if now.timeIntervalSince(connectedAt) >= stableConnectionResetSeconds {
+            dropRecoveryAttemptCounts[profileID] = nil
+        }
     }
 
     private func waitForDropRecoveryConnection(profileID: String, timeoutSeconds: Double = 10) async -> Bool {
@@ -1409,6 +1447,9 @@ final class DashboardModel: ObservableObject {
         if status == .connected {
             vpnErrorMessage = nil
             tunnelDiagnostic = nil
+            if let profileID = connectedConfigProfileID ?? displayedConfigProfile?.id ?? activeConfigProfile?.id {
+                dropRecoveryConnectedAt[profileID] = Date()
+            }
         }
 
         guard status == .disconnected else {
@@ -1425,6 +1466,7 @@ final class DashboardModel: ObservableObject {
         }
 
         if previousStatus == .connected || previousStatus == .reasserting {
+            resetDropRecoveryAttemptsIfConnectionWasStable(profileID: droppedProfileID)
             notifyTunnelDropped(profile: droppedProfile)
             reconnectAfterUnexpectedDrop(profileID: droppedProfileID, profileName: droppedProfile)
         }
@@ -1505,7 +1547,7 @@ final class DashboardModel: ObservableObject {
             dnsProtectionEnabled: dnsProtectionEnabled,
             localNetworkAccessEnabled: localNetworkAccessEnabled,
             ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled,
-            autoReconnectOnDemandEnabled: reconnectAfterDropEnabled
+            autoReconnectOnDemandEnabled: false
         )
     }
 

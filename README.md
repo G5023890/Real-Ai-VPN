@@ -1,6 +1,6 @@
 # Real Ai Router
 
-Current recovery point: `0.93`.
+Current recovery point: `0.94`.
 
 Real Ai Router is a SwiftUI VPN client for iOS and macOS. It imports AmneziaWG
 profiles, Shadowrocket VLESS Reality links/subscriptions, and runs them through
@@ -62,6 +62,11 @@ rules and heuristic scoring through the `SmartServerSelection` API.
 
 ## Current Restore Point
 
+- `restore-v0.94-airdrop-killswitch-dns`: recovery point for the V0.94
+  TestFlight candidate. It preserves bounded reconnect/failover behavior,
+  routes local Bonjour multicast/broadcast and IPv6 local discovery outside the
+  VPN, keeps Apple local/device communication out of Kill Switch full-route
+  enforcement, and uses the `0.94 (HHMM.DD.YY)` build label format.
 - `restore-0.93-recovery-killswitch`: recovery point after adding bounded
   dropped/reset reconnect attempts, forced fallback after five failures, manual
   Disconnect protection from On Demand auto-reconnect, Kill Switch enforcement
