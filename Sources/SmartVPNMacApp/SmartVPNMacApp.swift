@@ -3092,7 +3092,6 @@ private struct MacProfilesWorkspace: View {
 private struct MacStatisticsWorkspace: View {
     @ObservedObject var model: DashboardModel
     let theme: MacLiquidTheme
-    @State private var expandedStandbyChannelID: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -3370,64 +3369,6 @@ private struct MacStatisticsWorkspace: View {
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(theme.stroke, lineWidth: 1))
     }
 
-    private func channelStatisticsRow(_ channel: VPNChannelStatistics) -> some View {
-        HStack(spacing: 18) {
-            Image(systemName: "circle.grid.3x3.fill")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(theme.tertiaryText)
-                .frame(width: 18)
-
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 10) {
-                    Text(regionMarker(channel.regionCode))
-                        .font(.system(size: 12, weight: .bold, design: .rounded))
-                        .foregroundStyle(theme.primaryText)
-                        .frame(width: 28, height: 20)
-                        .background(theme.selectedFill, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    Text(channel.displayName)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(theme.primaryText)
-                        .lineLimit(1)
-                    if channel.isConnected {
-                        channelBadge("Connected", color: .green)
-                    } else if channel.isActive {
-                        channelBadge("Active", color: .teal)
-                    }
-                }
-                Text("\(channel.regionCode) · \(protocolLabel(channel.protocolKind)) · \(channel.sampleCount) samples")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(theme.secondaryText)
-                    .lineLimit(1)
-            }
-            .frame(minWidth: 230, maxWidth: 290, alignment: .leading)
-
-            channelMetric("Latency", formatLatency(channel.averageLatencyMilliseconds), sparkSeed: 0.18)
-            channelMetric("Loss", formatPercent(channel.averagePacketLoss), sparkSeed: 0.30)
-            channelMetric("Success", formatPercent(channel.successRate), sparkSeed: 0.44)
-            channelMetric("Handshake", formatLatency(channel.averageHandshakeMilliseconds), sparkSeed: 0.58)
-            channelMetric("Failures", "\(channel.failureCount)", sparkSeed: nil)
-            channelMetric("Last", relativeTime(channel.lastSeen), sparkSeed: nil)
-            channelMetric("Risk", channel.dailyReport.map { formatPercent($0.degradationRisk) } ?? "--", sparkSeed: nil)
-            channelMetric("Action", channel.dailyReport.map { actionLabel($0.recommendedActionHint) } ?? "--", sparkSeed: nil)
-
-            VStack(alignment: .trailing, spacing: 2) {
-                Text(channel.dailyReport.map { "\(Int(($0.channelScore * 100).rounded()))" }
-                    ?? channel.ranking.map { "\(Int(($0.score * 100).rounded()))" }
-                    ?? "--")
-                    .font(.system(size: 20, weight: .bold, design: .rounded))
-                    .foregroundStyle(.teal)
-                Text("score")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(theme.secondaryText)
-            }
-            .frame(width: 50, alignment: .trailing)
-        }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 16)
-        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.stroke, lineWidth: 1))
-    }
-
     private func scoreText(_ channel: VPNChannelStatistics) -> String {
         "\(Int((channel.coreMLScore * 100).rounded()))"
     }
@@ -3448,15 +3389,6 @@ private struct MacStatisticsWorkspace: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.stroke, lineWidth: 1))
-    }
-
-    private func channelBadge(_ title: String, color: Color) -> some View {
-        Text(title)
-            .font(.system(size: 10, weight: .bold))
-            .foregroundStyle(color)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(color.opacity(0.14), in: Capsule())
     }
 
     private func channelMetric(_ title: String, _ value: String, sparkSeed: Double?) -> some View {
@@ -3644,6 +3576,9 @@ private struct MacSettingsWorkspace: View {
     @State private var amneziaKey = ""
     @State private var message: String?
     @State private var showConfigImporter = false
+    @State private var showCurrentRegions = false
+    @State private var showPreferredExitRegions = false
+    @State private var showAvoidRegions = false
 
     var body: some View {
         settingsMainContent
@@ -3770,11 +3705,11 @@ private struct MacSettingsWorkspace: View {
 
     private var regionsSettings: some View {
         VStack(spacing: 16) {
-            MacSettingsSectionCard(title: "Current Regions", theme: theme) {
+            MacCollapsibleSettingsSectionCard(title: "Current Regions", isExpanded: $showCurrentRegions, theme: theme) {
                 regionRow("Current Region", value: "\(model.currentRegion.rawValue) - Russia")
                 regionRow("Home Region", value: "\(model.homeRegion.rawValue) - Israel")
             }
-            MacSettingsSectionCard(title: "Preferred Exit Regions", theme: theme) {
+            MacCollapsibleSettingsSectionCard(title: "Preferred Exit Regions", isExpanded: $showPreferredExitRegions, theme: theme) {
                 ForEach(Array(model.configProfiles.prefix(6))) { profile in
                     regionRow(profile.displayName, value: profile.regionCode ?? "Unknown")
                 }
@@ -3783,7 +3718,7 @@ private struct MacSettingsWorkspace: View {
                         .foregroundStyle(theme.secondaryText)
                 }
             }
-            MacSettingsSectionCard(title: "Avoid Regions", theme: theme) {
+            MacCollapsibleSettingsSectionCard(title: "Avoid Regions", isExpanded: $showAvoidRegions, theme: theme) {
                 regionRow("Russia", value: "RU")
                 regionRow("Belarus", value: "BY")
                 regionRow("China", value: "CN")
@@ -3904,6 +3839,50 @@ private struct MacSettingsSectionCard<Content: View>: View {
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(theme.primaryText)
             content
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .macLiquidCard(theme)
+    }
+}
+
+private struct MacCollapsibleSettingsSectionCard<Content: View>: View {
+    let title: String
+    @Binding var isExpanded: Bool
+    let theme: MacLiquidTheme
+    let content: Content
+
+    init(title: String, isExpanded: Binding<Bool>, theme: MacLiquidTheme, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self._isExpanded = isExpanded
+        self.theme = theme
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Button {
+                withAnimation(.snappy(duration: 0.18)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    Text(title)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(theme.primaryText)
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(theme.secondaryText)
+                        .rotationEffect(.degrees(isExpanded ? 0 : -90))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                content
+            }
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)

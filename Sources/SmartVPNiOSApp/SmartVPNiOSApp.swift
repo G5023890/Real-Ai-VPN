@@ -2328,7 +2328,6 @@ private struct iOSRouteScreen: View {
 
 private struct iOSStatisticsScreen: View {
     @ObservedObject var model: iOSDashboardModel
-    @State private var expandedStandbyChannelID: String?
 
     var body: some View {
         GeometryReader { geometry in
@@ -2658,76 +2657,6 @@ private struct iOSStatisticsScreen: View {
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
     }
 
-    private func channelRow(_ channel: iOSVPNChannelStatistics) -> some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: channel.isConnected ? "checkmark.shield.fill" : "server.rack")
-                    .font(.system(size: 23, weight: .semibold))
-                    .foregroundStyle(channel.isConnected ? AppTheme.success : (channel.isActive ? AppTheme.accent : AppTheme.secondaryText))
-                    .frame(width: 48, height: 48)
-                    .background(AppTheme.card.opacity(0.68), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        Text(regionMarker(channel.regionCode))
-                            .font(.system(size: 15, weight: .bold, design: .rounded))
-                            .foregroundStyle(AppTheme.primaryText)
-                        Text(channel.displayName)
-                            .font(.system(size: 19, weight: .bold))
-                            .foregroundStyle(AppTheme.primaryText)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.62)
-                    }
-                    if channel.isConnected {
-                        channelBadge("Connected", color: AppTheme.success)
-                    } else if channel.isActive {
-                        channelBadge("Active", color: AppTheme.accent)
-                    }
-                    Text("\(channel.regionCode) · \(protocolLabel(channel.protocolKind)) · \(channel.sampleCount) samples")
-                        .font(.system(size: 15, weight: .bold))
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.7)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                VStack(alignment: .trailing, spacing: 1) {
-                    Text(channel.dailyReport.map { "\(Int(($0.channelScore * 100).rounded()))" }
-                        ?? channel.ranking.map { "\(Int(($0.score * 100).rounded()))" }
-                        ?? "--")
-                        .font(.system(size: 27, weight: .bold, design: .rounded))
-                        .foregroundStyle(AppTheme.accent)
-                        .lineLimit(1)
-                    Text("score")
-                        .font(.system(size: 15, weight: .bold))
-                        .foregroundStyle(AppTheme.secondaryText)
-                }
-                .frame(width: 54, alignment: .trailing)
-
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 19, weight: .bold))
-                    .rotationEffect(.degrees(90))
-                    .foregroundStyle(AppTheme.secondaryText)
-                    .padding(.top, 6)
-                    .frame(width: 14)
-            }
-
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 72), spacing: 10), count: 3), spacing: 10) {
-                channelMetric("Latency", formatLatency(channel.averageLatencyMilliseconds))
-                channelMetric("Loss", formatPercent(channel.averagePacketLoss))
-                channelMetric("Success", formatPercent(channel.successRate))
-                channelMetric("Handshake", formatLatency(channel.averageHandshakeMilliseconds))
-                channelMetric("Failures", "\(channel.failureCount)")
-                channelMetric("Last", relativeTime(channel.lastSeen))
-                channelMetric("Risk", channel.dailyReport.map { formatPercent($0.degradationRisk) } ?? "--")
-                channelMetric("Action", channel.dailyReport.map { actionLabel($0.recommendedActionHint) } ?? "--")
-            }
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity)
-        .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-    }
-
     private func scoreText(_ channel: iOSVPNChannelStatistics) -> String {
         "\(Int((channel.coreMLScore * 100).rounded()))"
     }
@@ -2748,16 +2677,6 @@ private struct iOSStatisticsScreen: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-    }
-
-    private func channelBadge(_ title: String, color: Color) -> some View {
-        Text(title)
-            .font(.system(size: 13, weight: .bold))
-            .foregroundStyle(color)
-            .lineLimit(1)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(AppTheme.pill, in: Capsule())
     }
 
     private func channelMetric(_ title: String, _ value: String) -> some View {
@@ -2930,6 +2849,9 @@ private struct iOSSettingsScreen: View {
     @AppStorage("ios.showNotificationsAfterSwitch") private var showNotificationsAfterSwitch = true
     @AppStorage("ios.appearanceMode") private var appearanceMode = "System"
     @State private var showingCoreAIDebugger = false
+    @State private var showCurrentRegions = false
+    @State private var showPreferredExitRegions = false
+    @State private var showAvoidRegions = false
 
     var body: some View {
         ScrollView {
@@ -2945,6 +2867,31 @@ private struct iOSSettingsScreen: View {
                 settingsSection("BEHAVIOR") {
                     settingToggleRow(title: "Auto-switch", systemImage: "arrow.triangle.2.circlepath", isOn: $model.automaticFailoverEnabled)
                     settingToggleRow(title: "Show Notification", systemImage: "bell.fill", isOn: $showNotificationsAfterSwitch)
+                }
+
+                settingsSection("REGIONS") {
+                    collapsibleSettingsGroup(title: "Current Regions", isExpanded: $showCurrentRegions) {
+                        regionRow("Current Region", value: "RU - Russia")
+                        regionRow("Home Region", value: "IL - Israel")
+                    }
+                    collapsibleSettingsGroup(title: "Preferred Exit Regions", isExpanded: $showPreferredExitRegions) {
+                        if model.profiles.isEmpty {
+                            Text("Import profiles to build a preferred region list.")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(AppTheme.secondaryText)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(14)
+                        } else {
+                            ForEach(Array(model.profiles.prefix(6))) { profile in
+                                regionRow(profile.displayName, value: profile.regionCode ?? "Unknown")
+                            }
+                        }
+                    }
+                    collapsibleSettingsGroup(title: "Avoid Regions", isExpanded: $showAvoidRegions) {
+                        regionRow("Russia", value: "RU")
+                        regionRow("Belarus", value: "BY")
+                        regionRow("China", value: "CN")
+                    }
                 }
 
                 settingsSection("ABOUT") {
@@ -2980,6 +2927,58 @@ private struct iOSSettingsScreen: View {
             .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
         }
+    }
+
+    private func collapsibleSettingsGroup<Content: View>(
+        title: String,
+        isExpanded: Binding<Bool>,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(spacing: 0) {
+            Button {
+                withAnimation(.snappy(duration: 0.18)) {
+                    isExpanded.wrappedValue.toggle()
+                }
+            } label: {
+                HStack(spacing: 12) {
+                    Text(title)
+                        .font(.headline)
+                        .foregroundStyle(AppTheme.primaryText)
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                        .rotationEffect(.degrees(isExpanded.wrappedValue ? 0 : -90))
+                }
+                .padding(14)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded.wrappedValue {
+                content()
+            }
+        }
+        .background(AppTheme.row.opacity(0.001))
+    }
+
+    private func regionRow(_ title: String, value: String) -> some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(AppTheme.primaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+            Spacer(minLength: 12)
+            Text(value)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(AppTheme.secondaryText)
+                .multilineTextAlignment(.trailing)
+                .lineLimit(2)
+                .minimumScaleFactor(0.72)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
     }
 
     private func settingToggleRow(title: String, systemImage: String, isOn: Binding<Bool>) -> some View {
