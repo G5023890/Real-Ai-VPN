@@ -24,6 +24,12 @@
     <string>$(REAL_AI_VPN_BUILD_LABEL)</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Real Ai Router uses the local network to keep local devices, AirDrop, Bonjour, and router access available while VPN protection is active.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_services._dns-sd._udp</string>
+    </array>
     <key>UIApplicationSceneManifest</key>
     <dict>
         <key>UIApplicationSupportsMultipleScenes</key>

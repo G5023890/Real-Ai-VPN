@@ -229,12 +229,9 @@ private final class SingBoxPlatformInterface: NSObject, LibboxPlatformInterfaceP
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         if killSwitchEnabled {
             if #available(iOS 27.0, macOS 27.0, *) {
-                settings.includeAllNetworks = .any
-                settings.excludeLocalNetworks = localNetworkAccessEnabled ? .any : .none
                 settings.excludeAPNs = true
                 settings.excludeCellularServices = true
                 settings.excludeDeviceCommunication = true
-                settings.enforceRoutes = true
             }
         }
         settings.mtu = NSNumber(value: options.getMTU())

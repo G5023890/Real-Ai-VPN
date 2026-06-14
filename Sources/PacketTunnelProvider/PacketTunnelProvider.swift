@@ -1,4 +1,5 @@
 import AmneziaConfig
+import Darwin
 import Foundation
 import Network
 import NetworkExtension
@@ -212,13 +213,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 continue
             }
 
-            if isCIDRLikeRoute(normalized) {
+            if let ipPrefix = normalizedIPRoutePrefix(normalized) {
                 switch rule.mode {
                 case .forceVPN:
-                    overrides.forceVPNIPCIDRs.append(normalized)
-                    forceHostRoutes.append(normalized)
+                    overrides.forceVPNIPCIDRs.append(ipPrefix)
+                    forceHostRoutes.append(ipPrefix)
                 case .bypassVPN:
-                    overrides.bypassVPNIPCIDRs.append(normalized)
+                    overrides.bypassVPNIPCIDRs.append(ipPrefix)
                 }
             } else {
                 switch rule.mode {
@@ -384,8 +385,42 @@ enum PacketTunnelProviderError: LocalizedError {
     }
 }
 
-private func isCIDRLikeRoute(_ value: String) -> Bool {
-    value.contains("/") || IPv4CIDR(value) != nil || value.contains(":")
+private func normalizedIPRoutePrefix(_ value: String) -> String? {
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !normalized.isEmpty else {
+        return nil
+    }
+
+    if normalized.contains("/") {
+        let parts = normalized.split(separator: "/", maxSplits: 1).map(String.init)
+        guard parts.count == 2, let prefix = Int(parts[1]) else {
+            return nil
+        }
+
+        var ipv4 = in_addr()
+        if inet_pton(AF_INET, parts[0], &ipv4) == 1, (0...32).contains(prefix) {
+            return normalized
+        }
+
+        var ipv6 = in6_addr()
+        if inet_pton(AF_INET6, parts[0], &ipv6) == 1, (0...128).contains(prefix) {
+            return normalized
+        }
+
+        return nil
+    }
+
+    var ipv4 = in_addr()
+    if inet_pton(AF_INET, normalized, &ipv4) == 1 {
+        return "\(normalized)/32"
+    }
+
+    var ipv6 = in6_addr()
+    if inet_pton(AF_INET6, normalized, &ipv6) == 1 {
+        return "\(normalized)/128"
+    }
+
+    return nil
 }
 
 private func loadBundledCIDRs(resource: String, extension fileExtension: String) -> [String] {

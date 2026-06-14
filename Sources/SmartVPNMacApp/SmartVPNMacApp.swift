@@ -24,6 +24,34 @@ private final class MacAppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+private enum LocalNetworkPermissionProbe {
+    private static var browser: NWBrowser?
+
+    static func requestIfNeeded() {
+        let parameters = NWParameters.udp
+        parameters.includePeerToPeer = true
+        let descriptor = NWBrowser.Descriptor.bonjour(type: "_services._dns-sd._udp", domain: "local.")
+        let browser = NWBrowser(for: descriptor, using: parameters)
+        Self.browser = browser
+        browser.stateUpdateHandler = { state in
+            switch state {
+            case .ready, .failed, .cancelled:
+                DispatchQueue.main.async {
+                    Self.browser?.cancel()
+                    Self.browser = nil
+                }
+            default:
+                break
+            }
+        }
+        browser.start(queue: .main)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            Self.browser?.cancel()
+            Self.browser = nil
+        }
+    }
+}
+
 private enum AppVisibilityMode: String, CaseIterable, Identifiable {
     case menuBarOnly
     case dockOnly
@@ -79,6 +107,7 @@ struct SmartVPNMacApp: App {
     init() {
         Self.applyActivationPolicy(for: Self.storedVisibilityMode())
         Self.configureNotifications()
+        LocalNetworkPermissionProbe.requestIfNeeded()
     }
 
     var body: some Scene {
@@ -961,8 +990,8 @@ final class DashboardModel: ObservableObject {
         if wasConnectedOrConnecting {
             vpnStatus = .disconnecting
             suppressExpectedDisconnectNotification = true
-            vpnManager.disconnect()
             Task {
+                await vpnManager.disconnectDisablingOnDemand()
                 await waitUntilVPNIsDisconnected()
                 connectVPN()
             }
@@ -1040,8 +1069,8 @@ final class DashboardModel: ObservableObject {
         vpnStatus = .disconnecting
         suppressExpectedDisconnectNotification = true
         monitorStatus = killSwitchEnabled ? "\(reason) with Kill Switch" : reason
-        vpnManager.disconnect()
         Task {
+            await vpnManager.disconnectDisablingOnDemand()
             await waitUntilVPNIsDisconnected()
             connectVPN()
         }
@@ -3617,20 +3646,7 @@ private struct MacSettingsWorkspace: View {
     @State private var showConfigImporter = false
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .top, spacing: 18) {
-                settingsSidebar
-                    .frame(width: 170)
-
-                settingsMainContent
-            }
-            .frame(minWidth: 760)
-
-            VStack(alignment: .leading, spacing: 16) {
-                compactSettingsTabs
-                settingsMainContent
-            }
-        }
+        settingsMainContent
         .onAppear {
             amneziaKey = model.loadAmneziaPremiumKeyForEditing()
         }
@@ -3645,11 +3661,13 @@ private struct MacSettingsWorkspace: View {
 
     private var settingsMainContent: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text(selectedSection.rawValue)
+            Text("Settings")
                 .font(.system(size: 22, weight: .semibold))
                 .foregroundStyle(theme.primaryText)
 
-            settingsContent
+            generalSettings
+            regionsSettings
+            securitySettings
 
             if let message {
                 Text(message)
@@ -3659,58 +3677,6 @@ private struct MacSettingsWorkspace: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
-    }
-
-    private var settingsSidebar: some View {
-        VStack(spacing: 8) {
-            ForEach(MacSettingsSection.allCases) { section in
-                Button {
-                    selectedSection = section
-                } label: {
-                    Label(section.rawValue, systemImage: section.symbol)
-                        .font(.system(size: 12, weight: .semibold))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .foregroundStyle(selectedSection == section ? theme.accent : theme.secondaryText)
-                        .background(selectedSection == section ? theme.selectedFill : .clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                }
-                .buttonStyle(.plain)
-            }
-            Spacer()
-        }
-    }
-
-    private var compactSettingsTabs: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(MacSettingsSection.allCases) { section in
-                    Button {
-                        selectedSection = section
-                    } label: {
-                        Label(section.rawValue, systemImage: section.symbol)
-                            .font(.system(size: 12, weight: .semibold))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 9)
-                            .foregroundStyle(selectedSection == section ? theme.accent : theme.secondaryText)
-                            .background(selectedSection == section ? theme.selectedFill : theme.rowFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var settingsContent: some View {
-        switch selectedSection {
-        case .general:
-            generalSettings
-        case .regions:
-            regionsSettings
-        case .security:
-            securitySettings
-        }
     }
 
     private var generalSettings: some View {

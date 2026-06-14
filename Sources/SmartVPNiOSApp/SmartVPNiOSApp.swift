@@ -264,6 +264,34 @@ private struct ProfileEndpoint {
     var port: UInt16
 }
 
+private enum LocalNetworkPermissionProbe {
+    private static var browser: NWBrowser?
+
+    static func requestIfNeeded() {
+        let parameters = NWParameters.udp
+        parameters.includePeerToPeer = true
+        let descriptor = NWBrowser.Descriptor.bonjour(type: "_services._dns-sd._udp", domain: "local.")
+        let browser = NWBrowser(for: descriptor, using: parameters)
+        Self.browser = browser
+        browser.stateUpdateHandler = { state in
+            switch state {
+            case .ready, .failed, .cancelled:
+                DispatchQueue.main.async {
+                    Self.browser?.cancel()
+                    Self.browser = nil
+                }
+            default:
+                break
+            }
+        }
+        browser.start(queue: .main)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            Self.browser?.cancel()
+            Self.browser = nil
+        }
+    }
+}
+
 @main
 struct RealAiVPNiOSApp: App {
     private static let notificationDelegate = iOSNotificationDelegate()
@@ -273,6 +301,7 @@ struct RealAiVPNiOSApp: App {
         let center = UNUserNotificationCenter.current()
         center.delegate = Self.notificationDelegate
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        LocalNetworkPermissionProbe.requestIfNeeded()
     }
 
     var body: some Scene {
