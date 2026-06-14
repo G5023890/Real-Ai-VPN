@@ -272,6 +272,18 @@ struct VPNChannelStatistics: Identifiable {
     var coreMLEvidenceCount: Int {
         (dailyReport?.sampleCount ?? sampleCount) + (dailyReport?.probeCount ?? 0)
     }
+
+    var coreAIScoreText: String {
+        "\(Int((coreMLScore * 100).rounded()))"
+    }
+
+    var coreAIConfidenceText: String {
+        "\(Int((coreMLConfidence * 100).rounded()))"
+    }
+
+    var isCurrentCoreAIProfile: Bool {
+        isConnected || isActive
+    }
 }
 
 struct LocalProfileQualityHistoryStore {
@@ -2406,7 +2418,7 @@ struct DashboardView: View {
                 MacStatisticsWorkspace(model: model, theme: theme)
                     .padding(compact ? 14 : 24)
             case .about:
-                MacAboutWorkspace(buildLabel: buildLabel, theme: theme)
+                MacAboutWorkspace(model: model, buildLabel: buildLabel, theme: theme)
                     .padding(compact ? 14 : 24)
             }
         }
@@ -3259,50 +3271,16 @@ private struct MacStatisticsWorkspace: View {
     }
 
     private func standbyRankingRow(_ channel: VPNChannelStatistics) -> some View {
-        let isExpanded = expandedStandbyChannelID == channel.id
-
-        return VStack(alignment: .leading, spacing: 12) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.18)) {
-                    expandedStandbyChannelID = isExpanded ? nil : channel.id
-                }
-            } label: {
-                HStack(spacing: 12) {
-                    Text(channel.displayName)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(theme.primaryText)
-                        .lineLimit(1)
-                    Spacer()
-                    Text(scoreText(channel))
-                        .font(.system(size: 18, weight: .bold, design: .rounded))
-                        .foregroundStyle(.teal)
-                        .frame(width: 44, alignment: .trailing)
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(theme.secondaryText)
-                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
-                        .frame(width: 18)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            if isExpanded {
-                HStack(spacing: 12) {
-                    channelMetric("Risk", channel.coreMLRisk.map { formatPercent($0) } ?? "--", sparkSeed: nil)
-                    channelMetric("Confidence", formatPercent(channel.coreMLConfidence), sparkSeed: nil)
-                    channelMetric("Action", channel.coreMLAction.map { actionLabel($0) } ?? "--", sparkSeed: nil)
-                    channelMetric("Latency", formatLatency(channel.averageLatencyMilliseconds), sparkSeed: nil)
-                    channelMetric("Success", formatPercent(channel.successRate), sparkSeed: nil)
-                    channelMetric("Checks", "\(channel.coreMLEvidenceCount)", sparkSeed: nil)
-                    channelMetric("Last", relativeTime(channel.lastSeen), sparkSeed: nil)
-                }
-
-                Text(channel.coreMLSummary)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(theme.secondaryText)
-                    .lineLimit(2)
-            }
+        HStack(spacing: 12) {
+            Text(channel.displayName)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(theme.primaryText)
+                .lineLimit(1)
+            Spacer()
+            Text(scoreText(channel))
+                .font(.system(size: 18, weight: .bold, design: .rounded))
+                .foregroundStyle(.teal)
+                .frame(width: 44, alignment: .trailing)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
@@ -3767,14 +3745,6 @@ private struct MacSettingsWorkspace: View {
                 settingsToggle("Auto-switch when connection is unstable", isOn: $model.automaticFailoverEnabled)
                 settingsToggle("Show notification after switch", isOn: $model.showFailoverNotifications)
             }
-
-            MacSettingsSectionCard(title: "Language", theme: theme) {
-                Picker("Language", selection: $model.preferredLanguage) {
-                    Text("English").tag("English")
-                    Text("Русский").tag("Русский")
-                }
-                .pickerStyle(.menu)
-            }
         }
     }
 
@@ -3976,8 +3946,10 @@ private struct MacSettingsSectionCard<Content: View>: View {
 }
 
 private struct MacAboutWorkspace: View {
+    @ObservedObject var model: DashboardModel
     let buildLabel: String
     let theme: MacLiquidTheme
+    @State private var showingCoreAIDebugger = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -3994,9 +3966,212 @@ private struct MacAboutWorkspace: View {
             }
             .padding(22)
             .macLiquidCard(theme)
+
+            Button {
+                showingCoreAIDebugger = true
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "brain.head.profile")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.teal)
+                        .frame(width: 34, height: 34)
+                        .background(theme.selectedFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Core AI Debugger")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(theme.primaryText)
+                        Text("Read-only live ranking and probe snapshot")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(theme.secondaryText)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(theme.secondaryText)
+                }
+                .padding(16)
+                .macLiquidCard(theme)
+            }
+            .buttonStyle(.plain)
+
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .sheet(isPresented: $showingCoreAIDebugger) {
+            MacCoreAIDebuggerView(model: model, theme: theme)
+                .frame(width: 760, height: 680)
+        }
+    }
+}
+
+private struct MacCoreAIDebuggerView: View {
+    @ObservedObject var model: DashboardModel
+    let theme: MacLiquidTheme
+    @Environment(\.dismiss) private var dismiss
+
+    private var channels: [VPNChannelStatistics] {
+        model.channelStatistics
+    }
+
+    private var currentChannel: VPNChannelStatistics? {
+        channels.first(where: \.isConnected) ?? channels.first(where: \.isActive)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Core AI Debugger")
+                        .font(.system(size: 24, weight: .semibold))
+                        .foregroundStyle(theme.primaryText)
+                    Text("Read-only live CoreML ranking and probe data")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(theme.secondaryText)
+                }
+                Spacer()
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(theme.secondaryText)
+                }
+                .buttonStyle(.plain)
+            }
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    debuggerSection("Snapshot") {
+                        debugRow("VPN Status", model.vpnStatus.rawValue.capitalized)
+                        debugRow("Current Profile", currentChannel?.displayName ?? "None")
+                        debugRow("Channels", "\(channels.count)")
+                        debugRow("Last Probe", relativeTime(model.lastProbeDate))
+                    }
+
+                    debuggerSection("Current Core AI Decision") {
+                        if let currentChannel {
+                            debugRow("Score", currentChannel.coreAIScoreText)
+                            debugRow("Risk", currentChannel.coreMLRisk.map { formatPercent($0) } ?? "--")
+                            debugRow("Confidence", currentChannel.coreAIConfidenceText)
+                            debugRow("Action", currentChannel.coreMLAction.map { actionLabel($0) } ?? "--")
+                            debugText("Summary", currentChannel.coreMLSummary)
+                        } else {
+                            emptyText("No active profile or probe data yet.")
+                        }
+                    }
+
+                    debuggerSection("Ranked Channels") {
+                        if channels.isEmpty {
+                            emptyText("No ranked channels yet.")
+                        } else {
+                            ForEach(channels) { channel in
+                                VStack(alignment: .leading, spacing: 10) {
+                                    HStack(spacing: 12) {
+                                        Text(channel.displayName)
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundStyle(theme.primaryText)
+                                            .lineLimit(1)
+                                        Spacer()
+                                        Text(channel.coreAIScoreText)
+                                            .font(.system(size: 22, weight: .bold, design: .rounded))
+                                            .foregroundStyle(.teal)
+                                    }
+                                    debugRow("Confidence", channel.coreAIConfidenceText)
+                                    debugRow("Samples", "\(channel.sampleCount)")
+                                    debugRow("Evidence", "\(channel.coreMLEvidenceCount)")
+                                    debugText("Summary", channel.coreMLSummary)
+                                }
+                                .padding(14)
+                                .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.stroke, lineWidth: 1))
+                            }
+                        }
+                    }
+                }
+                .padding(.trailing, 4)
+            }
+        }
+        .padding(24)
+        .background(theme.background.ignoresSafeArea())
+    }
+
+    private func debuggerSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(theme.primaryText)
+            VStack(alignment: .leading, spacing: 0) {
+                content()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .macLiquidCard(theme)
+        }
+    }
+
+    private func debugRow(_ title: String, _ value: String) -> some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(theme.secondaryText)
+            Spacer(minLength: 12)
+            Text(value)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(theme.primaryText)
+                .multilineTextAlignment(.trailing)
+                .lineLimit(2)
+                .minimumScaleFactor(0.75)
+        }
+        .padding(12)
+    }
+
+    private func debugText(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(theme.secondaryText)
+            Text(value)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(theme.primaryText)
+                .textSelection(.enabled)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+    }
+
+    private func emptyText(_ value: String) -> some View {
+        Text(value)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(theme.secondaryText)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(14)
+    }
+
+    private func formatPercent(_ value: Double) -> String {
+        "\(Int((value * 100).rounded()))%"
+    }
+
+    private func relativeTime(_ date: Date?) -> String {
+        guard let date else { return "--" }
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        if seconds < 60 { return "\(seconds)s" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m" }
+        return "\(minutes / 60)h"
+    }
+
+    private func actionLabel(_ action: CoreMLRecommendedActionHint) -> String {
+        switch action {
+        case .keepCurrent:
+            return "Keep"
+        case .reconnect:
+            return "Reconnect"
+        case .switchServer:
+            return "Switch"
+        case .quarantine:
+            return "Quarantine"
+        case .askUser:
+            return "Ask"
+        }
     }
 }
 

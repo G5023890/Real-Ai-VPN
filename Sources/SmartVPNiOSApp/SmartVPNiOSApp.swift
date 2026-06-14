@@ -199,6 +199,18 @@ struct iOSVPNChannelStatistics: Identifiable {
     var coreMLEvidenceCount: Int {
         (dailyReport?.sampleCount ?? sampleCount) + (dailyReport?.probeCount ?? 0)
     }
+
+    var coreAIScoreText: String {
+        "\(Int((coreMLScore * 100).rounded()))"
+    }
+
+    var coreAIConfidenceText: String {
+        "\(Int((coreMLConfidence * 100).rounded()))"
+    }
+
+    var isCurrentCoreAIProfile: Bool {
+        isConnected || isActive
+    }
 }
 
 private struct LocalProfileQualityHistoryStore {
@@ -2563,52 +2575,17 @@ private struct iOSStatisticsScreen: View {
     }
 
     private func standbyRankingRow(_ channel: iOSVPNChannelStatistics) -> some View {
-        let isExpanded = expandedStandbyChannelID == channel.id
-
-        return VStack(alignment: .leading, spacing: 14) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.18)) {
-                    expandedStandbyChannelID = isExpanded ? nil : channel.id
-                }
-            } label: {
-                HStack(spacing: 12) {
-                    Text(channel.displayName)
-                        .font(.system(size: 17, weight: .bold))
-                        .foregroundStyle(AppTheme.primaryText)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.62)
-                    Spacer(minLength: 8)
-                    Text(scoreText(channel))
-                        .font(.system(size: 24, weight: .bold, design: .rounded))
-                        .foregroundStyle(AppTheme.accent)
-                        .frame(width: 48, alignment: .trailing)
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(AppTheme.secondaryText)
-                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
-                        .frame(width: 18)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            if isExpanded {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 72), spacing: 10), count: 3), spacing: 10) {
-                    channelMetric("Risk", channel.coreMLRisk.map { formatPercent($0) } ?? "--")
-                    channelMetric("Confidence", formatPercent(channel.coreMLConfidence))
-                    channelMetric("Action", channel.coreMLAction.map { actionLabel($0) } ?? "--")
-                    channelMetric("Latency", formatLatency(channel.averageLatencyMilliseconds))
-                    channelMetric("Success", formatPercent(channel.successRate))
-                    channelMetric("Checks", "\(channel.coreMLEvidenceCount)")
-                    channelMetric("Last", relativeTime(channel.lastSeen))
-                }
-
-                Text(channel.coreMLSummary)
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(AppTheme.secondaryText)
-                    .lineLimit(3)
-                    .minimumScaleFactor(0.72)
-            }
+        HStack(spacing: 12) {
+            Text(channel.displayName)
+                .font(.system(size: 17, weight: .bold))
+                .foregroundStyle(AppTheme.primaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.62)
+            Spacer(minLength: 8)
+            Text(scoreText(channel))
+                .font(.system(size: 24, weight: .bold, design: .rounded))
+                .foregroundStyle(AppTheme.accent)
+                .frame(width: 48, alignment: .trailing)
         }
         .padding(14)
         .frame(maxWidth: .infinity)
@@ -2923,6 +2900,7 @@ private struct iOSSettingsScreen: View {
     @ObservedObject var model: iOSDashboardModel
     @AppStorage("ios.showNotificationsAfterSwitch") private var showNotificationsAfterSwitch = true
     @AppStorage("ios.appearanceMode") private var appearanceMode = "System"
+    @State private var showingCoreAIDebugger = false
 
     var body: some View {
         ScrollView {
@@ -2933,7 +2911,6 @@ private struct iOSSettingsScreen: View {
                     settingToggleRow(title: "Reconnect after dropped/reset", systemImage: "arrow.clockwise", isOn: $model.reconnectAfterDropEnabled)
                     settingToggleRow(title: "Kill Switch", systemImage: "shield.fill", isOn: $model.killSwitchEnabled)
                     settingToggleRow(title: "DNS Protection", systemImage: "network", isOn: $model.dnsProtectionEnabled)
-                    settingNavigationRow(title: "Language", value: "English", systemImage: "globe")
                 }
 
                 settingsSection("BEHAVIOR") {
@@ -2944,6 +2921,9 @@ private struct iOSSettingsScreen: View {
                 settingsSection("ABOUT") {
                     settingNavigationRow(title: "Version", value: iOSBuildLabel, systemImage: "info.circle")
                     settingNavigationRow(title: "About Real Ai Router", value: "", systemImage: "lock.shield")
+                    settingButtonRow(title: "Core AI Debugger", value: "Read only", systemImage: "brain.head.profile") {
+                        showingCoreAIDebugger = true
+                    }
                 }
             }
             .padding(16)
@@ -2952,6 +2932,11 @@ private struct iOSSettingsScreen: View {
         .background(AppTheme.background.ignoresSafeArea())
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showingCoreAIDebugger) {
+            NavigationStack {
+                iOSCoreAIDebuggerView(model: model)
+            }
+        }
     }
 
     private func settingsSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -3005,6 +2990,187 @@ private struct iOSSettingsScreen: View {
                 .foregroundStyle(AppTheme.secondaryText)
         }
         .padding(14)
+    }
+
+    private func settingButtonRow(title: String, value: String, systemImage: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: systemImage)
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .frame(width: 22)
+                Text(title)
+                    .font(.headline)
+                    .foregroundStyle(AppTheme.primaryText)
+                Spacer()
+                Text(value)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(AppTheme.secondaryText)
+                    .lineLimit(1)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(AppTheme.secondaryText)
+            }
+            .padding(14)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct iOSCoreAIDebuggerView: View {
+    @ObservedObject var model: iOSDashboardModel
+    @Environment(\.dismiss) private var dismiss
+
+    private var channels: [iOSVPNChannelStatistics] {
+        model.channelStatistics
+    }
+
+    private var currentChannel: iOSVPNChannelStatistics? {
+        channels.first(where: \.isConnected) ?? channels.first(where: \.isActive)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                debuggerSection("Snapshot") {
+                    debugRow("VPN Status", model.vpnStatus.rawValue.capitalized)
+                    debugRow("Current Profile", currentChannel?.displayName ?? "None")
+                    debugRow("Channels", "\(channels.count)")
+                    debugRow("Last Probe", relativeTime(model.lastProbeDate))
+                }
+
+                debuggerSection("Current Core AI Decision") {
+                    if let currentChannel {
+                        debugRow("Score", currentChannel.coreAIScoreText)
+                        debugRow("Risk", currentChannel.coreMLRisk.map { formatPercent($0) } ?? "--")
+                        debugRow("Confidence", currentChannel.coreAIConfidenceText)
+                        debugRow("Action", currentChannel.coreMLAction.map { actionLabel($0) } ?? "--")
+                        debugText("Summary", currentChannel.coreMLSummary)
+                    } else {
+                        emptyText("No active profile or probe data yet.")
+                    }
+                }
+
+                debuggerSection("Ranked Channels") {
+                    if channels.isEmpty {
+                        emptyText("No ranked channels yet.")
+                    } else {
+                        ForEach(channels) { channel in
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack(spacing: 12) {
+                                    Text(channel.displayName)
+                                        .font(.headline)
+                                        .foregroundStyle(AppTheme.primaryText)
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.72)
+                                    Spacer()
+                                    Text(channel.coreAIScoreText)
+                                        .font(.system(size: 22, weight: .bold, design: .rounded))
+                                        .foregroundStyle(AppTheme.accent)
+                                }
+                                debugRow("Confidence", channel.coreAIConfidenceText)
+                                debugRow("Samples", "\(channel.sampleCount)")
+                                debugRow("Evidence", "\(channel.coreMLEvidenceCount)")
+                                debugText("Summary", channel.coreMLSummary)
+                            }
+                            .padding(14)
+                            .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        }
+                    }
+                }
+            }
+            .padding(16)
+            .padding(.bottom, 24)
+        }
+        .background(AppTheme.background.ignoresSafeArea())
+        .navigationTitle("Core AI Debugger")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Done") {
+                    dismiss()
+                }
+            }
+        }
+    }
+
+    private func debuggerSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(AppTheme.primaryText)
+            VStack(alignment: .leading, spacing: 0) {
+                content()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
+        }
+    }
+
+    private func debugRow(_ title: String, _ value: String) -> some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(AppTheme.secondaryText)
+            Spacer(minLength: 12)
+            Text(value)
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(AppTheme.primaryText)
+                .multilineTextAlignment(.trailing)
+                .lineLimit(2)
+                .minimumScaleFactor(0.72)
+        }
+        .padding(14)
+    }
+
+    private func debugText(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(AppTheme.secondaryText)
+            Text(value)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(AppTheme.primaryText)
+                .textSelection(.enabled)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+    }
+
+    private func emptyText(_ value: String) -> some View {
+        Text(value)
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(AppTheme.secondaryText)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(14)
+    }
+
+    private func formatPercent(_ value: Double) -> String {
+        "\(Int((value * 100).rounded()))%"
+    }
+
+    private func relativeTime(_ date: Date?) -> String {
+        guard let date else { return "--" }
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        if seconds < 60 { return "\(seconds)s" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m" }
+        return "\(minutes / 60)h"
+    }
+
+    private func actionLabel(_ action: CoreMLRecommendedActionHint) -> String {
+        switch action {
+        case .keepCurrent:
+            return "Keep"
+        case .reconnect:
+            return "Reconnect"
+        case .switchServer:
+            return "Switch"
+        case .quarantine:
+            return "Quarantine"
+        case .askUser:
+            return "Ask"
+        }
     }
 }
 
