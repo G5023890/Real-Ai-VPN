@@ -261,7 +261,11 @@ final class AmneziaConfigDecoderTests: XCTestCase {
         XCTAssertEqual(providerBackupDNS["server"] as? String, "77.88.8.2")
         XCTAssertNil(providerBackupDNS["detour"])
         XCTAssertTrue(providerSuffixes.contains("ru"))
-        XCTAssertTrue(providerSuffixes.contains("local"))
+        XCTAssertTrue(directDomainSuffixes.contains("local"))
+        XCTAssertTrue(directDomainSuffixes.contains("lan"))
+        XCTAssertTrue(directDomainSuffixes.contains("in-addr.arpa"))
+        XCTAssertTrue(directDomainSuffixes.contains("ip6.arpa"))
+        XCTAssertFalse(providerSuffixes.contains("local"))
     }
 
     func testSingBoxDNSProtectionRoutesProviderDomainsToYandex() throws {
@@ -286,6 +290,10 @@ final class AmneziaConfigDecoderTests: XCTestCase {
         let providerSuffixes = try XCTUnwrap(providerRule["domain_suffix"] as? [String])
         let route = try XCTUnwrap(root["route"] as? [String: Any])
         let routeRules = try XCTUnwrap(route["rules"] as? [[String: Any]])
+        let directDomainSuffixes = routeRules
+            .filter { ($0["outbound"] as? String) == "direct" }
+            .compactMap { $0["domain_suffix"] as? [String] }
+            .flatMap { $0 }
         let directIPCIDRs = routeRules
             .filter { ($0["outbound"] as? String) == "direct" }
             .compactMap { $0["ip_cidr"] as? [String] }
@@ -295,15 +303,18 @@ final class AmneziaConfigDecoderTests: XCTestCase {
         XCTAssertTrue(dnsServers.contains { ($0["tag"] as? String) == "provider-yandex-backup" && ($0["server"] as? String) == "77.88.8.2" })
         XCTAssertTrue(directIPCIDRs.contains("77.88.8.88/32"))
         XCTAssertTrue(directIPCIDRs.contains("77.88.8.2/32"))
+        XCTAssertTrue(directIPCIDRs.contains("17.0.0.0/8"))
         XCTAssertTrue(directIPCIDRs.contains("224.0.0.0/4"))
         XCTAssertTrue(directIPCIDRs.contains("255.255.255.255/32"))
         XCTAssertTrue(directIPCIDRs.contains("ff00::/8"))
         XCTAssertEqual(forceSuffixes, ["2ip.ru"])
         XCTAssertTrue(providerSuffixes.contains("ru"))
-        XCTAssertTrue(providerSuffixes.contains("local"))
         XCTAssertTrue(providerSuffixes.contains("mos.ru"))
-        XCTAssertTrue(providerSuffixes.contains("example.local"))
         XCTAssertTrue(providerSuffixes.contains("yandex.ru"))
+        XCTAssertTrue(directDomainSuffixes.contains("local"))
+        XCTAssertTrue(directDomainSuffixes.contains("example.local"))
+        XCTAssertFalse(providerSuffixes.contains("local"))
+        XCTAssertFalse(providerSuffixes.contains("example.local"))
         XCTAssertFalse(providerSuffixes.contains("2ip.ru"))
     }
 

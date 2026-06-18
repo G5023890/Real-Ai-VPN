@@ -227,6 +227,12 @@ private final class SingBoxPlatformInterface: NSObject, LibboxPlatformInterfaceP
         }
 
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
+        if localNetworkAccessEnabled {
+            if #available(iOS 27.0, macOS 27.0, *) {
+                settings.excludeLocalNetworks = .any
+                settings.excludeDeviceCommunication = true
+            }
+        }
         if killSwitchEnabled {
             if #available(iOS 27.0, macOS 27.0, *) {
                 settings.excludeAPNs = true

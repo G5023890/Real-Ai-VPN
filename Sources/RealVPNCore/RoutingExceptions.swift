@@ -50,6 +50,88 @@ public struct RoutingExceptionCollection: Codable, Equatable, Sendable {
     }
 }
 
+public enum RoutingExceptionProtectedProbeGuard {
+    public static let protectedHosts: Set<String> = [
+        "ya.ru",
+        "www.mos.ru",
+        "www.rbc.ru",
+        "www.gosuslugi.ru",
+        "www.cloudflare.com",
+        "1.1.1.1",
+        "example.com",
+        "www.iana.org",
+        "www.wikipedia.org",
+        "www.bing.com",
+        "duckduckgo.com",
+        "www.mozilla.org",
+        "www.debian.org",
+        "www.kernel.org",
+        "9.9.9.9",
+        "208.67.222.222",
+        "cloudflare-dns.com",
+        "dns.quad9.net",
+        "77.88.8.8"
+    ]
+
+    public static func protectedMatch(for value: String) -> String? {
+        let normalized = normalizedRoutingValue(value)
+        guard !normalized.isEmpty else {
+            return nil
+        }
+
+        for protectedHost in protectedHosts {
+            if normalized == protectedHost {
+                return protectedHost
+            }
+
+            if isDomain(normalized),
+               isDomain(protectedHost),
+               protectedHost.hasSuffix(".\(normalized)") {
+                return protectedHost
+            }
+
+            if let cidr = IPv4CIDR(normalized),
+               let protectedIP = IPv4Address(protectedHost),
+               cidr.contains(protectedIP) {
+                return protectedHost
+            }
+        }
+
+        return nil
+    }
+
+    public static func isProtected(_ value: String) -> Bool {
+        protectedMatch(for: value) != nil
+    }
+
+    private static func normalizedRoutingValue(_ value: String) -> String {
+        var normalized = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        if let url = URL(string: normalized), let host = url.host {
+            normalized = host
+        } else {
+            normalized = normalized
+                .replacingOccurrences(of: "https://", with: "")
+                .replacingOccurrences(of: "http://", with: "")
+                .split(separator: "/")
+                .first
+                .map(String.init) ?? normalized
+        }
+
+        if normalized.hasPrefix("*.") {
+            normalized = String(normalized.dropFirst(2))
+        }
+
+        return normalized.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    }
+
+    private static func isDomain(_ value: String) -> Bool {
+        IPv4Address(value) == nil && IPv4CIDR(value) == nil && value.contains(".")
+    }
+}
+
 public struct RoutingExceptionStore {
     private let defaults: UserDefaults
     private let key: String
@@ -74,6 +156,56 @@ public struct RoutingExceptionStore {
         }
 
         defaults.set(data, forKey: key)
+    }
+}
+
+private struct IPv4Address: Equatable, Sendable {
+    let rawValue: UInt32
+
+    init?(_ value: String) {
+        let parts = value.split(separator: ".")
+        guard parts.count == 4 else {
+            return nil
+        }
+
+        var result: UInt32 = 0
+        for part in parts {
+            guard let octet = UInt8(part) else {
+                return nil
+            }
+            result = (result << 8) | UInt32(octet)
+        }
+
+        rawValue = result
+    }
+}
+
+private struct IPv4CIDR: Sendable {
+    let network: UInt32
+    let mask: UInt32
+
+    init?(_ value: String) {
+        let parts = value.split(separator: "/", maxSplits: 1).map(String.init)
+        guard let address = IPv4Address(parts[0]) else {
+            return nil
+        }
+
+        let prefix: UInt8
+        if parts.count == 2 {
+            guard let parsedPrefix = UInt8(parts[1]), parsedPrefix <= 32 else {
+                return nil
+            }
+            prefix = parsedPrefix
+        } else {
+            prefix = 32
+        }
+
+        mask = prefix == 0 ? 0 : UInt32.max << UInt32(32 - prefix)
+        network = address.rawValue & mask
+    }
+
+    func contains(_ address: IPv4Address) -> Bool {
+        (address.rawValue & mask) == network
     }
 }
 

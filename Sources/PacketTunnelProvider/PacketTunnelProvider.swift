@@ -50,10 +50,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let routingExceptions = RoutingExceptionCodec.decode(
             (options?["routingExceptions"] as? String) ?? (options?["routingExceptions"] as? NSString).map(String.init)
         )
-        let killSwitchEnabled = (options?["killSwitchEnabled"] as? NSNumber)?.boolValue ?? false
-        let dnsProtectionEnabled = (options?["dnsProtectionEnabled"] as? NSNumber)?.boolValue ?? true
-        let localNetworkAccessEnabled = (options?["localNetworkAccessEnabled"] as? NSNumber)?.boolValue ?? true
-        let ipv6LeakProtectionEnabled = (options?["ipv6LeakProtectionEnabled"] as? NSNumber)?.boolValue ?? true
+        let providerOptions = storedProviderConfiguration()
+        let killSwitchEnabled = optionBool("killSwitchEnabled", options: options, providerOptions: providerOptions, defaultValue: false)
+        let dnsProtectionEnabled = optionBool("dnsProtectionEnabled", options: options, providerOptions: providerOptions, defaultValue: true)
+        let localNetworkAccessEnabled = optionBool("localNetworkAccessEnabled", options: options, providerOptions: providerOptions, defaultValue: true)
+        let ipv6LeakProtectionEnabled = optionBool("ipv6LeakProtectionEnabled", options: options, providerOptions: providerOptions, defaultValue: true)
 
         guard let importedConfig, !importedConfig.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             packetTunnelLogger.error("Missing transient Amnezia config")
@@ -136,6 +137,28 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         return try? premiumKeyStore.read()
+    }
+
+    private func storedProviderConfiguration() -> [String: Any] {
+        (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
+    }
+
+    private func optionBool(
+        _ key: String,
+        options: [String: NSObject]?,
+        providerOptions: [String: Any],
+        defaultValue: Bool
+    ) -> Bool {
+        if let value = options?[key] as? NSNumber {
+            return value.boolValue
+        }
+        if let value = providerOptions[key] as? NSNumber {
+            return value.boolValue
+        }
+        if let value = providerOptions[key] as? Bool {
+            return value
+        }
+        return defaultValue
     }
 
     private func startAmneziaWireGuardTunnel(
@@ -474,6 +497,7 @@ private func localRouteExcludes(
         "169.254.0.0/16",
         "172.16.0.0/12",
         "192.168.0.0/16",
+        "17.0.0.0/8",
         "224.0.0.0/4",
         "255.255.255.255/32"
     ]

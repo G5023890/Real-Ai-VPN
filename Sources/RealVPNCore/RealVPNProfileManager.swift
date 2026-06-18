@@ -249,8 +249,16 @@ public final class RealVPNProfileManager: ObservableObject {
         protocolConfiguration.providerConfiguration = [
             "serverID": configuration.serverID,
             "regionCode": configuration.regionCode,
-            "mode": "prototype"
+            "mode": "prototype",
+            "killSwitchEnabled": NSNumber(value: configuration.killSwitchEnabled),
+            "dnsProtectionEnabled": NSNumber(value: configuration.dnsProtectionEnabled),
+            "localNetworkAccessEnabled": NSNumber(value: configuration.localNetworkAccessEnabled),
+            "ipv6LeakProtectionEnabled": NSNumber(value: configuration.ipv6LeakProtectionEnabled)
         ]
+        protocolConfiguration.excludeLocalNetworks = configuration.localNetworkAccessEnabled
+        if #available(iOS 17.4, macOS 14.4, *) {
+            protocolConfiguration.excludeDeviceCommunication = configuration.localNetworkAccessEnabled
+        }
 
         manager.localizedDescription = configuration.localizedDescription
         manager.protocolConfiguration = protocolConfiguration

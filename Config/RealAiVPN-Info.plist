@@ -18,6 +18,8 @@
 	<string>Real Ai Router</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>

@@ -947,6 +947,11 @@ final class DashboardModel: ObservableObject {
             return
         }
 
+        if let protectedMatch = RoutingExceptionProtectedProbeGuard.protectedMatch(for: normalized) {
+            monitorStatus = "\(protectedMatch) is used by VPN health checks and cannot be added to routing exceptions"
+            return
+        }
+
         routingExceptions.rules.append(RoutingExceptionRule(value: normalized, mode: mode))
         routingExceptionStore.save(routingExceptions)
         monitorStatus = "Routing exceptions will apply on reconnect"

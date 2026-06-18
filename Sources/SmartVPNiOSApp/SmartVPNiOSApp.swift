@@ -322,6 +322,8 @@ final class iOSDashboardModel: ObservableObject {
     @Published private(set) var vpnLastError: String?
     @Published private(set) var vpnProviderBundleIdentifier: String?
     @Published private(set) var tunnelDiagnostic: TunnelDiagnosticSnapshot?
+    @Published private(set) var vpnActionInFlight = false
+    @Published private(set) var vpnActionTitle: String?
     @Published private(set) var message = "Import an AmneziaWG .conf profile to start."
     @Published private(set) var routeTitle = "Ready"
     @Published private(set) var confidence = 0
@@ -355,6 +357,11 @@ final class iOSDashboardModel: ObservableObject {
             UserDefaults.standard.set(automaticFailoverEnabled, forKey: "ios.automaticFailoverEnabled")
         }
     }
+    @Published var showFailoverNotifications = UserDefaults.standard.object(forKey: "ios.showFailoverNotifications") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(showFailoverNotifications, forKey: "ios.showFailoverNotifications")
+        }
+    }
     @Published var connectOnStartEnabled = UserDefaults.standard.object(forKey: "ios.connectOnStartEnabled") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(connectOnStartEnabled, forKey: "ios.connectOnStartEnabled")
@@ -377,6 +384,17 @@ final class iOSDashboardModel: ObservableObject {
             UserDefaults.standard.set(dnsProtectionEnabled, forKey: "ios.dnsProtectionEnabled")
         }
     }
+    @Published var localNetworkAccessEnabled = UserDefaults.standard.object(forKey: "ios.localNetworkAccessEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(localNetworkAccessEnabled, forKey: "ios.localNetworkAccessEnabled")
+            Task { await vpnManager.prepareProfile(configuration: vpnConfiguration) }
+        }
+    }
+    @Published var ipv6LeakProtectionEnabled = UserDefaults.standard.object(forKey: "ios.ipv6LeakProtectionEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(ipv6LeakProtectionEnabled, forKey: "ios.ipv6LeakProtectionEnabled")
+        }
+    }
 
     private let decoder = AmneziaConfigDecoder()
     private let shadowrocketParser = ShadowrocketVLESSConfigParser()
@@ -397,12 +415,17 @@ final class iOSDashboardModel: ObservableObject {
     private var lastAutomaticFailoverDate: Date?
     private var vpnHardDegradedSince: Date?
     private var profileQuarantineUntil: [String: Date] = [:]
+    private var didPrepareVPNProfile = false
+    private var prepareVPNProfileTask: Task<Void, Never>?
     private var suppressExpectedDisconnectNotification = false
     private var dropRecoveryTask: Task<Void, Never>?
     private var dropRecoveryProfileID: String?
     private var dropRecoveryAttempt = 0
     private var dropRecoveryAttemptCounts: [String: Int] = [:]
     private var dropRecoveryConnectedAt: [String: Date] = [:]
+    private var lastConnectedProfileID: String?
+    private var lastConnectedProfileName: String?
+    private var vpnActionResetTask: Task<Void, Never>?
     private let maxDropReconnectAttempts = 5
     private let dropReconnectDelaySeconds: UInt64 = 2
     private let stableConnectionResetSeconds: TimeInterval = 60
@@ -438,7 +461,8 @@ final class iOSDashboardModel: ObservableObject {
         requestNotificationPermission()
         startMonitoring()
         Task {
-            await vpnManager.prepareProfile(configuration: vpnConfiguration)
+            try? await Task.sleep(for: .milliseconds(900))
+            await prepareVPNProfileIfNeeded()
             await connectOnStartIfNeeded()
         }
     }
@@ -446,10 +470,20 @@ final class iOSDashboardModel: ObservableObject {
     deinit {
         monitoringTask?.cancel()
         dropRecoveryTask?.cancel()
+        vpnActionResetTask?.cancel()
+        prepareVPNProfileTask?.cancel()
     }
 
     var isConnectedOrConnecting: Bool {
         vpnStatus.isConnectedOrConnecting
+    }
+
+    var vpnButtonTitle: String {
+        vpnActionTitle ?? (isConnectedOrConnecting ? "Disconnect" : "Connect")
+    }
+
+    var vpnButtonSystemImage: String {
+        vpnActionInFlight ? "hourglass" : (isConnectedOrConnecting ? "stop.fill" : "power")
     }
 
     var activeProfile: StoredAmneziaConfigProfile? {
@@ -873,7 +907,7 @@ final class iOSDashboardModel: ObservableObject {
                   connectProfile.endpointHost ?? "unknown",
                   providerBundleIdentifier(for: connectProfile))
             await vpnManager.connect(
-                configuration: vpnConfiguration(for: connectProfile),
+                configuration: vpnConfiguration(for: connectProfile, enableOnDemandReconnect: reconnectAfterDropEnabled),
                 transientAmneziaKey: connectProfile.config,
                 routingExceptions: routingExceptions
             )
@@ -881,6 +915,14 @@ final class iOSDashboardModel: ObservableObject {
             NSLog("RealAiVPN iOS connect() returned from vpnManager")
             refreshStatusMessage()
         }
+    }
+
+    func toggleVPNFromUser() {
+        guard !vpnActionInFlight else {
+            return
+        }
+        beginVPNUserAction(title: isConnectedOrConnecting ? "Disconnecting..." : "Connecting...")
+        isConnectedOrConnecting ? disconnect() : connect()
     }
 
     func disconnect() {
@@ -891,6 +933,37 @@ final class iOSDashboardModel: ObservableObject {
         Task {
             await vpnManager.disconnectDisablingOnDemand()
         }
+    }
+
+    private func beginVPNUserAction(title: String, timeoutSeconds: UInt64 = 12) {
+        vpnActionInFlight = true
+        vpnActionTitle = title
+        vpnActionResetTask?.cancel()
+        vpnActionResetTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(timeoutSeconds))
+            await MainActor.run {
+                self?.vpnActionInFlight = false
+                self?.vpnActionTitle = nil
+            }
+        }
+    }
+
+    private func finishVPNUserActionIfSettled(_ status: VPNConnectionStatus) {
+        guard status == .connected || status == .disconnected || status == .invalid || status == .unknown else {
+            return
+        }
+        vpnActionResetTask?.cancel()
+        vpnActionResetTask = nil
+        vpnActionInFlight = false
+        vpnActionTitle = nil
+    }
+
+    private func prepareVPNProfileIfNeeded() async {
+        guard !didPrepareVPNProfile else {
+            return
+        }
+        didPrepareVPNProfile = true
+        await vpnManager.prepareProfile(configuration: vpnConfiguration)
     }
 
     private func connectOnStartIfNeeded() async {
@@ -912,6 +985,8 @@ final class iOSDashboardModel: ObservableObject {
         clearDropRecoveryState()
         dropRecoveryAttemptCounts.removeAll()
         dropRecoveryConnectedAt.removeAll()
+        lastConnectedProfileID = nil
+        lastConnectedProfileName = nil
     }
 
     private func clearDropRecoveryState() {
@@ -921,10 +996,20 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     private func reconnectAfterUnexpectedDrop(profileID: String?, profileName: String) {
-        guard reconnectAfterDropEnabled,
-              dropRecoveryTask == nil,
-              let profileID,
-              profiles.contains(where: { $0.id == profileID }) else {
+        guard reconnectAfterDropEnabled else {
+            NSLog("RealAiVPN iOS dropRecovery skipped: reconnectAfterDrop disabled")
+            return
+        }
+        guard dropRecoveryTask == nil else {
+            NSLog("RealAiVPN iOS dropRecovery skipped: task already running profileID=%@", dropRecoveryProfileID ?? "nil")
+            return
+        }
+        guard let profileID else {
+            NSLog("RealAiVPN iOS dropRecovery skipped: missing profileID")
+            return
+        }
+        guard profiles.contains(where: { $0.id == profileID }) else {
+            NSLog("RealAiVPN iOS dropRecovery skipped: profile not found profileID=%@", profileID)
             return
         }
 
@@ -1083,6 +1168,11 @@ final class iOSDashboardModel: ObservableObject {
             return
         }
 
+        if let protectedMatch = RoutingExceptionProtectedProbeGuard.protectedMatch(for: normalized) {
+            message = "\(protectedMatch) is used by VPN health checks and cannot be added to routing exceptions."
+            return
+        }
+
         routingExceptions.rules.append(RoutingExceptionRule(value: normalized, mode: mode))
         routingExceptionStore.save(routingExceptions)
         message = "Routing exceptions will apply on the next reconnect."
@@ -1181,12 +1271,15 @@ final class iOSDashboardModel: ObservableObject {
         let droppedProfileID = connectedProfileID ?? displayedProfile?.id ?? activeProfile?.id
         let droppedProfileName = displayedProfile?.displayName ?? activeProfile?.displayName ?? "profile"
         vpnStatus = status
+        finishVPNUserActionIfSettled(status)
 
         if status == .connected {
             vpnLastError = nil
             tunnelDiagnostic = nil
             if let profileID = connectedProfileID ?? displayedProfile?.id ?? activeProfile?.id {
                 dropRecoveryConnectedAt[profileID] = Date()
+                lastConnectedProfileID = profileID
+                lastConnectedProfileName = profiles.first { $0.id == profileID }?.displayName ?? droppedProfileName
             }
         }
 
@@ -1202,13 +1295,17 @@ final class iOSDashboardModel: ObservableObject {
 
         if suppressExpectedDisconnectNotification {
             suppressExpectedDisconnectNotification = false
+            lastConnectedProfileID = nil
+            lastConnectedProfileName = nil
             return
         }
 
-        if previousStatus == .connected || previousStatus == .reasserting {
-            resetDropRecoveryAttemptsIfConnectionWasStable(profileID: droppedProfileID)
-            notifyTunnelDropped(profile: droppedProfileName)
-            reconnectAfterUnexpectedDrop(profileID: droppedProfileID, profileName: droppedProfileName)
+        let recoveryProfileID = droppedProfileID ?? lastConnectedProfileID
+        let recoveryProfileName = lastConnectedProfileName ?? droppedProfileName
+        if previousStatus == .connected || previousStatus == .reasserting || lastConnectedProfileID != nil {
+            resetDropRecoveryAttemptsIfConnectionWasStable(profileID: recoveryProfileID)
+            notifyTunnelDropped(profile: recoveryProfileName)
+            reconnectAfterUnexpectedDrop(profileID: recoveryProfileID, profileName: recoveryProfileName)
         }
     }
 
@@ -1230,7 +1327,10 @@ final class iOSDashboardModel: ObservableObject {
         vpnConfiguration(for: activeProfile)
     }
 
-    private func vpnConfiguration(for profile: StoredAmneziaConfigProfile?) -> VPNProfileConfiguration {
+    private func vpnConfiguration(
+        for profile: StoredAmneziaConfigProfile?,
+        enableOnDemandReconnect: Bool = false
+    ) -> VPNProfileConfiguration {
         VPNProfileConfiguration(
             localizedDescription: localizedVPNDescription(for: profile),
             providerBundleIdentifier: providerBundleIdentifier(for: profile),
@@ -1238,7 +1338,9 @@ final class iOSDashboardModel: ObservableObject {
             regionCode: profile?.regionCode ?? "ZZ",
             killSwitchEnabled: killSwitchEnabled,
             dnsProtectionEnabled: dnsProtectionEnabled,
-            autoReconnectOnDemandEnabled: false
+            localNetworkAccessEnabled: localNetworkAccessEnabled,
+            ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled,
+            autoReconnectOnDemandEnabled: enableOnDemandReconnect && reconnectAfterDropEnabled
         )
     }
 
@@ -1387,6 +1489,7 @@ final class iOSDashboardModel: ObservableObject {
     private func startMonitoring() {
         monitoringTask?.cancel()
         monitoringTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(6))
             while !Task.isCancelled {
                 await self?.runMonitoringCycle()
                 try? await Task.sleep(for: .seconds(30))
@@ -1648,6 +1751,10 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     private func notifyFailover(from oldProfile: String, to newProfile: String, reason: String) {
+        guard showFailoverNotifications else {
+            return
+        }
+
         let content = UNMutableNotificationContent()
         content.title = "Real Ai Router switched profile"
         content.body = "\(oldProfile) → \(newProfile). \(reason)"
@@ -1924,30 +2031,41 @@ private struct iOSHomeScreen: View {
 
             metricsGrid
 
-            Button {
-                model.isConnectedOrConnecting ? model.disconnect() : model.connect()
-            } label: {
-                Label(
-                    model.isConnectedOrConnecting ? "Disconnect" : "Connect",
-                    systemImage: model.isConnectedOrConnecting ? "stop.fill" : "power"
-                )
-                .font(.headline.weight(.semibold))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 13)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(model.isConnectedOrConnecting ? .red : .white)
-            .background(
-                model.isConnectedOrConnecting
-                    ? Color.red.opacity(0.10)
-                    : AppTheme.accent,
-                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-            )
+            vpnPrimaryActionButton
         }
         .padding(16)
         .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
         .shadow(color: AppTheme.shadow, radius: 22, x: 0, y: 14)
+    }
+
+    private var vpnPrimaryActionButton: some View {
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+
+        return Label(
+            model.vpnButtonTitle,
+            systemImage: model.vpnButtonSystemImage
+        )
+        .font(.headline.weight(.semibold))
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 20)
+        .foregroundStyle(model.isConnectedOrConnecting ? .red : .white)
+        .background(
+            model.isConnectedOrConnecting
+                ? Color.red.opacity(0.10)
+                : AppTheme.accent,
+            in: shape
+        )
+        .contentShape(shape)
+        .opacity(model.vpnActionInFlight ? 0.45 : 1)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(model.vpnButtonTitle)
+        .accessibilityAddTraits(.isButton)
+        .highPriorityGesture(
+            TapGesture().onEnded {
+                model.toggleVPNFromUser()
+            }
+        )
     }
 
     private var metricsGrid: some View {
@@ -2846,7 +2964,6 @@ private struct iOSSparklineView: View {
 
 private struct iOSSettingsScreen: View {
     @ObservedObject var model: iOSDashboardModel
-    @AppStorage("ios.showNotificationsAfterSwitch") private var showNotificationsAfterSwitch = true
     @AppStorage("ios.appearanceMode") private var appearanceMode = "System"
     @State private var showingCoreAIDebugger = false
     @State private var showCurrentRegions = false
@@ -2858,15 +2975,13 @@ private struct iOSSettingsScreen: View {
             VStack(alignment: .leading, spacing: 18) {
                 settingsSection("GENERAL") {
                     settingNavigationRow(title: "Appearance", value: appearanceMode, systemImage: "circle.lefthalf.filled")
-                    settingToggleRow(title: "Connect to start", systemImage: "power", isOn: $model.connectOnStartEnabled)
-                    settingToggleRow(title: "Reconnect after dropped/reset", systemImage: "arrow.clockwise", isOn: $model.reconnectAfterDropEnabled)
-                    settingToggleRow(title: "Kill Switch", systemImage: "shield.fill", isOn: $model.killSwitchEnabled)
-                    settingToggleRow(title: "DNS Protection", systemImage: "network", isOn: $model.dnsProtectionEnabled)
                 }
 
                 settingsSection("BEHAVIOR") {
-                    settingToggleRow(title: "Auto-switch", systemImage: "arrow.triangle.2.circlepath", isOn: $model.automaticFailoverEnabled)
-                    settingToggleRow(title: "Show Notification", systemImage: "bell.fill", isOn: $showNotificationsAfterSwitch)
+                    settingToggleRow(title: "Connect to start", systemImage: "power", isOn: $model.connectOnStartEnabled)
+                    settingToggleRow(title: "Reconnect to VPN after dropped or reset", systemImage: "arrow.clockwise", isOn: $model.reconnectAfterDropEnabled)
+                    settingToggleRow(title: "Auto-switch when connection is unstable", systemImage: "arrow.triangle.2.circlepath", isOn: $model.automaticFailoverEnabled)
+                    settingToggleRow(title: "Show notification after switch", systemImage: "bell.fill", isOn: $model.showFailoverNotifications)
                 }
 
                 settingsSection("REGIONS") {
@@ -2891,6 +3006,21 @@ private struct iOSSettingsScreen: View {
                         regionRow("Russia", value: "RU")
                         regionRow("Belarus", value: "BY")
                         regionRow("China", value: "CN")
+                    }
+                }
+
+                settingsSection("SECURITY") {
+                    settingToggleRow(title: "Kill Switch", systemImage: "shield.fill", isOn: $model.killSwitchEnabled)
+                    settingToggleRow(title: "DNS Protection", systemImage: "network", isOn: $model.dnsProtectionEnabled)
+                    settingToggleRow(title: "Local Network Access", systemImage: "wifi.router", isOn: $model.localNetworkAccessEnabled)
+                    settingToggleRow(title: "IPv6 Leak Protection", systemImage: "lock.icloud", isOn: $model.ipv6LeakProtectionEnabled)
+                    settingToggleRow(title: "Auto Recovery", systemImage: "cross.case.fill", isOn: $model.automaticFailoverEnabled)
+                    settingButtonRow(title: "Reset Security Settings", value: "", systemImage: "arrow.counterclockwise") {
+                        model.killSwitchEnabled = false
+                        model.dnsProtectionEnabled = true
+                        model.localNetworkAccessEnabled = true
+                        model.ipv6LeakProtectionEnabled = true
+                        model.automaticFailoverEnabled = true
                     }
                 }
 
@@ -3326,22 +3456,36 @@ private struct LegacyiOSDashboardView: View {
             .font(.callout.weight(.semibold))
             .foregroundStyle(AppTheme.accent)
 
-            Button {
-                NSLog("RealAiVPN iOS main connect button tapped connectedOrConnecting=%@",
-                      model.isConnectedOrConnecting ? "true" : "false")
-                model.isConnectedOrConnecting ? model.disconnect() : model.connect()
-            } label: {
-                Label(
-                    model.isConnectedOrConnecting ? "Disconnect" : "Connect",
-                    systemImage: model.isConnectedOrConnecting ? "stop.fill" : "power"
-                )
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(model.isConnectedOrConnecting ? .red : AppTheme.accent)
+            legacyVPNActionButton
         }
         .padding(18)
         .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private var legacyVPNActionButton: some View {
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+
+        return Label(
+            model.vpnButtonTitle,
+            systemImage: model.vpnButtonSystemImage
+        )
+        .font(.headline.weight(.semibold))
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 18)
+        .foregroundStyle(.white)
+        .background(model.isConnectedOrConnecting ? Color.red : AppTheme.accent, in: shape)
+        .contentShape(shape)
+        .opacity(model.vpnActionInFlight ? 0.45 : 1)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(model.vpnButtonTitle)
+        .accessibilityAddTraits(.isButton)
+        .highPriorityGesture(
+            TapGesture().onEnded {
+                NSLog("RealAiVPN iOS main connect button tapped connectedOrConnecting=%@",
+                      model.isConnectedOrConnecting ? "true" : "false")
+                model.toggleVPNFromUser()
+            }
+        )
     }
 
     private var navigationCards: some View {

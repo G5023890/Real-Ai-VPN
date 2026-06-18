@@ -66,7 +66,9 @@ public struct SingBoxConfig: Codable, Equatable, Sendable {
 public struct SingBoxRouteOverrides: Equatable, Sendable {
     public static let providerDNSServers = ["77.88.8.88", "77.88.8.2"]
     public static let providerDNSDomainSuffixes = [
-        "ru",
+        "ru"
+    ]
+    public static let localDiscoveryDomainSuffixes = [
         "local",
         "lan",
         "localhost",
@@ -392,13 +394,14 @@ public struct SingBoxConfigBuilder: Sendable {
         )
         appendRouteRules(
             to: &routeRules,
-            domainSuffixes: ["ru"] + routeOverrides.bypassVPNDomainSuffixes,
+            domainSuffixes: ["ru"] + SingBoxRouteOverrides.localDiscoveryDomainSuffixes + routeOverrides.bypassVPNDomainSuffixes,
             ipCIDRs: [
                 "10.0.0.0/8",
                 "100.64.0.0/10",
                 "169.254.0.0/16",
                 "172.16.0.0/12",
                 "192.168.0.0/16",
+                "17.0.0.0/8",
                 "224.0.0.0/4",
                 "255.255.255.255/32",
                 "77.88.8.88/32",
@@ -494,7 +497,7 @@ public struct SingBoxConfigBuilder: Sendable {
             .uniqued()
         let providerSuffixes = (SingBoxRouteOverrides.providerDNSDomainSuffixes + routeOverrides.bypassVPNDomainSuffixes)
             .map(normalizedDomainSuffix)
-            .filter { !$0.isEmpty && !forceVPNSuffixes.contains($0) }
+            .filter { !$0.isEmpty && !forceVPNSuffixes.contains($0) && !isLocalDiscoverySuffix($0) }
             .uniqued()
 
         var rules: [[String: Any]] = []
@@ -543,6 +546,15 @@ public struct SingBoxConfigBuilder: Sendable {
                 "ip_cidr": normalizedIPCIDRs,
                 "outbound": outbound
             ])
+        }
+    }
+
+    private func isLocalDiscoverySuffix(_ value: String) -> Bool {
+        let suffix = normalizedDomainSuffix(value)
+        guard !suffix.isEmpty else { return false }
+
+        return SingBoxRouteOverrides.localDiscoveryDomainSuffixes.contains { localSuffix in
+            suffix == localSuffix || suffix.hasSuffix(".\(localSuffix)")
         }
     }
 
