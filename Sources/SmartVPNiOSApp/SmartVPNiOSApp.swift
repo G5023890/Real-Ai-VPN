@@ -311,6 +311,24 @@ struct RealAiVPNiOSApp: App {
     }
 }
 
+struct iOSChannelTestingState: Equatable {
+    var isRunning = false
+    var status = "Ready"
+    var currentProfileID: String?
+    var currentProfileName = "None"
+    var testedCount = 0
+    var totalCount = 0
+    var secondsRemaining = 0
+    var lastResult = "No tunnel samples yet"
+
+    var progress: Double {
+        guard totalCount > 0 else {
+            return 0
+        }
+        return min(1, max(0, Double(testedCount) / Double(totalCount)))
+    }
+}
+
 @MainActor
 final class iOSDashboardModel: ObservableObject {
     @Published private(set) var profiles: [StoredAmneziaConfigProfile] = []
@@ -352,6 +370,7 @@ final class iOSDashboardModel: ObservableObject {
     @Published private(set) var rankedServers: [RankedServer] = []
     @Published private(set) var lastProbeDate: Date?
     @Published private(set) var lastRecoveryDecisionLog = ""
+    @Published private(set) var channelTesting = iOSChannelTestingState()
     @Published var automaticFailoverEnabled = UserDefaults.standard.object(forKey: "ios.automaticFailoverEnabled") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(automaticFailoverEnabled, forKey: "ios.automaticFailoverEnabled")
@@ -426,9 +445,13 @@ final class iOSDashboardModel: ObservableObject {
     private var lastConnectedProfileID: String?
     private var lastConnectedProfileName: String?
     private var vpnActionResetTask: Task<Void, Never>?
+    private var channelTestingTask: Task<Void, Never>?
+    private var channelTestingIdleTimerWasDisabled = false
     private let maxDropReconnectAttempts = 5
     private let dropReconnectDelaySeconds: UInt64 = 2
     private let stableConnectionResetSeconds: TimeInterval = 60
+    private let channelTestingDurationSeconds = 120
+    private let channelTestingProbeIntervalSeconds = 20
 
     init() {
         vpnManager.$status
@@ -472,6 +495,7 @@ final class iOSDashboardModel: ObservableObject {
         dropRecoveryTask?.cancel()
         vpnActionResetTask?.cancel()
         prepareVPNProfileTask?.cancel()
+        channelTestingTask?.cancel()
     }
 
     var isConnectedOrConnecting: Bool {
@@ -502,6 +526,18 @@ final class iOSDashboardModel: ObservableObject {
 
     var displayedProfile: StoredAmneziaConfigProfile? {
         vpnStatus.isConnectedOrConnecting ? (connectedProfile ?? activeProfile) : activeProfile
+    }
+
+    var profilesByCoreAIScore: [StoredAmneziaConfigProfile] {
+        let scoresByID = Dictionary(uniqueKeysWithValues: rankedServers.map { ($0.server.id, $0.score) })
+        return profiles.sorted { lhs, rhs in
+            let lhsScore = scoresByID[lhs.id] ?? -1
+            let rhsScore = scoresByID[rhs.id] ?? -1
+            if lhsScore == rhsScore {
+                return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+            }
+            return lhsScore > rhsScore
+        }
     }
 
     var confidenceDetail: String {
@@ -935,6 +971,29 @@ final class iOSDashboardModel: ObservableObject {
         }
     }
 
+    func startChannelTesting() {
+        guard !channelTesting.isRunning else {
+            return
+        }
+        guard !profiles.isEmpty else {
+            channelTesting = iOSChannelTestingState(status: "Import profiles first", lastResult: "No VPN profiles available")
+            return
+        }
+
+        channelTestingTask?.cancel()
+        channelTestingTask = Task { [weak self] in
+            await self?.runChannelTesting()
+        }
+    }
+
+    func stopChannelTesting() {
+        guard channelTesting.isRunning else {
+            return
+        }
+        channelTesting.status = "Stopping..."
+        channelTestingTask?.cancel()
+    }
+
     private func beginVPNUserAction(title: String, timeoutSeconds: UInt64 = 12) {
         vpnActionInFlight = true
         vpnActionTitle = title
@@ -1117,6 +1176,158 @@ final class iOSDashboardModel: ObservableObject {
                 return
             }
             try? await Task.sleep(for: .milliseconds(150))
+        }
+    }
+
+    private func runChannelTesting() async {
+        let testProfiles = profiles
+        let originalProfileID = activeProfileID
+        let wasConnected = vpnStatus.isConnectedOrConnecting
+        channelTestingIdleTimerWasDisabled = UIApplication.shared.isIdleTimerDisabled
+        UIApplication.shared.isIdleTimerDisabled = true
+        monitoringTask?.cancel()
+        cancelDropRecovery()
+
+        channelTesting = iOSChannelTestingState(
+            isRunning: true,
+            status: "Starting tunnel tests",
+            totalCount: testProfiles.count,
+            lastResult: "Preparing VPN profiles"
+        )
+
+        for (index, profile) in testProfiles.enumerated() {
+            guard !Task.isCancelled else {
+                await finishChannelTesting(originalProfileID: originalProfileID, reconnectOriginal: wasConnected, cancelled: true)
+                return
+            }
+
+            channelTesting.currentProfileID = profile.id
+            channelTesting.currentProfileName = profile.displayName
+            channelTesting.status = "Testing \(profile.displayName)"
+            channelTesting.secondsRemaining = channelTestingDurationSeconds
+
+            let succeeded = await testProfileThroughTunnel(profile)
+            guard !Task.isCancelled else {
+                await finishChannelTesting(originalProfileID: originalProfileID, reconnectOriginal: wasConnected, cancelled: true)
+                return
+            }
+            channelTesting.testedCount = index + 1
+            channelTesting.lastResult = succeeded
+                ? "\(profile.displayName): tunnel samples saved"
+                : "\(profile.displayName): connection or probes failed"
+            refreshRoutePreview()
+        }
+
+        await finishChannelTesting(originalProfileID: originalProfileID, reconnectOriginal: wasConnected, cancelled: false)
+    }
+
+    private func testProfileThroughTunnel(_ profile: StoredAmneziaConfigProfile) async -> Bool {
+        do {
+            if vpnStatus.isConnectedOrConnecting {
+                suppressExpectedDisconnectNotification = true
+                await vpnManager.disconnectDisablingOnDemand()
+                await waitUntilVPNIsDisconnected(timeoutSeconds: 8)
+            }
+
+            try profileStore.setActiveProfile(id: profile.id)
+            reloadProfiles()
+            connect()
+
+            guard await waitForDropRecoveryConnection(profileID: profile.id, timeoutSeconds: 25) else {
+                recordFailedTunnelSample(for: profile)
+                return false
+            }
+
+            var allProbes: [ConnectivityProbeResult] = []
+            let started = Date()
+            while Date().timeIntervalSince(started) < TimeInterval(channelTestingDurationSeconds) {
+                guard !Task.isCancelled else {
+                    return false
+                }
+
+                var probes = await vpnProtectedProbes(serverID: profile.id)
+                probes.append(await exitIPProbe(serverID: profile.id))
+                probes.append(await exitCountryProbe(serverID: profile.id))
+                allProbes.append(contentsOf: probes)
+                liveProbeResults = probes
+                recordProbeReliabilitySamples(probes)
+                recordTunnelQualitySample(for: profile, probes: probes)
+                lastProbeDate = Date()
+                refreshRoutePreview()
+
+                let elapsed = Int(Date().timeIntervalSince(started))
+                channelTesting.secondsRemaining = max(0, channelTestingDurationSeconds - elapsed)
+                try? await Task.sleep(for: .seconds(channelTestingProbeIntervalSeconds))
+            }
+
+            if vpnStatus.isConnectedOrConnecting {
+                suppressExpectedDisconnectNotification = true
+                await vpnManager.disconnectDisablingOnDemand()
+                await waitUntilVPNIsDisconnected(timeoutSeconds: 8)
+            }
+
+            return allProbes.contains(where: \.succeeded)
+        } catch {
+            recordFailedTunnelSample(for: profile)
+            channelTesting.lastResult = "\(profile.displayName): \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func recordTunnelQualitySample(for profile: StoredAmneziaConfigProfile, probes: [ConnectivityProbeResult]) {
+        let latencies = probes.compactMap(\.latencyMilliseconds)
+        let averageLatency = latencies.isEmpty ? 3_000 : latencies.reduce(0, +) / Double(latencies.count)
+        let failures = probes.filter { !$0.succeeded }.count
+        let packetLoss = probes.isEmpty ? 1 : Double(failures) / Double(probes.count)
+        let sample = ServerQualitySample(
+            serverID: profile.id,
+            region: RegionCode(profile.regionCode ?? "ZZ"),
+            networkKind: .wifi,
+            latencyMilliseconds: averageLatency,
+            packetLoss: packetLoss,
+            handshakeMilliseconds: averageLatency,
+            recentFailureCount: failures
+        )
+        recordQualitySample(sample)
+    }
+
+    private func recordFailedTunnelSample(for profile: StoredAmneziaConfigProfile) {
+        let sample = ServerQualitySample(
+            serverID: profile.id,
+            region: RegionCode(profile.regionCode ?? "ZZ"),
+            networkKind: .wifi,
+            latencyMilliseconds: 3_000,
+            packetLoss: 1,
+            handshakeMilliseconds: 3_000,
+            recentFailureCount: 5
+        )
+        recordQualitySample(sample)
+    }
+
+    private func finishChannelTesting(originalProfileID: String?, reconnectOriginal: Bool, cancelled: Bool) async {
+        if vpnStatus.isConnectedOrConnecting {
+            suppressExpectedDisconnectNotification = true
+            await vpnManager.disconnectDisablingOnDemand()
+            await waitUntilVPNIsDisconnected(timeoutSeconds: 8)
+        }
+
+        if let originalProfileID,
+           profiles.contains(where: { $0.id == originalProfileID }) {
+            try? profileStore.setActiveProfile(id: originalProfileID)
+            reloadProfiles()
+        }
+
+        UIApplication.shared.isIdleTimerDisabled = channelTestingIdleTimerWasDisabled
+        startMonitoring()
+
+        channelTesting.status = cancelled ? "Stopped" : "Completed"
+        channelTesting.currentProfileID = nil
+        channelTesting.currentProfileName = "None"
+        channelTesting.secondsRemaining = 0
+        channelTesting.isRunning = false
+
+        if reconnectOriginal {
+            connect()
         }
     }
 
@@ -1514,16 +1725,6 @@ final class iOSDashboardModel: ObservableObject {
 
             let tcp = await ConnectivityProbeRunner.tcpConnect(host: endpoint.host, port: endpoint.port)
             let latency = tcp.latency ?? 3_000
-            let sample = ServerQualitySample(
-                serverID: profile.id,
-                region: RegionCode(profile.regionCode ?? "ZZ"),
-                networkKind: .wifi,
-                latencyMilliseconds: latency,
-                packetLoss: tcp.succeeded ? 0 : 1,
-                handshakeMilliseconds: latency,
-                recentFailureCount: tcp.succeeded ? 0 : 1
-            )
-            recordQualitySample(sample)
 
             if profile.id == activeID {
                 probes.append(ConnectivityProbeResult(
@@ -1540,9 +1741,13 @@ final class iOSDashboardModel: ObservableObject {
         }
 
         if vpnStatus.isConnectedOrConnecting, let activeID {
-            probes.append(contentsOf: await vpnProtectedProbes(serverID: activeID))
-            probes.append(await exitIPProbe(serverID: activeID))
-            probes.append(await exitCountryProbe(serverID: activeID))
+            var tunnelProbes = await vpnProtectedProbes(serverID: activeID)
+            tunnelProbes.append(await exitIPProbe(serverID: activeID))
+            tunnelProbes.append(await exitCountryProbe(serverID: activeID))
+            probes.append(contentsOf: tunnelProbes)
+            if let activeProfile = profiles.first(where: { $0.id == activeID }) {
+                recordTunnelQualitySample(for: activeProfile, probes: tunnelProbes)
+            }
         }
 
         liveProbeResults = probes
@@ -1716,6 +1921,9 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     private func applyAutomaticFailoverIfNeeded() async {
+        guard !channelTesting.isRunning else {
+            return
+        }
         guard automaticFailoverEnabled, vpnStatus.isConnectedOrConnecting else {
             return
         }
@@ -1864,6 +2072,7 @@ private enum iOSMainTab: Hashable {
     case home
     case profiles
     case route
+    case test
     case settings
     case statistics
 }
@@ -1903,6 +2112,14 @@ struct iOSDashboardView: View {
             .tag(iOSMainTab.route)
 
             NavigationStack {
+                iOSChannelTestScreen(model: model)
+            }
+            .tabItem {
+                Label("Test", systemImage: "testtube.2")
+            }
+            .tag(iOSMainTab.test)
+
+            NavigationStack {
                 iOSSettingsScreen(model: model)
             }
             .tabItem {
@@ -1920,6 +2137,130 @@ struct iOSDashboardView: View {
         }
         .tint(AppTheme.accent)
         .background(AppTheme.background.ignoresSafeArea())
+    }
+}
+
+private struct iOSChannelTestScreen: View {
+    @ObservedObject var model: iOSDashboardModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                headerCard
+                profileScoresCard
+            }
+            .padding(20)
+        }
+        .navigationTitle("Test")
+        .background(AppTheme.background.ignoresSafeArea())
+    }
+
+    private var headerCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Testing Channel")
+                        .font(.system(size: 24, weight: .bold))
+                    Text(model.channelTesting.status)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
+                Spacer()
+                Image(systemName: model.channelTesting.isRunning ? "waveform.path.ecg" : "testtube.2")
+                    .font(.system(size: 30, weight: .semibold))
+                    .foregroundStyle(AppTheme.accent)
+            }
+
+            ProgressView(value: model.channelTesting.progress)
+                .tint(AppTheme.accent)
+
+            HStack(spacing: 12) {
+                testMetric(title: "Current", value: model.channelTesting.currentProfileName)
+                testMetric(title: "Done", value: "\(model.channelTesting.testedCount)/\(model.channelTesting.totalCount)")
+                testMetric(title: "Left", value: "\(model.channelTesting.secondsRemaining)s")
+            }
+
+            Text(model.channelTesting.lastResult)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(AppTheme.secondaryText)
+
+            Button {
+                model.channelTesting.isRunning ? model.stopChannelTesting() : model.startChannelTesting()
+            } label: {
+                Label(
+                    model.channelTesting.isRunning ? "Stop Testing Channel" : "Start Testing Channel",
+                    systemImage: model.channelTesting.isRunning ? "stop.fill" : "play.fill"
+                )
+                .font(.system(size: 17, weight: .bold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(model.channelTesting.isRunning ? .red : AppTheme.accent)
+            .disabled(model.profiles.isEmpty && !model.channelTesting.isRunning)
+        }
+        .padding(18)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(AppTheme.border, lineWidth: 1)
+        )
+    }
+
+    private var profileScoresCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Core AI Scores")
+                .font(.system(size: 18, weight: .bold))
+
+            if model.profiles.isEmpty {
+                Text("No VPN profiles")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(AppTheme.secondaryText)
+            } else {
+                ForEach(model.profilesByCoreAIScore) { profile in
+                    HStack(spacing: 12) {
+                        Image(systemName: model.channelTesting.currentProfileID == profile.id ? "dot.radiowaves.left.and.right" : "circle")
+                            .foregroundStyle(model.channelTesting.currentProfileID == profile.id ? AppTheme.accent : AppTheme.secondaryText.opacity(0.55))
+                            .frame(width: 24)
+                        Text(profile.displayName)
+                            .font(.system(size: 15, weight: .semibold))
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(score(for: profile))")
+                            .font(.system(size: 18, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(AppTheme.accent)
+                    }
+                    .padding(.vertical, 8)
+                }
+            }
+        }
+        .padding(18)
+        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(AppTheme.border, lineWidth: 1)
+        )
+    }
+
+    private func testMetric(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(AppTheme.secondaryText)
+            Text(value)
+                .font(.system(size: 13, weight: .bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(AppTheme.card.opacity(0.68), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private func score(for profile: StoredAmneziaConfigProfile) -> Int {
+        let value = model.rankedServers.first { $0.server.id == profile.id }?.score ?? 0
+        return Int((value * 100).rounded())
     }
 }
 
@@ -2209,7 +2550,7 @@ private struct iOSHomeScreen: View {
                 .buttonStyle(.plain)
             }
 
-            ForEach(Array(model.profiles.prefix(3))) { profile in
+            ForEach(Array(model.profilesByCoreAIScore.prefix(3))) { profile in
                 Button {
                     model.setActiveProfile(id: profile.id)
                 } label: {
@@ -2405,7 +2746,7 @@ private struct iOSRouteScreen: View {
                 .font(.headline)
                 .foregroundStyle(AppTheme.primaryText)
 
-            ForEach(model.profiles) { profile in
+            ForEach(model.profilesByCoreAIScore) { profile in
                 Button {
                     selectedProfileID = profile.id
                 } label: {
@@ -2997,7 +3338,7 @@ private struct iOSSettingsScreen: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(14)
                         } else {
-                            ForEach(Array(model.profiles.prefix(6))) { profile in
+                            ForEach(Array(model.profilesByCoreAIScore.prefix(6))) { profile in
                                 regionRow(profile.displayName, value: profile.regionCode ?? "Unknown")
                             }
                         }
@@ -3593,7 +3934,7 @@ private struct LegacyiOSDashboardView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 20)
             } else {
-                ForEach(model.profiles) { profile in
+                ForEach(model.profilesByCoreAIScore) { profile in
                     HStack(spacing: 10) {
                         Button {
                             NSLog("RealAiVPN iOS profile row tapped id=%@ name=%@ kind=%@ endpoint=%@",
@@ -3889,7 +4230,7 @@ private struct iOSProfilesScreen: View {
                 if model.profiles.isEmpty {
                     emptyState
                 } else {
-                    ForEach(model.profiles) { profile in
+                    ForEach(model.profilesByCoreAIScore) { profile in
                         profileRow(profile)
                     }
                 }

@@ -606,7 +606,8 @@ public struct CoreMLServerFeatureExtractor: Sendable {
             .sorted { $0.timestamp < $1.timestamp }
         let recentSamples = Array(windowSamples.suffix(CoreMLServerFeatureVector.recentSampleLimit))
 
-        let recentLatency = average(recentSamples.map(\.latencyMilliseconds)) ?? server.lastLatencyMilliseconds ?? 250
+        let hasChannelSamples = !windowSamples.isEmpty
+        let recentLatency = average(recentSamples.map(\.latencyMilliseconds)) ?? 1_200
         let longTermLatency = average(windowSamples.map(\.latencyMilliseconds)) ?? recentLatency
         let recentHandshake = average(recentSamples.map(\.handshakeMilliseconds)) ?? 350
         let longTermHandshake = average(windowSamples.map(\.handshakeMilliseconds)) ?? recentHandshake
@@ -619,37 +620,46 @@ public struct CoreMLServerFeatureExtractor: Sendable {
         let estimatedSuccessRate = min(max(1 - ((recentFailurePressure * 0.65) + (longTermFailurePressure * 0.35)), 0), 1)
 
         let serverProbes = probeHistory
-            .filter { $0.serverID == server.id || ($0.serverID == nil && $0.targetKind == .dnsResolver) }
+            .filter { $0.serverID == server.id }
             .filter { $0.timestamp >= cutoff }
+        let tunnelProbes = serverProbes.filter { $0.targetKind == .vpnProtectedEndpoint || $0.targetKind == .dnsResolver }
+        let endpointProbes = serverProbes.filter { $0.targetKind == .vpnServer }
+        let hasTunnelEvidence = hasChannelSamples || !tunnelProbes.isEmpty
         let dnsAvailability = successRate(
-            serverProbes.filter { $0.method == .dnsQuery || $0.targetKind == .dnsResolver },
-            defaultValue: 1
+            tunnelProbes.filter { $0.method == .dnsQuery || $0.targetKind == .dnsResolver },
+            defaultValue: hasTunnelEvidence ? estimatedSuccessRate : 0.5
         )
         let dohAvailability = successRate(
-            serverProbes.filter { $0.method == .httpGet && $0.targetID.lowercased().contains("dns-query") },
+            tunnelProbes.filter { $0.method == .httpGet && $0.targetID.lowercased().contains("dns-query") },
             defaultValue: dnsAvailability
         )
         let tcpEndpointReachability = successRate(
-            serverProbes.filter { $0.method == .tcpConnect },
+            endpointProbes.filter { $0.method == .tcpConnect },
             defaultValue: 1
         )
         let vpnEndpointReachability = successRate(
-            serverProbes.filter { $0.targetKind == .vpnServer },
+            endpointProbes,
             defaultValue: tcpEndpointReachability
         )
         let exitIPConsistency = successRate(
-            serverProbes.filter { $0.targetKind == .vpnProtectedEndpoint },
-            defaultValue: estimatedSuccessRate
+            tunnelProbes,
+            defaultValue: hasTunnelEvidence ? estimatedSuccessRate : 0.5
         )
         let lastProbe = serverProbes.map(\.timestamp).max()
         let probeFreshness = lastProbe.map { max(0, now.timeIntervalSince($0)) } ?? CoreMLServerFeatureVector.historyWindow
 
-        var heuristicScore = 1.0
-        heuristicScore -= min(((recentLatency * 0.65) + (longTermLatency * 0.35)) / 900, 0.45)
-        heuristicScore -= min(((recentHandshake * 0.65) + (longTermHandshake * 0.35)) / 1_500, 0.2)
-        heuristicScore -= min(((recentLoss * 0.65) + (longTermLoss * 0.35)) * 1.7, 0.25)
-        heuristicScore -= min(((recentFailures * 0.65) + (longTermFailures * 0.35)) * 0.07, 0.25)
-        heuristicScore += min((dnsAvailability + tcpEndpointReachability + vpnEndpointReachability + exitIPConsistency - 3.2) * 0.08, 0.08)
+        var heuristicScore = hasTunnelEvidence ? 1.0 : 0.35
+        if hasTunnelEvidence {
+            heuristicScore -= min(((recentLatency * 0.65) + (longTermLatency * 0.35)) / 900, 0.45)
+            heuristicScore -= min(((recentHandshake * 0.65) + (longTermHandshake * 0.35)) / 1_500, 0.2)
+            heuristicScore -= min(((recentLoss * 0.65) + (longTermLoss * 0.35)) * 1.7, 0.25)
+            heuristicScore -= min(((recentFailures * 0.65) + (longTermFailures * 0.35)) * 0.07, 0.25)
+            heuristicScore += min((dnsAvailability + dohAvailability + exitIPConsistency - 2.4) * 0.08, 0.08)
+        }
+
+        if !endpointProbes.isEmpty, vpnEndpointReachability == 0 {
+            heuristicScore = min(heuristicScore, hasTunnelEvidence ? 0.45 : 0.18)
+        }
 
         if server.healthState == .degraded {
             heuristicScore -= 0.12
@@ -662,9 +672,10 @@ public struct CoreMLServerFeatureExtractor: Sendable {
         }
 
         heuristicScore = min(max(heuristicScore, 0), 1)
-        let pathRisk = 1 - min(dnsAvailability, dohAvailability, tcpEndpointReachability, vpnEndpointReachability, exitIPConsistency)
+        let tunnelRisk = hasTunnelEvidence ? (1 - min(dnsAvailability, dohAvailability, exitIPConsistency)) : 0.65
+        let endpointRisk = endpointProbes.isEmpty ? 0 : (1 - vpnEndpointReachability)
         let qualityRisk = 1 - heuristicScore
-        let degradationRisk = min(max((qualityRisk * 0.7) + (pathRisk * 0.3), 0), 1)
+        let degradationRisk = min(max((qualityRisk * 0.75) + (tunnelRisk * 0.2) + (endpointRisk * 0.05), 0), 1)
         let confidence = confidence(sampleCount: windowSamples.count, recentSampleCount: recentSamples.count, probeCount: serverProbes.count)
 
         return CoreMLServerFeatureVector(
@@ -1062,11 +1073,15 @@ public struct CoreMLServerScorer: ServerScoring {
                     return nil
                 }
 
+                let channelScore = min(
+                    max(output.channelScore, vector.heuristicScore - 0.15),
+                    vector.heuristicScore + 0.15
+                )
                 return RankedServer(
                     server: server,
-                    score: output.channelScore,
+                    score: channelScore,
                     confidence: output.confidence,
-                    reason: "coreml-score=\(String(format: "%.2f", output.channelScore)) risk=\(String(format: "%.2f", output.degradationRisk)) action=\(output.recommendedActionHint.rawValue) samples21d=\(vector.sampleCount21d)"
+                    reason: "coreml-score=\(String(format: "%.2f", channelScore)) model=\(String(format: "%.2f", output.channelScore)) tunnel=\(String(format: "%.2f", vector.heuristicScore)) risk=\(String(format: "%.2f", output.degradationRisk)) action=\(output.recommendedActionHint.rawValue) samples21d=\(vector.sampleCount21d)"
                 )
             }
             .sorted { lhs, rhs in
