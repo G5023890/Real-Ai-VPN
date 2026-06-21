@@ -444,12 +444,17 @@ final class iOSDashboardModel: ObservableObject {
     private var dropRecoveryConnectedAt: [String: Date] = [:]
     private var lastConnectedProfileID: String?
     private var lastConnectedProfileName: String?
+    private var tunnelWatchdogFailureCount = 0
+    private var lastTunnelWatchdogReconnectDate: Date?
+    private var reassertingRecoveryTask: Task<Void, Never>?
     private var vpnActionResetTask: Task<Void, Never>?
     private var channelTestingTask: Task<Void, Never>?
     private var channelTestingIdleTimerWasDisabled = false
     private let maxDropReconnectAttempts = 5
     private let dropReconnectDelaySeconds: UInt64 = 2
     private let stableConnectionResetSeconds: TimeInterval = 60
+    private let tunnelWatchdogFailureThreshold = 2
+    private let tunnelWatchdogReconnectCooldown: TimeInterval = 60
     private let channelTestingDurationSeconds = 120
     private let channelTestingProbeIntervalSeconds = 20
 
@@ -496,6 +501,7 @@ final class iOSDashboardModel: ObservableObject {
         vpnActionResetTask?.cancel()
         prepareVPNProfileTask?.cancel()
         channelTestingTask?.cancel()
+        reassertingRecoveryTask?.cancel()
     }
 
     var isConnectedOrConnecting: Bool {
@@ -1114,6 +1120,11 @@ final class iOSDashboardModel: ObservableObject {
 
             message = "Reconnecting \(profileName) after drop/reset (\(reservedAttempt)/\(maxDropReconnectAttempts))..."
             vpnLastError = nil
+            if vpnStatus.isConnectedOrConnecting {
+                suppressExpectedDisconnectNotification = true
+                await vpnManager.disconnectDisablingOnDemand()
+                await waitUntilVPNIsDisconnected(timeoutSeconds: 8)
+            }
             connect()
 
             if await waitForDropRecoveryConnection(profileID: profileID) {
@@ -1159,8 +1170,7 @@ final class iOSDashboardModel: ObservableObject {
             if Task.isCancelled {
                 return false
             }
-            if (vpnStatus == .connected || vpnStatus == .reasserting),
-               connectedProfileID == profileID {
+            if vpnStatus == .connected, connectedProfileID == profileID {
                 return true
             }
             try? await Task.sleep(for: .milliseconds(300))
@@ -1487,11 +1497,18 @@ final class iOSDashboardModel: ObservableObject {
         if status == .connected {
             vpnLastError = nil
             tunnelDiagnostic = nil
+            tunnelWatchdogFailureCount = 0
+            reassertingRecoveryTask?.cancel()
+            reassertingRecoveryTask = nil
             if let profileID = connectedProfileID ?? displayedProfile?.id ?? activeProfile?.id {
                 dropRecoveryConnectedAt[profileID] = Date()
                 lastConnectedProfileID = profileID
                 lastConnectedProfileName = profiles.first { $0.id == profileID }?.displayName ?? droppedProfileName
             }
+        }
+
+        if status == .reasserting {
+            scheduleReassertingRecovery(profileID: droppedProfileID, profileName: droppedProfileName)
         }
 
         guard status == .disconnected else {
@@ -1501,6 +1518,9 @@ final class iOSDashboardModel: ObservableObject {
         connectedProfileID = nil
         observedExitIP = nil
         observedExitCountry = nil
+        tunnelWatchdogFailureCount = 0
+        reassertingRecoveryTask?.cancel()
+        reassertingRecoveryTask = nil
         tunnelDiagnostic = tunnelDiagnosticsStore.load()
         refreshStatusMessage()
 
@@ -1517,6 +1537,40 @@ final class iOSDashboardModel: ObservableObject {
             resetDropRecoveryAttemptsIfConnectionWasStable(profileID: recoveryProfileID)
             notifyTunnelDropped(profile: recoveryProfileName)
             reconnectAfterUnexpectedDrop(profileID: recoveryProfileID, profileName: recoveryProfileName)
+        }
+    }
+
+    private func scheduleReassertingRecovery(profileID: String?, profileName: String) {
+        guard reconnectAfterDropEnabled, !channelTesting.isRunning else {
+            return
+        }
+        guard dropRecoveryTask == nil else {
+            return
+        }
+        let recoveryProfileID = profileID ?? lastConnectedProfileID
+        guard let recoveryProfileID else {
+            return
+        }
+
+        reassertingRecoveryTask?.cancel()
+        reassertingRecoveryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(10))
+            await MainActor.run {
+                guard let self,
+                      !Task.isCancelled,
+                      self.reconnectAfterDropEnabled,
+                      !self.channelTesting.isRunning,
+                      self.dropRecoveryTask == nil,
+                      self.vpnStatus == .reasserting else {
+                    return
+                }
+
+                let name = self.lastConnectedProfileName ?? profileName
+                self.message = "VPN is still reasserting. Reconnecting \(name)..."
+                NSLog("RealAiVPN iOS reassertingRecovery profileID=%@ name=%@", recoveryProfileID, name)
+                self.notifyTunnelDropped(profile: name)
+                self.reconnectAfterUnexpectedDrop(profileID: recoveryProfileID, profileName: name)
+            }
         }
     }
 
@@ -1551,7 +1605,8 @@ final class iOSDashboardModel: ObservableObject {
             dnsProtectionEnabled: dnsProtectionEnabled,
             localNetworkAccessEnabled: localNetworkAccessEnabled,
             ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled,
-            autoReconnectOnDemandEnabled: enableOnDemandReconnect && reconnectAfterDropEnabled
+            autoReconnectOnDemandEnabled: enableOnDemandReconnect && reconnectAfterDropEnabled,
+            preserveExistingOnDemandReconnect: reconnectAfterDropEnabled
         )
     }
 
@@ -1748,6 +1803,7 @@ final class iOSDashboardModel: ObservableObject {
             if let activeProfile = profiles.first(where: { $0.id == activeID }) {
                 recordTunnelQualitySample(for: activeProfile, probes: tunnelProbes)
             }
+            auditConnectedTunnel(profileID: activeID, probes: tunnelProbes)
         }
 
         liveProbeResults = probes
@@ -1756,6 +1812,63 @@ final class iOSDashboardModel: ObservableObject {
         lastProbeDate = Date()
         refreshRoutePreview()
         await applyAutomaticFailoverIfNeeded()
+    }
+
+    private func auditConnectedTunnel(profileID: String, probes: [ConnectivityProbeResult]) {
+        guard reconnectAfterDropEnabled, !channelTesting.isRunning else {
+            return
+        }
+        guard vpnStatus == .connected || vpnStatus == .reasserting else {
+            tunnelWatchdogFailureCount = 0
+            return
+        }
+        guard connectedProfileID == profileID || displayedProfile?.id == profileID else {
+            return
+        }
+
+        let successCount = probes.filter(\.succeeded).count
+        let successRate = probes.isEmpty ? 0 : Double(successCount) / Double(probes.count)
+        let hasWorkingExit = probes.contains { probe in
+            (probe.targetID == "exit-ip" || probe.targetID == "exit-country") && probe.succeeded
+        }
+        let hasWorkingTunnelProbe = probes.contains { probe in
+            probe.targetKind == .vpnProtectedEndpoint && probe.succeeded
+        }
+        let tunnelLooksAlive = successRate >= 0.4 && hasWorkingTunnelProbe && hasWorkingExit
+
+        if tunnelLooksAlive {
+            tunnelWatchdogFailureCount = 0
+            return
+        }
+
+        tunnelWatchdogFailureCount += 1
+        NSLog(
+            "RealAiVPN iOS tunnelWatchdog failed count=%ld status=%@ profileID=%@ successRate=%.2f workingExit=%@",
+            tunnelWatchdogFailureCount,
+            vpnStatus.rawValue,
+            profileID,
+            successRate,
+            hasWorkingExit ? "true" : "false"
+        )
+
+        let shouldReconnect = vpnStatus == .reasserting || tunnelWatchdogFailureCount >= tunnelWatchdogFailureThreshold
+        guard shouldReconnect, dropRecoveryTask == nil else {
+            return
+        }
+        if let lastTunnelWatchdogReconnectDate,
+           Date().timeIntervalSince(lastTunnelWatchdogReconnectDate) < tunnelWatchdogReconnectCooldown {
+            return
+        }
+
+        lastTunnelWatchdogReconnectDate = Date()
+        tunnelWatchdogFailureCount = 0
+        let profileName = profiles.first { $0.id == profileID }?.displayName
+            ?? displayedProfile?.displayName
+            ?? activeProfile?.displayName
+            ?? "profile"
+        message = "Tunnel stopped responding. Reconnecting \(profileName)..."
+        notifyTunnelDropped(profile: profileName)
+        reconnectAfterUnexpectedDrop(profileID: profileID, profileName: profileName)
     }
 
     private var providerProbeTrust: PathProbeTrust {

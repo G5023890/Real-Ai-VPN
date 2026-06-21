@@ -36,6 +36,7 @@ public struct VPNProfileConfiguration: Hashable, Codable, Sendable {
     public var localNetworkAccessEnabled: Bool
     public var ipv6LeakProtectionEnabled: Bool
     public var autoReconnectOnDemandEnabled: Bool
+    public var preserveExistingOnDemandReconnect: Bool
 
     public init(
         localizedDescription: String = "Real Ai Router",
@@ -46,7 +47,8 @@ public struct VPNProfileConfiguration: Hashable, Codable, Sendable {
         dnsProtectionEnabled: Bool = true,
         localNetworkAccessEnabled: Bool = true,
         ipv6LeakProtectionEnabled: Bool = true,
-        autoReconnectOnDemandEnabled: Bool = false
+        autoReconnectOnDemandEnabled: Bool = false,
+        preserveExistingOnDemandReconnect: Bool = false
     ) {
         self.localizedDescription = localizedDescription
         self.providerBundleIdentifier = providerBundleIdentifier
@@ -57,6 +59,7 @@ public struct VPNProfileConfiguration: Hashable, Codable, Sendable {
         self.localNetworkAccessEnabled = localNetworkAccessEnabled
         self.ipv6LeakProtectionEnabled = ipv6LeakProtectionEnabled
         self.autoReconnectOnDemandEnabled = autoReconnectOnDemandEnabled
+        self.preserveExistingOnDemandReconnect = preserveExistingOnDemandReconnect
     }
 }
 
@@ -234,6 +237,8 @@ public final class RealVPNProfileManager: ObservableObject {
             }
             return protocolConfiguration.providerBundleIdentifier == configuration.providerBundleIdentifier
         } ?? NETunnelProviderManager()
+        let shouldEnableOnDemand = configuration.autoReconnectOnDemandEnabled
+            || (configuration.preserveExistingOnDemandReconnect && manager.isOnDemandEnabled)
         NSLog("RealAiVPN VPNProfileManager loadOrCreate matchedExisting=%@ provider=%@",
               managers.contains(where: {
                   guard $0.localizedDescription == configuration.localizedDescription,
@@ -263,8 +268,8 @@ public final class RealVPNProfileManager: ObservableObject {
         manager.localizedDescription = configuration.localizedDescription
         manager.protocolConfiguration = protocolConfiguration
         manager.isEnabled = true
-        manager.isOnDemandEnabled = configuration.autoReconnectOnDemandEnabled
-        if configuration.autoReconnectOnDemandEnabled {
+        manager.isOnDemandEnabled = shouldEnableOnDemand
+        if shouldEnableOnDemand {
             let connectRule = NEOnDemandRuleConnect()
             connectRule.interfaceTypeMatch = .any
             manager.onDemandRules = [connectRule]
@@ -272,7 +277,7 @@ public final class RealVPNProfileManager: ObservableObject {
             manager.onDemandRules = nil
         }
         NSLog("RealAiVPN VPNProfileManager onDemand=%@ provider=%@",
-              configuration.autoReconnectOnDemandEnabled ? "true" : "false",
+              shouldEnableOnDemand ? "true" : "false",
               configuration.providerBundleIdentifier)
 
         return manager
