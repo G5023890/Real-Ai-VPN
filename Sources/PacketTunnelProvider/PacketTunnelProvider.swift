@@ -15,10 +15,67 @@ private let packetTunnelLogger = Logger(
     category: "PacketTunnelProvider"
 )
 
+private final class TunnelTrafficSampler {
+    typealias ByteReader = @Sendable () async -> (rxBytes: UInt64?, txBytes: UInt64?, source: TunnelTrafficSource)
+
+    private let profileID: String
+    private let protocolKind: String
+    private let store: TunnelTrafficStatsStore
+    private let byteReader: ByteReader
+    private let startedAt = Date()
+    private var task: Task<Void, Never>?
+
+    init(
+        profileID: String,
+        protocolKind: String,
+        store: TunnelTrafficStatsStore = TunnelTrafficStatsStore(),
+        byteReader: @escaping ByteReader
+    ) {
+        self.profileID = profileID
+        self.protocolKind = protocolKind
+        self.store = store
+        self.byteReader = byteReader
+    }
+
+    func start() {
+        task?.cancel()
+        task = Task { [weak self] in
+            guard let self else { return }
+            await self.flush()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(10))
+                guard !Task.isCancelled else { break }
+                await self.flush()
+            }
+        }
+    }
+
+    func stop() async {
+        task?.cancel()
+        task = nil
+        await flush()
+    }
+
+    private func flush() async {
+        let snapshot = await byteReader()
+        store.save(TunnelTrafficStats(
+            profileID: profileID,
+            protocol: protocolKind,
+            startedAt: startedAt,
+            duration: Date().timeIntervalSince(startedAt),
+            rxBytes: snapshot.rxBytes,
+            txBytes: snapshot.txBytes,
+            lastUpdatedAt: Date(),
+            source: snapshot.source
+        ))
+    }
+}
+
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let decoder = AmneziaConfigDecoder()
     private let shadowrocketParser = ShadowrocketVLESSConfigParser()
     private let diagnosticsStore = TunnelDiagnosticsStore()
+    private var trafficSampler: TunnelTrafficSampler?
     private let profileStore = AmneziaConfigProfileStore(
         accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup,
         allowsAuthenticationUI: false
@@ -51,6 +108,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             (options?["routingExceptions"] as? String) ?? (options?["routingExceptions"] as? NSString).map(String.init)
         )
         let providerOptions = storedProviderConfiguration()
+        let profileID = stringOption("serverID", options: options, providerOptions: providerOptions, defaultValue: "active-profile")
+        let configuredProtocolKind = stringOption("protocolKind", options: options, providerOptions: providerOptions, defaultValue: "unknown")
         let killSwitchEnabled = optionBool("killSwitchEnabled", options: options, providerOptions: providerOptions, defaultValue: false)
         let dnsProtectionEnabled = optionBool("dnsProtectionEnabled", options: options, providerOptions: providerOptions, defaultValue: true)
         let localNetworkAccessEnabled = optionBool("localNetworkAccessEnabled", options: options, providerOptions: providerOptions, defaultValue: true)
@@ -76,6 +135,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     localNetworkAccessEnabled: localNetworkAccessEnabled,
                     ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
                 )
+                startUnavailableTrafficSampler(profileID: profileID, protocolKind: configuredProtocolKind == "unknown" ? "singBox" : configuredProtocolKind)
                 saveDiagnostic(stage: "started-vless", message: "sing-box tunnel start returned successfully.")
             } catch {
                 saveDiagnostic(stage: "vless-failed", message: error.localizedDescription)
@@ -115,6 +175,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 localNetworkAccessEnabled: localNetworkAccessEnabled,
                 ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
             )
+            startWireGuardTrafficSampler(profileID: profileID, protocolKind: configuredProtocolKind == "unknown" ? "amneziaWG" : configuredProtocolKind)
             saveDiagnostic(stage: "started-awg", message: "AmneziaWG tunnel start returned successfully.")
         } catch {
             saveDiagnostic(stage: "awg-failed", message: error.localizedDescription)
@@ -160,6 +221,79 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         return defaultValue
     }
+
+    private func stringOption(
+        _ key: String,
+        options: [String: NSObject]?,
+        providerOptions: [String: Any],
+        defaultValue: String
+    ) -> String {
+        if let value = options?[key] as? String, !value.isEmpty {
+            return value
+        }
+        if let value = options?[key] as? NSString, !value.isEqual(to: "") {
+            return String(value)
+        }
+        if let value = providerOptions[key] as? String, !value.isEmpty {
+            return value
+        }
+        return defaultValue
+    }
+
+    private func startUnavailableTrafficSampler(profileID: String, protocolKind: String) {
+        trafficSampler = TunnelTrafficSampler(profileID: profileID, protocolKind: protocolKind) {
+            (nil, nil, .unavailable)
+        }
+        trafficSampler?.start()
+    }
+
+    private func startWireGuardTrafficSampler(profileID: String, protocolKind: String) {
+#if SINGBOX_TUNNEL
+        startUnavailableTrafficSampler(profileID: profileID, protocolKind: protocolKind)
+#else
+        trafficSampler = TunnelTrafficSampler(profileID: profileID, protocolKind: protocolKind) { [weak self] in
+            guard let self else { return (nil, nil, .unavailable) }
+            return await self.currentWireGuardTrafficBytes()
+        }
+        trafficSampler?.start()
+#endif
+    }
+
+#if !SINGBOX_TUNNEL
+    private func currentWireGuardTrafficBytes() async -> (UInt64?, UInt64?, TunnelTrafficSource) {
+        await withCheckedContinuation { continuation in
+            adapter.getRuntimeConfiguration { runtimeConfiguration in
+                guard let runtimeConfiguration else {
+                    continuation.resume(returning: (nil, nil, .unavailable))
+                    return
+                }
+                let totals = Self.parseWireGuardTraffic(from: runtimeConfiguration)
+                continuation.resume(returning: (totals.rx, totals.tx, .wireGuardRuntime))
+            }
+        }
+    }
+
+    private static func parseWireGuardTraffic(from runtimeConfiguration: String) -> (rx: UInt64?, tx: UInt64?) {
+        var rxTotal: UInt64 = 0
+        var txTotal: UInt64 = 0
+        var sawRX = false
+        var sawTX = false
+
+        for line in runtimeConfiguration.split(separator: "\n", omittingEmptySubsequences: true) {
+            if line.hasPrefix("rx_bytes="),
+               let value = UInt64(String(line.dropFirst("rx_bytes=".count))) {
+                rxTotal += value
+                sawRX = true
+            } else if line.hasPrefix("tx_bytes="),
+                      let value = UInt64(String(line.dropFirst("tx_bytes=".count))) {
+                txTotal += value
+                sawTX = true
+            }
+        }
+
+        return (sawRX ? rxTotal : nil, sawTX ? txTotal : nil)
+    }
+#endif
 
     private func startAmneziaWireGuardTunnel(
         with config: AmneziaWireGuardConfig,
@@ -271,6 +405,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             stage: "stopTunnel",
             message: "reason=\(reason.diagnosticName) raw=\(reason.rawValue)"
         )
+        await trafficSampler?.stop()
+        trafficSampler = nil
         await singBoxRuntime.stop()
 #if !SINGBOX_TUNNEL
         await withCheckedContinuation { continuation in

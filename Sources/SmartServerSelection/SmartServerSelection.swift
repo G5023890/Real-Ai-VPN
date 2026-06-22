@@ -100,6 +100,11 @@ public struct ServerQualitySample: Hashable, Codable, Sendable {
     public var packetLoss: Double
     public var handshakeMilliseconds: Double
     public var recentFailureCount: Int
+    public var tunnelDurationSeconds: Double?
+    public var trafficRxBytes: UInt64?
+    public var trafficTxBytes: UInt64?
+    public var trafficObserved: Bool?
+    public var manualProblemReported: Bool?
     public var timestamp: Date
 
     public init(
@@ -111,6 +116,11 @@ public struct ServerQualitySample: Hashable, Codable, Sendable {
         packetLoss: Double,
         handshakeMilliseconds: Double,
         recentFailureCount: Int,
+        tunnelDurationSeconds: Double? = nil,
+        trafficRxBytes: UInt64? = nil,
+        trafficTxBytes: UInt64? = nil,
+        trafficObserved: Bool? = nil,
+        manualProblemReported: Bool? = nil,
         timestamp: Date = Date()
     ) {
         self.serverID = serverID
@@ -121,7 +131,25 @@ public struct ServerQualitySample: Hashable, Codable, Sendable {
         self.packetLoss = min(max(packetLoss, 0), 1)
         self.handshakeMilliseconds = max(0, handshakeMilliseconds)
         self.recentFailureCount = max(0, recentFailureCount)
+        self.tunnelDurationSeconds = tunnelDurationSeconds.map { max(0, $0) }
+        self.trafficRxBytes = trafficRxBytes
+        self.trafficTxBytes = trafficTxBytes
+        self.trafficObserved = trafficObserved
+        self.manualProblemReported = manualProblemReported
         self.timestamp = timestamp
+    }
+
+    public var trafficTotalBytes: UInt64? {
+        switch (trafficRxBytes, trafficTxBytes) {
+        case (.some(let rx), .some(let tx)):
+            return rx + tx
+        case (.some(let rx), .none):
+            return rx
+        case (.none, .some(let tx)):
+            return tx
+        case (.none, .none):
+            return nil
+        }
     }
 }
 
@@ -575,6 +603,10 @@ public struct CoreMLServerFeatureVector: Hashable, Codable, Sendable {
     public var vpnEndpointReachability: Double
     public var exitIPConsistency: Double
     public var probeFreshnessSeconds: Double
+    public var recentTunnelDurationSeconds: Double
+    public var trafficActivityScore: Double
+    public var idleWhileConnectedScore: Double
+    public var manualProblemPressure: Double
     public var heuristicScore: Double
     public var degradationRisk: Double
     public var confidence: Double
@@ -618,6 +650,23 @@ public struct CoreMLServerFeatureExtractor: Sendable {
         let recentFailurePressure = min(max(recentFailures / 4, 0), 1)
         let longTermFailurePressure = min(max(longTermFailures / 4, 0), 1)
         let estimatedSuccessRate = min(max(1 - ((recentFailurePressure * 0.65) + (longTermFailurePressure * 0.35)), 0), 1)
+        let recentTunnelDuration = average(recentSamples.compactMap(\.tunnelDurationSeconds)) ?? 0
+        let recentTrafficBytes = recentSamples.compactMap(\.trafficTotalBytes)
+        let trafficActivityScore: Double
+        if recentTrafficBytes.isEmpty {
+            trafficActivityScore = 0.5
+        } else {
+            let observedCount = recentSamples.filter { $0.trafficObserved == true || (($0.trafficTotalBytes ?? 0) > 0) }.count
+            trafficActivityScore = min(max(Double(observedCount) / Double(max(recentSamples.count, 1)), 0), 1)
+        }
+        let idleWhileConnectedScore: Double
+        if recentSamples.contains(where: { $0.trafficObserved != nil }) {
+            let idleCount = recentSamples.filter { $0.trafficObserved == false && ($0.tunnelDurationSeconds ?? 0) >= 30 }.count
+            idleWhileConnectedScore = min(max(Double(idleCount) / Double(max(recentSamples.count, 1)), 0), 1)
+        } else {
+            idleWhileConnectedScore = 0
+        }
+        let manualProblemPressure = min(max(Double(recentSamples.filter { $0.manualProblemReported == true }.count) / 3, 0), 1)
 
         let serverProbes = probeHistory
             .filter { $0.serverID == server.id }
@@ -655,6 +704,10 @@ public struct CoreMLServerFeatureExtractor: Sendable {
             heuristicScore -= min(((recentLoss * 0.65) + (longTermLoss * 0.35)) * 1.7, 0.25)
             heuristicScore -= min(((recentFailures * 0.65) + (longTermFailures * 0.35)) * 0.07, 0.25)
             heuristicScore += min((dnsAvailability + dohAvailability + exitIPConsistency - 2.4) * 0.08, 0.08)
+            heuristicScore += min(max(trafficActivityScore - 0.55, 0) * 0.08, 0.04)
+            heuristicScore += min(recentTunnelDuration / 3_600, 0.04)
+            heuristicScore -= min(idleWhileConnectedScore * 0.08, 0.08)
+            heuristicScore -= min(manualProblemPressure * 0.22, 0.22)
         }
 
         if !endpointProbes.isEmpty, vpnEndpointReachability == 0 {
@@ -703,6 +756,10 @@ public struct CoreMLServerFeatureExtractor: Sendable {
             vpnEndpointReachability: vpnEndpointReachability,
             exitIPConsistency: exitIPConsistency,
             probeFreshnessSeconds: probeFreshness,
+            recentTunnelDurationSeconds: recentTunnelDuration,
+            trafficActivityScore: trafficActivityScore,
+            idleWhileConnectedScore: idleWhileConnectedScore,
+            manualProblemPressure: manualProblemPressure,
             heuristicScore: heuristicScore,
             degradationRisk: degradationRisk,
             confidence: confidence
@@ -999,7 +1056,7 @@ public struct HeuristicServerScorer: ServerScoring, Sendable {
         )
         let score = vector.heuristicScore
         let confidence = vector.confidence
-        let reason = "latency=\(Int(vector.recentLatencyMilliseconds))ms long=\(Int(vector.longTermLatencyMilliseconds))ms handshake=\(Int(vector.recentHandshakeMilliseconds))ms loss=\(Int(vector.recentPacketLoss * 100))% samples21d=\(vector.sampleCount21d)"
+        let reason = "latency=\(Int(vector.recentLatencyMilliseconds))ms long=\(Int(vector.longTermLatencyMilliseconds))ms handshake=\(Int(vector.recentHandshakeMilliseconds))ms loss=\(Int(vector.recentPacketLoss * 100))% traffic=\(Int((vector.trafficActivityScore * 100).rounded()))% manual=\(Int((vector.manualProblemPressure * 100).rounded()))% samples21d=\(vector.sampleCount21d)"
 
         return RankedServer(server: server, score: score, confidence: confidence, reason: reason)
     }
@@ -1081,7 +1138,7 @@ public struct CoreMLServerScorer: ServerScoring {
                     server: server,
                     score: channelScore,
                     confidence: output.confidence,
-                    reason: "coreml-score=\(String(format: "%.2f", channelScore)) model=\(String(format: "%.2f", output.channelScore)) tunnel=\(String(format: "%.2f", vector.heuristicScore)) risk=\(String(format: "%.2f", output.degradationRisk)) action=\(output.recommendedActionHint.rawValue) samples21d=\(vector.sampleCount21d)"
+                    reason: "coreml-score=\(String(format: "%.2f", channelScore)) model=\(String(format: "%.2f", output.channelScore)) tunnel=\(String(format: "%.2f", vector.heuristicScore)) traffic=\(String(format: "%.2f", vector.trafficActivityScore)) manual=\(String(format: "%.2f", vector.manualProblemPressure)) risk=\(String(format: "%.2f", output.degradationRisk)) action=\(output.recommendedActionHint.rawValue) samples21d=\(vector.sampleCount21d)"
                 )
             }
             .sorted { lhs, rhs in
@@ -1156,6 +1213,10 @@ public struct CoreMLServerScorer: ServerScoring {
             "vpnEndpointReachability": MLFeatureValue(double: vector.vpnEndpointReachability),
             "exitIPConsistency": MLFeatureValue(double: vector.exitIPConsistency),
             "probeFreshnessSeconds": MLFeatureValue(double: vector.probeFreshnessSeconds),
+            "recentTunnelDurationSeconds": MLFeatureValue(double: vector.recentTunnelDurationSeconds),
+            "trafficActivityScore": MLFeatureValue(double: vector.trafficActivityScore),
+            "idleWhileConnectedScore": MLFeatureValue(double: vector.idleWhileConnectedScore),
+            "manualProblemPressure": MLFeatureValue(double: vector.manualProblemPressure),
             "heuristicScore": MLFeatureValue(double: vector.heuristicScore),
             "degradationRisk": MLFeatureValue(double: vector.degradationRisk),
             "featureConfidence": MLFeatureValue(double: vector.confidence)
@@ -1202,7 +1263,7 @@ public struct CoreMLServerScorer: ServerScoring {
             1 - min(vector.recentLatencyMilliseconds / 1_200, 1),
             1 - min(vector.recentHandshakeMilliseconds / 2_500, 1),
             1 - vector.recentPacketLoss,
-            1 - vector.recentFailurePressure
+            1 - min(vector.recentFailurePressure + (vector.manualProblemPressure * 0.5), 1)
         ]
 
         for (index, value) in values.enumerated() {

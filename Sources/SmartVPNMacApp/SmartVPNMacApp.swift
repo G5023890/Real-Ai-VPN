@@ -408,6 +408,7 @@ struct VPNChannelStatistics: Identifiable {
     var reliabilitySummary: ProbeReliabilitySummary?
     var ranking: RankedServer?
     var dailyReport: VPNChannelDailyReport?
+    var trafficStats: TunnelTrafficStats?
     var isActive: Bool
     var isConnected: Bool
 
@@ -445,6 +446,28 @@ struct VPNChannelStatistics: Identifiable {
 
     var isCurrentCoreAIProfile: Bool {
         isConnected || isActive
+    }
+
+    var trafficSummaryText: String {
+        guard let trafficStats, trafficStats.source != .unavailable else {
+            return "Traffic: unknown"
+        }
+        return "Traffic: \(Self.formatBytes(trafficStats.rxBytes)) down / \(Self.formatBytes(trafficStats.txBytes)) up"
+    }
+
+    private static func formatBytes(_ bytes: UInt64?) -> String {
+        guard let bytes else { return "--" }
+        let value = Double(bytes)
+        if bytes >= 1_073_741_824 {
+            return String(format: "%.1f GB", value / 1_073_741_824)
+        }
+        if bytes >= 1_048_576 {
+            return String(format: "%.1f MB", value / 1_048_576)
+        }
+        if bytes >= 1_024 {
+            return String(format: "%.1f KB", value / 1_024)
+        }
+        return "\(bytes) B"
     }
 }
 
@@ -673,6 +696,7 @@ final class DashboardModel: ObservableObject {
     @Published private(set) var routeDecision: RouteDecision
     @Published private(set) var healthAssessment: PreventiveHealthAssessment
     @Published private(set) var rankedServers: [RankedServer] = []
+    @Published private(set) var currentTrafficStats: TunnelTrafficStats?
     @Published private(set) var vpnStatus: VPNConnectionStatus = .disconnected
     @Published private(set) var vpnErrorMessage: String?
     @Published private(set) var tunnelDiagnostic: TunnelDiagnosticSnapshot?
@@ -766,6 +790,7 @@ final class DashboardModel: ObservableObject {
     private let probeReliabilityAnalyzer = ProbeReliabilityAnalyzer()
     private let routingExceptionStore = RoutingExceptionStore()
     private let tunnelDiagnosticsStore = TunnelDiagnosticsStore()
+    private let tunnelTrafficStatsStore = TunnelTrafficStatsStore()
     private lazy var monitor = PreventiveVPNHealthMonitor(selector: selector, reliabilityAnalyzer: probeReliabilityAnalyzer)
     private var cancellables: Set<AnyCancellable> = []
     private var qualitySamples: [ServerQualitySample] = []
@@ -830,6 +855,7 @@ final class DashboardModel: ObservableObject {
         refreshPremiumKeyState()
         loadQualityHistory()
         loadProbeReliabilityHistory()
+        loadTunnelTrafficStats()
         startMonitoring()
         configureLaunchAtLogin(launchAtLoginEnabled)
         Task {
@@ -1009,6 +1035,7 @@ final class DashboardModel: ObservableObject {
                 reliabilitySummary: reliability,
                 ranking: ranking,
                 dailyReport: dailyReportsByServerID[server.id],
+                trafficStats: currentTrafficStats?.profileID == server.id ? currentTrafficStats : nil,
                 isActive: server.id == activeID,
                 isConnected: vpnStatus.isConnectedOrConnecting && server.id == connectedID
             )
@@ -1520,7 +1547,11 @@ final class DashboardModel: ObservableObject {
             latencyMilliseconds: averageLatency,
             packetLoss: packetLoss,
             handshakeMilliseconds: averageLatency,
-            recentFailureCount: failures
+            recentFailureCount: failures,
+            tunnelDurationSeconds: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.duration : nil,
+            trafficRxBytes: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.rxBytes : nil,
+            trafficTxBytes: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.txBytes : nil,
+            trafficObserved: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.trafficObserved : nil
         )
         recordQualitySample(sample)
     }
@@ -1536,6 +1567,57 @@ final class DashboardModel: ObservableObject {
             recentFailureCount: 5
         )
         recordQualitySample(sample)
+    }
+
+    func analyzeCurrentChannel() {
+        Task { await analyzeCurrentChannelNow(markProblem: false) }
+    }
+
+    func markCurrentChannelProblem() {
+        Task { await analyzeCurrentChannelNow(markProblem: true) }
+    }
+
+    private func analyzeCurrentChannelNow(markProblem: Bool) async {
+        loadTunnelTrafficStats()
+        guard let profile = displayedConfigProfile ?? activeConfigProfile else {
+            monitorStatus = "Select a VPN profile to analyze"
+            return
+        }
+
+        var probes = await vpnProtectedProbes(serverID: profile.id)
+        probes.append(await exitIPProbe(serverID: profile.id))
+        probes.append(await exitCountryProbe(serverID: profile.id))
+        recordProbeReliabilitySamples(probes)
+
+        if markProblem {
+            let sample = ServerQualitySample(
+                serverID: profile.id,
+                region: RegionCode(profile.regionCode ?? "ZZ"),
+                networkKind: .wifi,
+                latencyMilliseconds: 3_000,
+                packetLoss: 1,
+                handshakeMilliseconds: 3_000,
+                recentFailureCount: 5,
+                tunnelDurationSeconds: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.duration : nil,
+                trafficRxBytes: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.rxBytes : nil,
+                trafficTxBytes: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.txBytes : nil,
+                trafficObserved: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.trafficObserved : nil,
+                manualProblemReported: true
+            )
+            recordQualitySample(sample)
+        } else {
+            recordTunnelQualitySample(for: profile, probes: probes)
+        }
+
+        liveProbeResults = probes
+        tunnelDiagnostic = tunnelDiagnosticsStore.load()
+        lastProbeDate = Date()
+        refresh()
+
+        let successCount = probes.filter(\.succeeded).count
+        monitorStatus = markProblem
+            ? "Problem marked for \(profile.displayName). \(successCount)/\(probes.count) tunnel checks passed."
+            : "Analyzed \(profile.displayName). \(successCount)/\(probes.count) tunnel checks passed."
     }
 
     private func finishChannelTesting(originalProfileID: String?, reconnectOriginal: Bool, cancelled: Bool) async {
@@ -2044,6 +2126,7 @@ final class DashboardModel: ObservableObject {
             providerBundleIdentifier: providerBundleIdentifier(for: profile),
             serverID: profile?.id ?? server.id,
             regionCode: profile?.regionCode ?? server.region.rawValue,
+            protocolKind: profile?.kind == .singBoxVLESSReality ? VPNProtocolKind.singBox.rawValue : VPNProtocolKind.amneziaWG.rawValue,
             killSwitchEnabled: killSwitchEnabled,
             dnsProtectionEnabled: dnsProtectionEnabled,
             localNetworkAccessEnabled: localNetworkAccessEnabled,
@@ -2211,6 +2294,10 @@ final class DashboardModel: ObservableObject {
         refresh()
     }
 
+    private func loadTunnelTrafficStats() {
+        currentTrafficStats = tunnelTrafficStatsStore.load()
+    }
+
     private func startMonitoring() {
         monitoringTask?.cancel()
         monitoringTask = Task { [weak self] in
@@ -2222,6 +2309,7 @@ final class DashboardModel: ObservableObject {
     }
 
     private func runMonitoringCycle() async {
+        loadTunnelTrafficStats()
         guard !configProfiles.isEmpty else {
             monitorStatus = "Import profiles to enable live probes"
             return
@@ -2583,7 +2671,6 @@ private enum MacSidebarPage: String, CaseIterable, Identifiable {
     case dashboard = "Dashboard"
     case profiles = "VPN Profiles"
     case routing = "Routing"
-    case test = "Test"
     case settings = "Settings"
     case statistics = "Stat"
     case about = "About"
@@ -2598,8 +2685,6 @@ private enum MacSidebarPage: String, CaseIterable, Identifiable {
             return "server.rack"
         case .routing:
             return "arrow.triangle.branch"
-        case .test:
-            return "testtube.2"
         case .settings:
             return "gearshape"
         case .statistics:
@@ -2894,9 +2979,6 @@ struct DashboardView: View {
                     .padding(compact ? 14 : 24)
             case .routing:
                 MacRoutingWorkspace(model: model, theme: theme)
-                    .padding(compact ? 14 : 24)
-            case .test:
-                MacChannelTestWorkspace(model: model, theme: theme)
                     .padding(compact ? 14 : 24)
             case .settings:
                 MacSettingsWorkspace(
@@ -3562,7 +3644,6 @@ private struct MacStatisticsWorkspace: View {
                 .foregroundStyle(theme.primaryText)
 
             liveHealthPanel
-            todayReportPanel
             channelsPanel
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -3593,41 +3674,6 @@ private struct MacStatisticsWorkspace: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(theme.tertiaryText)
             }
-        }
-        .padding(24)
-        .macLiquidCard(theme, radius: 16)
-    }
-
-    private var todayReportPanel: some View {
-        let reports = model.channelStatistics.compactMap(\.dailyReport)
-        let best = reports.max { $0.channelScore < $1.channelScore }
-        let averageScore = reports.isEmpty ? 0 : reports.reduce(0) { $0 + $1.channelScore } / Double(reports.count)
-        let averageRisk = reports.isEmpty ? 0 : reports.reduce(0) { $0 + $1.degradationRisk } / Double(reports.count)
-        let failures = reports.reduce(0) { $0 + $1.failureCount }
-        let samples = reports.reduce(0) { $0 + $1.sampleCount + $1.probeCount }
-
-        return VStack(alignment: .leading, spacing: 18) {
-            HStack {
-                Text("Today Report")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(theme.primaryText)
-                Spacer()
-                Label("\(samples) checks", systemImage: "calendar")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(theme.secondaryText)
-            }
-
-            HStack(spacing: 14) {
-                todayMetric("Score", "\(Int((averageScore * 100).rounded()))", tint: .teal)
-                todayMetric("Risk", formatPercent(averageRisk), tint: riskColor(averageRisk))
-                todayMetric("Failures", "\(failures)", tint: failures == 0 ? .green : .orange)
-                todayMetric("Best", best?.region.rawValue ?? "--", tint: .blue)
-            }
-
-            Text(best?.summaryText ?? "No VPN channel data has been collected today.")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(theme.secondaryText)
-                .lineLimit(2)
         }
         .padding(24)
         .macLiquidCard(theme, radius: 16)
@@ -3725,6 +3771,32 @@ private struct MacStatisticsWorkspace: View {
                 channelMetric("Loss", formatPercent(channel.averagePacketLoss), sparkSeed: 0.30)
                 channelMetric("Checks", "\(channel.coreMLEvidenceCount)", sparkSeed: nil)
                 channelMetric("Last", relativeTime(channel.lastSeen), sparkSeed: nil)
+                channelMetric("RX", formatBytes(channel.trafficStats?.rxBytes), sparkSeed: nil)
+                channelMetric("TX", formatBytes(channel.trafficStats?.txBytes), sparkSeed: nil)
+                channelMetric("Traffic", channel.trafficStats?.source == .unavailable ? "Unknown" : relativeDuration(channel.trafficStats?.duration), sparkSeed: nil)
+            }
+
+            HStack(spacing: 10) {
+                Text(channel.trafficSummaryText)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(theme.secondaryText)
+                    .lineLimit(1)
+                Spacer()
+                Button {
+                    model.analyzeCurrentChannel()
+                } label: {
+                    Label("Analyze Channel", systemImage: "stethoscope")
+                }
+                .buttonStyle(.bordered)
+                .tint(theme.accent)
+
+                Button {
+                    model.markCurrentChannelProblem()
+                } label: {
+                    Label("Mark Problem", systemImage: "exclamationmark.triangle.fill")
+                }
+                .buttonStyle(.bordered)
+                .tint(theme.warning)
             }
         }
         .padding(18)
@@ -3835,24 +3907,6 @@ private struct MacStatisticsWorkspace: View {
         "\(Int((channel.coreMLScore * 100).rounded()))"
     }
 
-    private func todayMetric(_ title: String, _ value: String, tint: Color) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(theme.secondaryText)
-            Text(value)
-                .font(.system(size: 22, weight: .bold, design: .rounded))
-                .foregroundStyle(tint)
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.stroke, lineWidth: 1))
-    }
-
     private func channelMetric(_ title: String, _ value: String, sparkSeed: Double?) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
@@ -3890,6 +3944,32 @@ private struct MacStatisticsWorkspace: View {
 
     private func formatPercent(_ value: Double) -> String {
         "\(Int((value * 100).rounded()))%"
+    }
+
+    private func formatBytes(_ bytes: UInt64?) -> String {
+        guard let bytes else { return "--" }
+        let value = Double(bytes)
+        if bytes >= 1_073_741_824 {
+            return String(format: "%.1f GB", value / 1_073_741_824)
+        }
+        if bytes >= 1_048_576 {
+            return String(format: "%.1f MB", value / 1_048_576)
+        }
+        if bytes >= 1_024 {
+            return String(format: "%.1f KB", value / 1_024)
+        }
+        return "\(bytes) B"
+    }
+
+    private func relativeDuration(_ duration: TimeInterval?) -> String {
+        guard let duration else { return "--" }
+        if duration >= 3_600 {
+            return "\(Int(duration / 3_600))h"
+        }
+        if duration >= 60 {
+            return "\(Int(duration / 60))m"
+        }
+        return "\(Int(duration))s"
     }
 
     private func actionLabel(_ action: CoreMLRecommendedActionHint) -> String {
@@ -4281,117 +4361,6 @@ private struct MacSettingsWorkspace: View {
         case .failure(let error):
             message = "Could not import config: \(error.localizedDescription)"
         }
-    }
-}
-
-private struct MacChannelTestWorkspace: View {
-    @ObservedObject var model: DashboardModel
-    let theme: MacLiquidTheme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack(alignment: .center) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Test")
-                        .font(.system(size: 28, weight: .bold))
-                    Text("Testing Channel")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(theme.secondaryText)
-                }
-                Spacer()
-                Button {
-                    model.channelTesting.isRunning ? model.stopChannelTesting() : model.startChannelTesting()
-                } label: {
-                    Label(
-                        model.channelTesting.isRunning ? "Stop Testing Channel" : "Start Testing Channel",
-                        systemImage: model.channelTesting.isRunning ? "stop.fill" : "play.fill"
-                    )
-                    .frame(minWidth: 190)
-                }
-                .controlSize(.large)
-                .buttonStyle(.borderedProminent)
-                .tint(model.channelTesting.isRunning ? theme.danger : theme.accent)
-                .disabled(model.configProfiles.isEmpty && !model.channelTesting.isRunning)
-            }
-
-            VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(model.channelTesting.status)
-                            .font(.system(size: 18, weight: .bold))
-                        Text(model.channelTesting.lastResult)
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(theme.secondaryText)
-                    }
-                    Spacer()
-                    Image(systemName: model.channelTesting.isRunning ? "waveform.path.ecg" : "testtube.2")
-                        .font(.system(size: 28, weight: .semibold))
-                        .foregroundStyle(theme.accent)
-                }
-
-                ProgressView(value: model.channelTesting.progress)
-                    .tint(theme.accent)
-
-                HStack(spacing: 12) {
-                    metricCard(title: "Current", value: model.channelTesting.currentProfileName)
-                    metricCard(title: "Done", value: "\(model.channelTesting.testedCount)/\(model.channelTesting.totalCount)")
-                    metricCard(title: "Left", value: "\(model.channelTesting.secondsRemaining)s")
-                }
-            }
-            .padding(18)
-            .macLiquidCard(theme, radius: 16)
-
-            VStack(alignment: .leading, spacing: 14) {
-                Text("Core AI Scores")
-                    .font(.system(size: 18, weight: .bold))
-
-                if model.configProfiles.isEmpty {
-                    Text("No VPN profiles")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(theme.secondaryText)
-                } else {
-                    ForEach(model.configProfilesByCoreAIScore) { profile in
-                        HStack(spacing: 12) {
-                            Image(systemName: model.channelTesting.currentProfileID == profile.id ? "dot.radiowaves.left.and.right" : "circle")
-                                .foregroundStyle(model.channelTesting.currentProfileID == profile.id ? theme.accent : theme.secondaryText.opacity(0.55))
-                                .frame(width: 24)
-                            Text(profile.displayName)
-                                .font(.system(size: 13, weight: .semibold))
-                                .lineLimit(1)
-                            Spacer()
-                            Text("\(score(for: profile))")
-                                .font(.system(size: 18, weight: .bold, design: .rounded))
-                                .monospacedDigit()
-                                .foregroundStyle(theme.accent)
-                        }
-                        .padding(.vertical, 7)
-                    }
-                }
-            }
-            .padding(18)
-            .macLiquidCard(theme, radius: 16)
-        }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-    }
-
-    private func metricCard(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title)
-                .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(theme.secondaryText)
-            Text(value)
-                .font(.system(size: 13, weight: .bold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.72)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(theme.rowFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    private func score(for profile: StoredAmneziaConfigProfile) -> Int {
-        let value = model.rankedServers.first { $0.server.id == profile.id }?.score ?? 0
-        return Int((value * 100).rounded())
     }
 }
 

@@ -173,6 +173,7 @@ struct iOSVPNChannelStatistics: Identifiable {
     var reliabilitySummary: ProbeReliabilitySummary?
     var ranking: RankedServer?
     var dailyReport: VPNChannelDailyReport?
+    var trafficStats: TunnelTrafficStats?
     var isActive: Bool
     var isConnected: Bool
 
@@ -210,6 +211,28 @@ struct iOSVPNChannelStatistics: Identifiable {
 
     var isCurrentCoreAIProfile: Bool {
         isConnected || isActive
+    }
+
+    var trafficSummaryText: String {
+        guard let trafficStats, trafficStats.source != .unavailable else {
+            return "Traffic: unknown"
+        }
+        return "Traffic: \(Self.formatBytes(trafficStats.rxBytes)) down / \(Self.formatBytes(trafficStats.txBytes)) up"
+    }
+
+    private static func formatBytes(_ bytes: UInt64?) -> String {
+        guard let bytes else { return "--" }
+        let value = Double(bytes)
+        if bytes >= 1_073_741_824 {
+            return String(format: "%.1f GB", value / 1_073_741_824)
+        }
+        if bytes >= 1_048_576 {
+            return String(format: "%.1f MB", value / 1_048_576)
+        }
+        if bytes >= 1_024 {
+            return String(format: "%.1f KB", value / 1_024)
+        }
+        return "\(bytes) B"
     }
 }
 
@@ -368,6 +391,7 @@ final class iOSDashboardModel: ObservableObject {
         recommendedAction: .askUser(reason: "collecting")
     )
     @Published private(set) var rankedServers: [RankedServer] = []
+    @Published private(set) var currentTrafficStats: TunnelTrafficStats?
     @Published private(set) var lastProbeDate: Date?
     @Published private(set) var lastRecoveryDecisionLog = ""
     @Published private(set) var channelTesting = iOSChannelTestingState()
@@ -420,6 +444,7 @@ final class iOSDashboardModel: ObservableObject {
     private let profileStore = AmneziaConfigProfileStore(accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup)
     private let routingExceptionStore = RoutingExceptionStore()
     private let tunnelDiagnosticsStore = TunnelDiagnosticsStore()
+    private let tunnelTrafficStatsStore = TunnelTrafficStatsStore()
     private let vpnManager = RealVPNProfileManager()
     private let selector = SmartServerSelector()
     private let qualityHistoryStore = LocalProfileQualityHistoryStore()
@@ -486,6 +511,7 @@ final class iOSDashboardModel: ObservableObject {
         reloadRoutingExceptions()
         loadQualityHistory()
         loadProbeReliabilityHistory()
+        loadTunnelTrafficStats()
         requestNotificationPermission()
         startMonitoring()
         Task {
@@ -633,6 +659,7 @@ final class iOSDashboardModel: ObservableObject {
                 reliabilitySummary: reliability,
                 ranking: ranking,
                 dailyReport: dailyReportsByServerID[server.id],
+                trafficStats: currentTrafficStats?.profileID == server.id ? currentTrafficStats : nil,
                 isActive: server.id == activeID,
                 isConnected: vpnStatus.isConnectedOrConnecting && server.id == connectedID
             )
@@ -1296,7 +1323,11 @@ final class iOSDashboardModel: ObservableObject {
             latencyMilliseconds: averageLatency,
             packetLoss: packetLoss,
             handshakeMilliseconds: averageLatency,
-            recentFailureCount: failures
+            recentFailureCount: failures,
+            tunnelDurationSeconds: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.duration : nil,
+            trafficRxBytes: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.rxBytes : nil,
+            trafficTxBytes: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.txBytes : nil,
+            trafficObserved: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.trafficObserved : nil
         )
         recordQualitySample(sample)
     }
@@ -1312,6 +1343,57 @@ final class iOSDashboardModel: ObservableObject {
             recentFailureCount: 5
         )
         recordQualitySample(sample)
+    }
+
+    func analyzeCurrentChannel() {
+        Task { await analyzeCurrentChannelNow(markProblem: false) }
+    }
+
+    func markCurrentChannelProblem() {
+        Task { await analyzeCurrentChannelNow(markProblem: true) }
+    }
+
+    private func analyzeCurrentChannelNow(markProblem: Bool) async {
+        loadTunnelTrafficStats()
+        guard let profile = displayedProfile ?? activeProfile else {
+            message = "Select a VPN profile to analyze."
+            return
+        }
+
+        var probes = await vpnProtectedProbes(serverID: profile.id)
+        probes.append(await exitIPProbe(serverID: profile.id))
+        probes.append(await exitCountryProbe(serverID: profile.id))
+        recordProbeReliabilitySamples(probes)
+
+        if markProblem {
+            let sample = ServerQualitySample(
+                serverID: profile.id,
+                region: RegionCode(profile.regionCode ?? "ZZ"),
+                networkKind: .wifi,
+                latencyMilliseconds: 3_000,
+                packetLoss: 1,
+                handshakeMilliseconds: 3_000,
+                recentFailureCount: 5,
+                tunnelDurationSeconds: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.duration : nil,
+                trafficRxBytes: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.rxBytes : nil,
+                trafficTxBytes: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.txBytes : nil,
+                trafficObserved: currentTrafficStats?.profileID == profile.id ? currentTrafficStats?.trafficObserved : nil,
+                manualProblemReported: true
+            )
+            recordQualitySample(sample)
+        } else {
+            recordTunnelQualitySample(for: profile, probes: probes)
+        }
+
+        liveProbeResults = probes
+        tunnelDiagnostic = tunnelDiagnosticsStore.load()
+        lastProbeDate = Date()
+        refreshRoutePreview()
+
+        let successCount = probes.filter(\.succeeded).count
+        message = markProblem
+            ? "Problem marked for \(profile.displayName). \(successCount)/\(probes.count) tunnel checks passed."
+            : "Analyzed \(profile.displayName). \(successCount)/\(probes.count) tunnel checks passed."
     }
 
     private func finishChannelTesting(originalProfileID: String?, reconnectOriginal: Bool, cancelled: Bool) async {
@@ -1601,6 +1683,7 @@ final class iOSDashboardModel: ObservableObject {
             providerBundleIdentifier: providerBundleIdentifier(for: profile),
             serverID: profile?.id ?? "real-ai-vpn-ios",
             regionCode: profile?.regionCode ?? "ZZ",
+            protocolKind: profile?.kind == .singBoxVLESSReality ? VPNProtocolKind.singBox.rawValue : VPNProtocolKind.amneziaWG.rawValue,
             killSwitchEnabled: killSwitchEnabled,
             dnsProtectionEnabled: dnsProtectionEnabled,
             localNetworkAccessEnabled: localNetworkAccessEnabled,
@@ -1713,6 +1796,10 @@ final class iOSDashboardModel: ObservableObject {
         refreshRoutePreview()
     }
 
+    private func loadTunnelTrafficStats() {
+        currentTrafficStats = tunnelTrafficStatsStore.load()
+    }
+
     private func recordQualitySample(_ sample: ServerQualitySample) {
         selector.record(sample)
         qualitySamples.append(sample)
@@ -1764,6 +1851,7 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     private func runMonitoringCycle() async {
+        loadTunnelTrafficStats()
         guard !profiles.isEmpty else {
             message = "Import an AmneziaWG .conf profile to start."
             return
@@ -2185,7 +2273,6 @@ private enum iOSMainTab: Hashable {
     case home
     case profiles
     case route
-    case test
     case settings
     case statistics
 }
@@ -2225,14 +2312,6 @@ struct iOSDashboardView: View {
             .tag(iOSMainTab.route)
 
             NavigationStack {
-                iOSChannelTestScreen(model: model)
-            }
-            .tabItem {
-                Label("Test", systemImage: "testtube.2")
-            }
-            .tag(iOSMainTab.test)
-
-            NavigationStack {
                 iOSSettingsScreen(model: model)
             }
             .tabItem {
@@ -2250,130 +2329,6 @@ struct iOSDashboardView: View {
         }
         .tint(AppTheme.accent)
         .background(AppTheme.background.ignoresSafeArea())
-    }
-}
-
-private struct iOSChannelTestScreen: View {
-    @ObservedObject var model: iOSDashboardModel
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                headerCard
-                profileScoresCard
-            }
-            .padding(20)
-        }
-        .navigationTitle("Test")
-        .background(AppTheme.background.ignoresSafeArea())
-    }
-
-    private var headerCard: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Testing Channel")
-                        .font(.system(size: 24, weight: .bold))
-                    Text(model.channelTesting.status)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(AppTheme.secondaryText)
-                }
-                Spacer()
-                Image(systemName: model.channelTesting.isRunning ? "waveform.path.ecg" : "testtube.2")
-                    .font(.system(size: 30, weight: .semibold))
-                    .foregroundStyle(AppTheme.accent)
-            }
-
-            ProgressView(value: model.channelTesting.progress)
-                .tint(AppTheme.accent)
-
-            HStack(spacing: 12) {
-                testMetric(title: "Current", value: model.channelTesting.currentProfileName)
-                testMetric(title: "Done", value: "\(model.channelTesting.testedCount)/\(model.channelTesting.totalCount)")
-                testMetric(title: "Left", value: "\(model.channelTesting.secondsRemaining)s")
-            }
-
-            Text(model.channelTesting.lastResult)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(AppTheme.secondaryText)
-
-            Button {
-                model.channelTesting.isRunning ? model.stopChannelTesting() : model.startChannelTesting()
-            } label: {
-                Label(
-                    model.channelTesting.isRunning ? "Stop Testing Channel" : "Start Testing Channel",
-                    systemImage: model.channelTesting.isRunning ? "stop.fill" : "play.fill"
-                )
-                .font(.system(size: 17, weight: .bold))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 16)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(model.channelTesting.isRunning ? .red : AppTheme.accent)
-            .disabled(model.profiles.isEmpty && !model.channelTesting.isRunning)
-        }
-        .padding(18)
-        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(AppTheme.border, lineWidth: 1)
-        )
-    }
-
-    private var profileScoresCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Core AI Scores")
-                .font(.system(size: 18, weight: .bold))
-
-            if model.profiles.isEmpty {
-                Text("No VPN profiles")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(AppTheme.secondaryText)
-            } else {
-                ForEach(model.profilesByCoreAIScore) { profile in
-                    HStack(spacing: 12) {
-                        Image(systemName: model.channelTesting.currentProfileID == profile.id ? "dot.radiowaves.left.and.right" : "circle")
-                            .foregroundStyle(model.channelTesting.currentProfileID == profile.id ? AppTheme.accent : AppTheme.secondaryText.opacity(0.55))
-                            .frame(width: 24)
-                        Text(profile.displayName)
-                            .font(.system(size: 15, weight: .semibold))
-                            .lineLimit(1)
-                        Spacer()
-                        Text("\(score(for: profile))")
-                            .font(.system(size: 18, weight: .bold, design: .rounded))
-                            .monospacedDigit()
-                            .foregroundStyle(AppTheme.accent)
-                    }
-                    .padding(.vertical, 8)
-                }
-            }
-        }
-        .padding(18)
-        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(AppTheme.border, lineWidth: 1)
-        )
-    }
-
-    private func testMetric(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(AppTheme.secondaryText)
-            Text(value)
-                .font(.system(size: 13, weight: .bold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.72)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(AppTheme.card.opacity(0.68), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-
-    private func score(for profile: StoredAmneziaConfigProfile) -> Int {
-        let value = model.rankedServers.first { $0.server.id == profile.id }?.score ?? 0
-        return Int((value * 100).rounded())
     }
 }
 
@@ -2907,7 +2862,6 @@ private struct iOSStatisticsScreen: View {
                 VStack(alignment: .leading, spacing: 22) {
                     topStatus
                     liveHealthCard
-                    todayReportCard
                     channelsCard
                 }
                 .frame(width: max(0, geometry.size.width - 32), alignment: .leading)
@@ -2982,49 +2936,6 @@ private struct iOSStatisticsScreen: View {
                     .font(.system(size: 20, weight: .semibold))
                     .foregroundStyle(AppTheme.secondaryText)
             }
-        }
-        .padding(18)
-        .frame(maxWidth: .infinity)
-        .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(AppTheme.border, lineWidth: 1))
-        .shadow(color: AppTheme.shadow, radius: 18, x: 0, y: 10)
-    }
-
-    private var todayReportCard: some View {
-        let reports = model.channelStatistics.compactMap(\.dailyReport)
-        let best = reports.max { $0.channelScore < $1.channelScore }
-        let averageScore = reports.isEmpty ? 0 : reports.reduce(0) { $0 + $1.channelScore } / Double(reports.count)
-        let averageRisk = reports.isEmpty ? 0 : reports.reduce(0) { $0 + $1.degradationRisk } / Double(reports.count)
-        let failures = reports.reduce(0) { $0 + $1.failureCount }
-        let samples = reports.reduce(0) { $0 + $1.sampleCount + $1.probeCount }
-
-        return VStack(alignment: .leading, spacing: 18) {
-            HStack(spacing: 12) {
-                Image(systemName: "calendar.badge.clock")
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(AppTheme.accent)
-                Text("Today Report")
-                    .font(.system(size: 24, weight: .bold))
-                    .foregroundStyle(AppTheme.secondaryText)
-                Spacer()
-                Text("\(samples)")
-                    .font(.system(size: 18, weight: .bold, design: .rounded))
-                    .foregroundStyle(AppTheme.primaryText)
-                    .lineLimit(1)
-            }
-
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 74), spacing: 10), count: 2), spacing: 10) {
-                todayMetric("Score", "\(Int((averageScore * 100).rounded()))", color: AppTheme.accent)
-                todayMetric("Risk", formatPercent(averageRisk), color: riskColor(averageRisk))
-                todayMetric("Failures", "\(failures)", color: failures == 0 ? AppTheme.success : AppTheme.warning)
-                todayMetric("Best", best?.region.rawValue ?? "--", color: AppTheme.primaryText)
-            }
-
-            Text(best?.summaryText ?? "No VPN channel data has been collected today.")
-                .font(.system(size: 15, weight: .bold))
-                .foregroundStyle(AppTheme.secondaryText)
-                .lineLimit(3)
-                .minimumScaleFactor(0.72)
         }
         .padding(18)
         .frame(maxWidth: .infinity)
@@ -3138,6 +3049,37 @@ private struct iOSStatisticsScreen: View {
                 channelMetric("Failures", "\(channel.failureCount)")
                 channelMetric("Checks", "\(channel.coreMLEvidenceCount)")
                 channelMetric("Last", relativeTime(channel.lastSeen))
+                channelMetric("RX", formatBytes(channel.trafficStats?.rxBytes))
+                channelMetric("TX", formatBytes(channel.trafficStats?.txBytes))
+                channelMetric("Traffic", channel.trafficStats?.source == .unavailable ? "Unknown" : relativeDuration(channel.trafficStats?.duration))
+            }
+
+            Text(channel.trafficSummaryText)
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(AppTheme.secondaryText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+
+            HStack(spacing: 10) {
+                Button {
+                    model.analyzeCurrentChannel()
+                } label: {
+                    Label("Analyze Channel", systemImage: "stethoscope")
+                        .font(.system(size: 14, weight: .bold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(AppTheme.accent)
+
+                Button {
+                    model.markCurrentChannelProblem()
+                } label: {
+                    Label("Mark Problem", systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 14, weight: .bold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(AppTheme.warning)
             }
         }
         .padding(16)
@@ -3233,22 +3175,30 @@ private struct iOSStatisticsScreen: View {
         "\(Int((channel.coreMLScore * 100).rounded()))"
     }
 
-    private func todayMetric(_ title: String, _ value: String, color: Color) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.system(size: 13, weight: .bold))
-                .foregroundStyle(AppTheme.secondaryText)
-                .lineLimit(1)
-            Text(value)
-                .font(.system(size: 22, weight: .bold, design: .rounded))
-                .foregroundStyle(color)
-                .lineLimit(1)
-                .minimumScaleFactor(0.68)
+    private func formatBytes(_ bytes: UInt64?) -> String {
+        guard let bytes else { return "--" }
+        let value = Double(bytes)
+        if bytes >= 1_073_741_824 {
+            return String(format: "%.1f GB", value / 1_073_741_824)
         }
-        .frame(maxWidth: .infinity, minHeight: 68, alignment: .leading)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(AppTheme.row, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        if bytes >= 1_048_576 {
+            return String(format: "%.1f MB", value / 1_048_576)
+        }
+        if bytes >= 1_024 {
+            return String(format: "%.1f KB", value / 1_024)
+        }
+        return "\(bytes) B"
+    }
+
+    private func relativeDuration(_ duration: TimeInterval?) -> String {
+        guard let duration else { return "--" }
+        if duration >= 3_600 {
+            return "\(Int(duration / 3_600))h"
+        }
+        if duration >= 60 {
+            return "\(Int(duration / 60))m"
+        }
+        return "\(Int(duration))s"
     }
 
     private func channelMetric(_ title: String, _ value: String) -> some View {

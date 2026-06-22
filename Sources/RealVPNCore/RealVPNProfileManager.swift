@@ -31,6 +31,7 @@ public struct VPNProfileConfiguration: Hashable, Codable, Sendable {
     public var providerBundleIdentifier: String
     public var serverID: String
     public var regionCode: String
+    public var protocolKind: String
     public var killSwitchEnabled: Bool
     public var dnsProtectionEnabled: Bool
     public var localNetworkAccessEnabled: Bool
@@ -43,6 +44,7 @@ public struct VPNProfileConfiguration: Hashable, Codable, Sendable {
         providerBundleIdentifier: String = "com.codex.RealAiVPN.PacketTunnel",
         serverID: String,
         regionCode: String,
+        protocolKind: String = "unknown",
         killSwitchEnabled: Bool = false,
         dnsProtectionEnabled: Bool = true,
         localNetworkAccessEnabled: Bool = true,
@@ -54,6 +56,7 @@ public struct VPNProfileConfiguration: Hashable, Codable, Sendable {
         self.providerBundleIdentifier = providerBundleIdentifier
         self.serverID = serverID
         self.regionCode = regionCode
+        self.protocolKind = protocolKind
         self.killSwitchEnabled = killSwitchEnabled
         self.dnsProtectionEnabled = dnsProtectionEnabled
         self.localNetworkAccessEnabled = localNetworkAccessEnabled
@@ -254,6 +257,7 @@ public final class RealVPNProfileManager: ObservableObject {
         protocolConfiguration.providerConfiguration = [
             "serverID": configuration.serverID,
             "regionCode": configuration.regionCode,
+            "protocolKind": configuration.protocolKind,
             "mode": "prototype",
             "killSwitchEnabled": NSNumber(value: configuration.killSwitchEnabled),
             "dnsProtectionEnabled": NSNumber(value: configuration.dnsProtectionEnabled),

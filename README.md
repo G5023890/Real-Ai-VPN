@@ -47,9 +47,8 @@ connected iPhone, not in a simulator.
   missed taps during startup/status transitions.
 - Settings parity: iOS and macOS expose the same security and behavior controls;
   the old Language block is removed, and Region blocks are collapsed by default.
-- Statistics: `Stat` keeps Live Health and Today Report, then shows the current
-  profile with Core AI/CoreML details and standby VPN channels as a compact
-  score ranking.
+- Statistics: `Stat` keeps Live Health, then shows the current profile with
+  Core AI/CoreML details and standby VPN channels as a compact score ranking.
 - Core AI Debugger: read-only debugger is available only from About on iOS and
   macOS, using real profiles and probe/ranking data.
 - Preventive health: direct/provider and VPN-protected probes feed recovery
