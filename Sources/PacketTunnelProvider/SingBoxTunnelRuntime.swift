@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import NetworkExtension
 import os
 import RealVPNCore
@@ -21,6 +22,7 @@ final class SingBoxTunnelRuntime {
     private var commandServer: LibboxCommandServer?
     private var platformInterface: SingBoxPlatformInterface?
     private var trafficMonitor: SingBoxTrafficMonitor?
+    private let interfaceTrafficSampler = TunInterfaceTrafficSampler()
     private let diagnosticsStore = TunnelDiagnosticsStore()
 
     init(provider: NEPacketTunnelProvider) {
@@ -92,6 +94,7 @@ final class SingBoxTunnelRuntime {
 
         self.platformInterface = platformInterface
         self.commandServer = commandServer
+        interfaceTrafficSampler.reset()
         startTrafficMonitor()
         singBoxLogger.info("sing-box runtime started")
         saveDiagnostic(stage: "singbox-started", message: "sing-box runtime started.")
@@ -113,10 +116,18 @@ final class SingBoxTunnelRuntime {
     }
 
     func currentTrafficBytes() async -> (UInt64?, UInt64?, TunnelTrafficSource) {
-        guard let snapshot = trafficMonitor?.snapshot else {
-            return (nil, nil, .unavailable)
+        if let snapshot = trafficMonitor?.snapshot,
+           snapshot.uplinkTotal > 0 || snapshot.downlinkTotal > 0 {
+            return (snapshot.downlinkTotal, snapshot.uplinkTotal, .singBoxStatus)
         }
-        return (snapshot.downlinkTotal, snapshot.uplinkTotal, .singBoxStatus)
+        if let fallback = interfaceTrafficSampler.currentDelta(),
+           fallback.rxBytes > 0 || fallback.txBytes > 0 {
+            return (fallback.rxBytes, fallback.txBytes, .networkInterface)
+        }
+        if let snapshot = trafficMonitor?.snapshot {
+            return (snapshot.downlinkTotal, snapshot.uplinkTotal, .singBoxStatus)
+        }
+        return (nil, nil, .unavailable)
     }
 
     private func startTrafficMonitor() {
@@ -240,6 +251,67 @@ private final class SingBoxTrafficMonitor: NSObject, LibboxCommandClientHandlerP
     func writeGroups(_: LibboxOutboundGroupIteratorProtocol?) {}
     func writeLogs(_: LibboxLogIteratorProtocol?) {}
     func writeOutbounds(_: LibboxOutboundGroupItemIteratorProtocol?) {}
+}
+
+private final class TunInterfaceTrafficSampler: @unchecked Sendable {
+    private let lock = NSLock()
+    private var baseline: InterfaceTrafficBytes?
+
+    func reset() {
+        let current = Self.readUtunTotals()
+        lock.withLock {
+            baseline = current
+        }
+    }
+
+    func currentDelta() -> InterfaceTrafficBytes? {
+        guard let current = Self.readUtunTotals() else {
+            return nil
+        }
+        return lock.withLock {
+            guard let baseline else {
+                self.baseline = current
+                return InterfaceTrafficBytes(rxBytes: 0, txBytes: 0)
+            }
+            return InterfaceTrafficBytes(
+                rxBytes: current.rxBytes >= baseline.rxBytes ? current.rxBytes - baseline.rxBytes : current.rxBytes,
+                txBytes: current.txBytes >= baseline.txBytes ? current.txBytes - baseline.txBytes : current.txBytes
+            )
+        }
+    }
+
+    private static func readUtunTotals() -> InterfaceTrafficBytes? {
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let firstAddress = addresses else {
+            return nil
+        }
+        defer { freeifaddrs(addresses) }
+
+        var rxBytes: UInt64 = 0
+        var txBytes: UInt64 = 0
+        var foundInterface = false
+
+        for cursor in sequence(first: firstAddress, next: { $0.pointee.ifa_next }) {
+            let interface = cursor.pointee
+            guard (interface.ifa_flags & UInt32(IFF_UP)) != 0,
+                  let address = interface.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_LINK),
+                  String(cString: interface.ifa_name).hasPrefix("utun"),
+                  let data = interface.ifa_data?.assumingMemoryBound(to: if_data.self).pointee else {
+                continue
+            }
+            rxBytes += UInt64(data.ifi_ibytes)
+            txBytes += UInt64(data.ifi_obytes)
+            foundInterface = true
+        }
+
+        return foundInterface ? InterfaceTrafficBytes(rxBytes: rxBytes, txBytes: txBytes) : nil
+    }
+}
+
+private struct InterfaceTrafficBytes: Sendable {
+    let rxBytes: UInt64
+    let txBytes: UInt64
 }
 
 private enum SingBoxTunnelRuntimeError: LocalizedError, CustomNSError {

@@ -37,6 +37,7 @@ public struct TunnelDiagnosticsStore: Sendable {
         }
         if usesSharedDefaults, let defaults = UserDefaults(suiteName: suiteName) {
             defaults.set(data, forKey: key)
+            defaults.synchronize()
         }
         if let sharedFileURL {
             try? data.write(to: sharedFileURL, options: [.atomic])

@@ -3,6 +3,7 @@ import Foundation
 public enum TunnelTrafficSource: String, Codable, Sendable {
     case wireGuardRuntime
     case singBoxStatus
+    case networkInterface
     case unavailable
 }
 
@@ -78,6 +79,7 @@ public struct TunnelTrafficStatsStore: Sendable {
         }
         if usesSharedDefaults, let defaults = UserDefaults(suiteName: suiteName) {
             defaults.set(data, forKey: key)
+            defaults.synchronize()
         }
         if let sharedFileURL {
             try? data.write(to: sharedFileURL, options: [.atomic])
