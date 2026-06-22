@@ -471,6 +471,11 @@ final class iOSDashboardModel: ObservableObject {
     private var lastConnectedProfileName: String?
     private var tunnelWatchdogFailureCount = 0
     private var lastTunnelWatchdogReconnectDate: Date?
+    private var highPriorityMonitoringUntil: Date?
+    private var lastExitProbeDate: Date?
+    private var lastExitProbeProfileID: String?
+    private var isStatisticsVisible = false
+    private var isAppActive = true
     private var reassertingRecoveryTask: Task<Void, Never>?
     private var vpnActionResetTask: Task<Void, Never>?
     private var channelTestingTask: Task<Void, Never>?
@@ -480,6 +485,11 @@ final class iOSDashboardModel: ObservableObject {
     private let stableConnectionResetSeconds: TimeInterval = 60
     private let tunnelWatchdogFailureThreshold = 2
     private let tunnelWatchdogReconnectCooldown: TimeInterval = 60
+    private let focusedMonitoringIntervalSeconds: UInt64 = 30
+    private let stableMonitoringIntervalSeconds: UInt64 = 120
+    private let inactiveMonitoringIntervalSeconds: UInt64 = 300
+    private let postReconnectFocusedSeconds: TimeInterval = 180
+    private let exitProbeFreshnessSeconds: TimeInterval = 600
     private let channelTestingDurationSeconds = 120
     private let channelTestingProbeIntervalSeconds = 20
 
@@ -750,6 +760,14 @@ final class iOSDashboardModel: ObservableObject {
 
     func reportStatus(_ status: String) {
         message = status
+    }
+
+    func setStatisticsVisible(_ isVisible: Bool) {
+        isStatisticsVisible = isVisible
+    }
+
+    func setAppActive(_ isActive: Bool) {
+        isAppActive = isActive
     }
 
     private func importProfile(displayName: String, rawConfig: String) async {
@@ -1580,6 +1598,7 @@ final class iOSDashboardModel: ObservableObject {
             vpnLastError = nil
             tunnelDiagnostic = nil
             tunnelWatchdogFailureCount = 0
+            markHighPriorityMonitoring()
             reassertingRecoveryTask?.cancel()
             reassertingRecoveryTask = nil
             if let profileID = connectedProfileID ?? displayedProfile?.id ?? activeProfile?.id {
@@ -1590,6 +1609,7 @@ final class iOSDashboardModel: ObservableObject {
         }
 
         if status == .reasserting {
+            markHighPriorityMonitoring()
             scheduleReassertingRecovery(profileID: droppedProfileID, profileName: droppedProfileName)
         }
 
@@ -1600,6 +1620,7 @@ final class iOSDashboardModel: ObservableObject {
         connectedProfileID = nil
         observedExitIP = nil
         observedExitCountry = nil
+        resetExitProbeCache()
         tunnelWatchdogFailureCount = 0
         reassertingRecoveryTask?.cancel()
         reassertingRecoveryTask = nil
@@ -1845,9 +1866,43 @@ final class iOSDashboardModel: ObservableObject {
             try? await Task.sleep(for: .seconds(6))
             while !Task.isCancelled {
                 await self?.runMonitoringCycle()
-                try? await Task.sleep(for: .seconds(30))
+                let delay = self?.currentMonitoringIntervalSeconds ?? 120
+                try? await Task.sleep(for: .seconds(delay))
             }
         }
+    }
+
+    private var currentMonitoringIntervalSeconds: UInt64 {
+        if channelTesting.isRunning {
+            return focusedMonitoringIntervalSeconds
+        }
+        if !isAppActive {
+            return inactiveMonitoringIntervalSeconds
+        }
+        if isStatisticsVisible || needsHighPriorityMonitoring {
+            return focusedMonitoringIntervalSeconds
+        }
+        return stableMonitoringIntervalSeconds
+    }
+
+    private var needsHighPriorityMonitoring: Bool {
+        if let highPriorityMonitoringUntil,
+           Date() < highPriorityMonitoringUntil {
+            return true
+        }
+        guard vpnStatus == .connected || vpnStatus == .reasserting else {
+            return false
+        }
+        switch healthAssessment.vpnPath.state {
+        case .healthy:
+            return false
+        case .degradedSoft, .degradedHard, .stalled, .down, .connectedButUnusable:
+            return true
+        }
+    }
+
+    private func markHighPriorityMonitoring(duration: TimeInterval? = nil) {
+        highPriorityMonitoringUntil = Date().addingTimeInterval(duration ?? postReconnectFocusedSeconds)
     }
 
     private func runMonitoringCycle() async {
@@ -1867,7 +1922,6 @@ final class iOSDashboardModel: ObservableObject {
             }
 
             let tcp = await ConnectivityProbeRunner.tcpConnect(host: endpoint.host, port: endpoint.port)
-            let latency = tcp.latency ?? 3_000
 
             if profile.id == activeID {
                 probes.append(ConnectivityProbeResult(
@@ -1949,6 +2003,7 @@ final class iOSDashboardModel: ObservableObject {
         }
 
         lastTunnelWatchdogReconnectDate = Date()
+        markHighPriorityMonitoring()
         tunnelWatchdogFailureCount = 0
         let profileName = profiles.first { $0.id == profileID }?.displayName
             ?? displayedProfile?.displayName
@@ -2050,17 +2105,21 @@ final class iOSDashboardModel: ObservableObject {
         guard vpnStatus.isConnectedOrConnecting else {
             observedExitIP = nil
             observedExitCountry = nil
+            resetExitProbeCache()
             return
         }
 
         observedExitIP = await ConnectivityProbeRunner.fetchText(url: URL(string: "https://api.ipify.org")!)
         observedExitCountry = await fetchExitCountry()
+        lastExitProbeProfileID = displayedProfile?.id ?? activeProfile?.id
+        lastExitProbeDate = Date()
     }
 
     private func exitIPProbe(serverID: String) async -> ConnectivityProbeResult {
         guard vpnStatus.isConnectedOrConnecting else {
             observedExitIP = nil
             observedExitCountry = nil
+            resetExitProbeCache()
             return ConnectivityProbeResult(
                 targetID: "exit-ip",
                 targetKind: .vpnProtectedEndpoint,
@@ -2071,9 +2130,23 @@ final class iOSDashboardModel: ObservableObject {
             )
         }
 
+        if shouldUseCachedExitProbe(serverID: serverID), observedExitIP != nil {
+            return ConnectivityProbeResult(
+                targetID: "exit-ip",
+                targetKind: .vpnProtectedEndpoint,
+                serverID: serverID,
+                method: .httpHead,
+                succeeded: true,
+                latencyMilliseconds: 0,
+                packetLoss: 0
+            )
+        }
+
         let started = Date()
         let exitIP = await ConnectivityProbeRunner.fetchText(url: URL(string: "https://api.ipify.org")!)
         observedExitIP = exitIP
+        lastExitProbeProfileID = serverID
+        lastExitProbeDate = Date()
         return ConnectivityProbeResult(
             targetID: "exit-ip",
             targetKind: .vpnProtectedEndpoint,
@@ -2088,6 +2161,7 @@ final class iOSDashboardModel: ObservableObject {
     private func exitCountryProbe(serverID: String) async -> ConnectivityProbeResult {
         guard vpnStatus.isConnectedOrConnecting else {
             observedExitCountry = nil
+            resetExitProbeCache()
             return ConnectivityProbeResult(
                 targetID: "exit-country",
                 targetKind: .vpnProtectedEndpoint,
@@ -2098,9 +2172,23 @@ final class iOSDashboardModel: ObservableObject {
             )
         }
 
+        if shouldUseCachedExitProbe(serverID: serverID), observedExitCountry != nil {
+            return ConnectivityProbeResult(
+                targetID: "exit-country",
+                targetKind: .vpnProtectedEndpoint,
+                serverID: serverID,
+                method: .httpGet,
+                succeeded: true,
+                latencyMilliseconds: 0,
+                packetLoss: 0
+            )
+        }
+
         let started = Date()
         let country = await fetchExitCountry()
         observedExitCountry = country
+        lastExitProbeProfileID = serverID
+        lastExitProbeDate = Date()
         return ConnectivityProbeResult(
             targetID: "exit-country",
             targetKind: .vpnProtectedEndpoint,
@@ -2110,6 +2198,19 @@ final class iOSDashboardModel: ObservableObject {
             latencyMilliseconds: Date().timeIntervalSince(started) * 1_000,
             packetLoss: country == nil ? 1 : 0
         )
+    }
+
+    private func shouldUseCachedExitProbe(serverID: String) -> Bool {
+        guard lastExitProbeProfileID == serverID,
+              let lastExitProbeDate else {
+            return false
+        }
+        return Date().timeIntervalSince(lastExitProbeDate) < exitProbeFreshnessSeconds
+    }
+
+    private func resetExitProbeCache() {
+        lastExitProbeDate = nil
+        lastExitProbeProfileID = nil
     }
 
     private func fetchExitCountry() async -> String? {
@@ -2278,6 +2379,7 @@ private enum iOSMainTab: Hashable {
 }
 
 struct iOSDashboardView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var model: iOSDashboardModel
     @State private var selectedTab: iOSMainTab = .home
 
@@ -2329,6 +2431,16 @@ struct iOSDashboardView: View {
         }
         .tint(AppTheme.accent)
         .background(AppTheme.background.ignoresSafeArea())
+        .onAppear {
+            model.setStatisticsVisible(selectedTab == .statistics)
+            model.setAppActive(scenePhase == .active)
+        }
+        .onChange(of: selectedTab) { _, newValue in
+            model.setStatisticsVisible(newValue == .statistics)
+        }
+        .onChange(of: scenePhase) { _, newValue in
+            model.setAppActive(newValue == .active)
+        }
     }
 }
 

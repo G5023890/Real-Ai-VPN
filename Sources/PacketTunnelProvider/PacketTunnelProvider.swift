@@ -23,7 +23,13 @@ private final class TunnelTrafficSampler {
     private let store: TunnelTrafficStatsStore
     private let byteReader: ByteReader
     private let startedAt = Date()
+    private let sampleIntervalSeconds: UInt64 = 30
+    private let heartbeatInterval: TimeInterval = 120
     private var task: Task<Void, Never>?
+    private var lastSavedRXBytes: UInt64?
+    private var lastSavedTXBytes: UInt64?
+    private var lastSavedSource: TunnelTrafficSource?
+    private var lastSavedAt: Date?
 
     init(
         profileID: String,
@@ -43,7 +49,7 @@ private final class TunnelTrafficSampler {
             guard let self else { return }
             await self.flush()
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(10))
+                try? await Task.sleep(for: .seconds(sampleIntervalSeconds))
                 guard !Task.isCancelled else { break }
                 await self.flush()
             }
@@ -58,16 +64,29 @@ private final class TunnelTrafficSampler {
 
     private func flush() async {
         let snapshot = await byteReader()
+        let now = Date()
+        let bytesChanged = snapshot.rxBytes != lastSavedRXBytes || snapshot.txBytes != lastSavedTXBytes
+        let sourceChanged = snapshot.source != lastSavedSource
+        let heartbeatDue = lastSavedAt.map { now.timeIntervalSince($0) >= heartbeatInterval } ?? true
+
+        guard bytesChanged || sourceChanged || heartbeatDue else {
+            return
+        }
+
         store.save(TunnelTrafficStats(
             profileID: profileID,
             protocol: protocolKind,
             startedAt: startedAt,
-            duration: Date().timeIntervalSince(startedAt),
+            duration: now.timeIntervalSince(startedAt),
             rxBytes: snapshot.rxBytes,
             txBytes: snapshot.txBytes,
-            lastUpdatedAt: Date(),
+            lastUpdatedAt: now,
             source: snapshot.source
         ))
+        lastSavedRXBytes = snapshot.rxBytes
+        lastSavedTXBytes = snapshot.txBytes
+        lastSavedSource = snapshot.source
+        lastSavedAt = now
     }
 }
 
