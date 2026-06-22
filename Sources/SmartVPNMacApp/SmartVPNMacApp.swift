@@ -1029,6 +1029,7 @@ final class DashboardModel: ObservableObject {
                 ?? routeDecision.rankedServers.first { $0.server.id == server.id }
             let activeID = displayedConfigProfile?.id ?? activeConfigProfile?.id ?? activeServerID
             let connectedID = connectedConfigProfile?.id
+            let trafficStats = trafficStats(for: server, connectedID: connectedID)
 
             return VPNChannelStatistics(
                 id: server.id,
@@ -1045,7 +1046,7 @@ final class DashboardModel: ObservableObject {
                 reliabilitySummary: reliability,
                 ranking: ranking,
                 dailyReport: dailyReportsByServerID[server.id],
-                trafficStats: currentTrafficStats?.profileID == server.id ? currentTrafficStats : nil,
+                trafficStats: trafficStats,
                 isActive: server.id == activeID,
                 isConnected: vpnStatus.isConnectedOrConnecting && server.id == connectedID
             )
@@ -1083,6 +1084,19 @@ final class DashboardModel: ObservableObject {
         }
 
         return servers.first { $0.id == serverID }?.displayName ?? serverID
+    }
+
+    private func trafficStats(for server: SmartVPNServer, connectedID: String?) -> TunnelTrafficStats? {
+        guard let currentTrafficStats else {
+            return nil
+        }
+        if currentTrafficStats.profileID == server.id {
+            return currentTrafficStats
+        }
+        if vpnStatus.isConnectedOrConnecting, server.id == connectedID, currentTrafficStats.source != .unavailable {
+            return currentTrafficStats
+        }
+        return nil
     }
 
     var context: ServerSelectionContext {
@@ -3895,7 +3909,7 @@ private struct MacStatisticsWorkspace: View {
                 channelMetric("Last", relativeTime(channel.lastSeen), sparkSeed: nil)
                 channelMetric("RX", formatBytes(channel.trafficStats?.rxBytes), sparkSeed: nil)
                 channelMetric("TX", formatBytes(channel.trafficStats?.txBytes), sparkSeed: nil)
-                channelMetric("Traffic", channel.trafficStats?.source == .unavailable ? "Unknown" : relativeDuration(channel.trafficStats?.duration), sparkSeed: nil)
+                channelMetric("Traffic", channel.trafficStats?.source == .unavailable ? "Unknown" : formatBytes(channel.trafficStats?.totalBytes), sparkSeed: nil)
             }
 
             HStack(spacing: 10) {

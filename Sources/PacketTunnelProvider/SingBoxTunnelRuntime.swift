@@ -212,6 +212,14 @@ private final class SingBoxTrafficMonitor: NSObject, LibboxCommandClientHandlerP
     }
 
     func writeStatus(_ message: LibboxStatusMessage?) {
+        storeStatus(message)
+    }
+
+    func write(_ message: LibboxStatusMessage?) {
+        storeStatus(message)
+    }
+
+    private func storeStatus(_ message: LibboxStatusMessage?) {
         guard let message, message.trafficAvailable else {
             return
         }
