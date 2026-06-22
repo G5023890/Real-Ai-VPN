@@ -812,10 +812,20 @@ final class DashboardModel: ObservableObject {
     private var wakeObserver: NSObjectProtocol?
     private var wakeRecoveryTask: Task<Void, Never>?
     private var reconnectProfileAfterWakeID: String?
+    private var highPriorityMonitoringUntil: Date?
+    private var lastExitProbeDate: Date?
+    private var lastExitProbeProfileID: String?
+    private var isStatisticsVisible = false
+    private var isAppActive = true
     private var globalConnectHotKey: MacGlobalConnectHotKey?
     private let maxDropReconnectAttempts = 5
     private let dropReconnectDelaySeconds: UInt64 = 2
     private let stableConnectionResetSeconds: TimeInterval = 60
+    private let focusedMonitoringIntervalSeconds: UInt64 = 30
+    private let stableMonitoringIntervalSeconds: UInt64 = 120
+    private let inactiveMonitoringIntervalSeconds: UInt64 = 300
+    private let postReconnectFocusedSeconds: TimeInterval = 180
+    private let exitProbeFreshnessSeconds: TimeInterval = 600
     private let channelTestingDurationSeconds = 120
     private let channelTestingProbeIntervalSeconds = 20
 
@@ -1106,6 +1116,14 @@ final class DashboardModel: ObservableObject {
             quarantinedServerIDs: activeQuarantinedProfileIDs()
         )
         updateRecoveryTracking(from: healthAssessment)
+    }
+
+    func setStatisticsVisible(_ isVisible: Bool) {
+        isStatisticsVisible = isVisible
+    }
+
+    func setAppActive(_ isActive: Bool) {
+        isAppActive = isActive
     }
 
     func applyRecoveryAction() {
@@ -1952,6 +1970,8 @@ final class DashboardModel: ObservableObject {
     private func handleSystemDidWake() {
         vpnManager.refreshStatus()
         syncVPNState()
+        resetExitProbeCache()
+        markHighPriorityMonitoring()
 
         let profileID = reconnectProfileAfterWakeID ?? connectedConfigProfileID ?? displayedConfigProfile?.id ?? activeConfigProfile?.id
         guard reconnectAfterDropEnabled, let profileID else {
@@ -2030,9 +2050,14 @@ final class DashboardModel: ObservableObject {
         if status == .connected {
             vpnErrorMessage = nil
             tunnelDiagnostic = nil
+            markHighPriorityMonitoring()
             if let profileID = connectedConfigProfileID ?? displayedConfigProfile?.id ?? activeConfigProfile?.id {
                 dropRecoveryConnectedAt[profileID] = Date()
             }
+        }
+
+        if status == .reasserting {
+            markHighPriorityMonitoring()
         }
 
         guard status == .disconnected else {
@@ -2042,6 +2067,7 @@ final class DashboardModel: ObservableObject {
         connectedConfigProfileID = nil
         observedExitIP = nil
         observedExitCountry = nil
+        resetExitProbeCache()
 
         if suppressExpectedDisconnectNotification {
             suppressExpectedDisconnectNotification = false
@@ -2303,9 +2329,43 @@ final class DashboardModel: ObservableObject {
         monitoringTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.runMonitoringCycle()
-                try? await Task.sleep(for: .seconds(30))
+                let delay = self?.currentMonitoringIntervalSeconds ?? 120
+                try? await Task.sleep(for: .seconds(delay))
             }
         }
+    }
+
+    private var currentMonitoringIntervalSeconds: UInt64 {
+        if channelTesting.isRunning {
+            return focusedMonitoringIntervalSeconds
+        }
+        if !isAppActive {
+            return inactiveMonitoringIntervalSeconds
+        }
+        if isStatisticsVisible || needsHighPriorityMonitoring {
+            return focusedMonitoringIntervalSeconds
+        }
+        return stableMonitoringIntervalSeconds
+    }
+
+    private var needsHighPriorityMonitoring: Bool {
+        if let highPriorityMonitoringUntil,
+           Date() < highPriorityMonitoringUntil {
+            return true
+        }
+        guard vpnStatus == .connected || vpnStatus == .reasserting else {
+            return false
+        }
+        switch healthAssessment.vpnPath.state {
+        case .healthy:
+            return false
+        case .degradedSoft, .degradedHard, .stalled, .down, .connectedButUnusable:
+            return true
+        }
+    }
+
+    private func markHighPriorityMonitoring(duration: TimeInterval? = nil) {
+        highPriorityMonitoringUntil = Date().addingTimeInterval(duration ?? postReconnectFocusedSeconds)
     }
 
     private func runMonitoringCycle() async {
@@ -2453,17 +2513,21 @@ final class DashboardModel: ObservableObject {
         guard vpnStatus.isConnectedOrConnecting else {
             observedExitIP = nil
             observedExitCountry = nil
+            resetExitProbeCache()
             return
         }
 
         observedExitIP = await ConnectivityProbeRunner.fetchText(url: URL(string: "https://api.ipify.org")!)
         observedExitCountry = await fetchExitCountry()
+        lastExitProbeProfileID = displayedConfigProfile?.id ?? activeConfigProfile?.id
+        lastExitProbeDate = Date()
     }
 
     private func exitIPProbe(serverID: String) async -> ConnectivityProbeResult {
         guard vpnStatus.isConnectedOrConnecting else {
             observedExitIP = nil
             observedExitCountry = nil
+            resetExitProbeCache()
             return ConnectivityProbeResult(
                 targetID: "exit-ip",
                 targetKind: .vpnProtectedEndpoint,
@@ -2474,9 +2538,23 @@ final class DashboardModel: ObservableObject {
             )
         }
 
+        if shouldUseCachedExitProbe(serverID: serverID), observedExitIP != nil {
+            return ConnectivityProbeResult(
+                targetID: "exit-ip",
+                targetKind: .vpnProtectedEndpoint,
+                serverID: serverID,
+                method: .httpHead,
+                succeeded: true,
+                latencyMilliseconds: 0,
+                packetLoss: 0
+            )
+        }
+
         let started = Date()
         let exitIP = await ConnectivityProbeRunner.fetchText(url: URL(string: "https://api.ipify.org")!)
         observedExitIP = exitIP
+        lastExitProbeProfileID = serverID
+        lastExitProbeDate = Date()
         return ConnectivityProbeResult(
             targetID: "exit-ip",
             targetKind: .vpnProtectedEndpoint,
@@ -2491,6 +2569,7 @@ final class DashboardModel: ObservableObject {
     private func exitCountryProbe(serverID: String) async -> ConnectivityProbeResult {
         guard vpnStatus.isConnectedOrConnecting else {
             observedExitCountry = nil
+            resetExitProbeCache()
             return ConnectivityProbeResult(
                 targetID: "exit-country",
                 targetKind: .vpnProtectedEndpoint,
@@ -2501,9 +2580,23 @@ final class DashboardModel: ObservableObject {
             )
         }
 
+        if shouldUseCachedExitProbe(serverID: serverID), observedExitCountry != nil {
+            return ConnectivityProbeResult(
+                targetID: "exit-country",
+                targetKind: .vpnProtectedEndpoint,
+                serverID: serverID,
+                method: .httpGet,
+                succeeded: true,
+                latencyMilliseconds: 0,
+                packetLoss: 0
+            )
+        }
+
         let started = Date()
         let country = await fetchExitCountry()
         observedExitCountry = country
+        lastExitProbeProfileID = serverID
+        lastExitProbeDate = Date()
         return ConnectivityProbeResult(
             targetID: "exit-country",
             targetKind: .vpnProtectedEndpoint,
@@ -2513,6 +2606,19 @@ final class DashboardModel: ObservableObject {
             latencyMilliseconds: Date().timeIntervalSince(started) * 1_000,
             packetLoss: country == nil ? 1 : 0
         )
+    }
+
+    private func shouldUseCachedExitProbe(serverID: String) -> Bool {
+        guard lastExitProbeProfileID == serverID,
+              let lastExitProbeDate else {
+            return false
+        }
+        return Date().timeIntervalSince(lastExitProbeDate) < exitProbeFreshnessSeconds
+    }
+
+    private func resetExitProbeCache() {
+        lastExitProbeDate = nil
+        lastExitProbeProfileID = nil
     }
 
     private func fetchExitCountry() async -> String? {
@@ -2826,9 +2932,25 @@ struct DashboardView: View {
         .foregroundStyle(theme.primaryText)
         .onAppear {
             openSettingsPageIfRequested()
+            model.setStatisticsVisible(selectedPage == .statistics)
+            model.setAppActive(NSApplication.shared.isActive)
+        }
+        .onDisappear {
+            model.setStatisticsVisible(false)
         }
         .onChange(of: showSettings) { _, _ in
             openSettingsPageIfRequested()
+        }
+        .onChange(of: selectedPage) { _, newValue in
+            model.setStatisticsVisible(newValue == .statistics)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.setAppActive(true)
+            model.setStatisticsVisible(selectedPage == .statistics)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+            model.setAppActive(false)
+            model.setStatisticsVisible(false)
         }
     }
 
