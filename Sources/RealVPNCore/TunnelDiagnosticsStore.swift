@@ -24,6 +24,7 @@ public struct TunnelDiagnosticsStore: Sendable {
 
     private let suiteName: String
     private let key = "real_ai_vpn.last_tunnel_diagnostic"
+    private let sharedFileName = "real-ai-vpn-last-tunnel-diagnostic.json"
     private let fallbackFileURL = URL(fileURLWithPath: "/tmp/real-ai-vpn-last-tunnel-diagnostic.json")
 
     public init(suiteName: String = Self.suiteName) {
@@ -34,15 +35,24 @@ public struct TunnelDiagnosticsStore: Sendable {
         guard let data = try? JSONEncoder().encode(snapshot) else {
             return
         }
-        if let defaults = UserDefaults(suiteName: suiteName) {
+        if usesSharedDefaults, let defaults = UserDefaults(suiteName: suiteName) {
             defaults.set(data, forKey: key)
+        }
+        if let sharedFileURL {
+            try? data.write(to: sharedFileURL, options: [.atomic])
         }
         try? data.write(to: fallbackFileURL, options: [.atomic])
     }
 
     public func load() -> TunnelDiagnosticSnapshot? {
-        if let defaults = UserDefaults(suiteName: suiteName),
+        if usesSharedDefaults,
+           let defaults = UserDefaults(suiteName: suiteName),
            let data = defaults.data(forKey: key),
+           let snapshot = try? JSONDecoder().decode(TunnelDiagnosticSnapshot.self, from: data) {
+            return snapshot
+        }
+        if let sharedFileURL,
+           let data = try? Data(contentsOf: sharedFileURL),
            let snapshot = try? JSONDecoder().decode(TunnelDiagnosticSnapshot.self, from: data) {
             return snapshot
         }
@@ -50,5 +60,19 @@ public struct TunnelDiagnosticsStore: Sendable {
             return nil
         }
         return try? JSONDecoder().decode(TunnelDiagnosticSnapshot.self, from: data)
+    }
+
+    private var sharedFileURL: URL? {
+        FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: suiteName)?
+            .appendingPathComponent(sharedFileName, isDirectory: false)
+    }
+
+    private var usesSharedDefaults: Bool {
+        #if os(macOS)
+        false
+        #else
+        true
+        #endif
     }
 }

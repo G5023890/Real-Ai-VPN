@@ -65,6 +65,7 @@ public struct TunnelTrafficStatsStore: Sendable {
 
     private let suiteName: String
     private let key = "real_ai_vpn.tunnel_traffic_stats"
+    private let sharedFileName = "real-ai-vpn-tunnel-traffic-stats.json"
     private let fallbackFileURL = URL(fileURLWithPath: "/tmp/real-ai-vpn-tunnel-traffic-stats.json")
 
     public init(suiteName: String = Self.suiteName) {
@@ -75,15 +76,24 @@ public struct TunnelTrafficStatsStore: Sendable {
         guard let data = try? JSONEncoder().encode(stats) else {
             return
         }
-        if let defaults = UserDefaults(suiteName: suiteName) {
+        if usesSharedDefaults, let defaults = UserDefaults(suiteName: suiteName) {
             defaults.set(data, forKey: key)
+        }
+        if let sharedFileURL {
+            try? data.write(to: sharedFileURL, options: [.atomic])
         }
         try? data.write(to: fallbackFileURL, options: [.atomic])
     }
 
     public func load() -> TunnelTrafficStats? {
-        if let defaults = UserDefaults(suiteName: suiteName),
+        if usesSharedDefaults,
+           let defaults = UserDefaults(suiteName: suiteName),
            let data = defaults.data(forKey: key),
+           let stats = try? JSONDecoder().decode(TunnelTrafficStats.self, from: data) {
+            return stats
+        }
+        if let sharedFileURL,
+           let data = try? Data(contentsOf: sharedFileURL),
            let stats = try? JSONDecoder().decode(TunnelTrafficStats.self, from: data) {
             return stats
         }
@@ -91,5 +101,19 @@ public struct TunnelTrafficStatsStore: Sendable {
             return nil
         }
         return try? JSONDecoder().decode(TunnelTrafficStats.self, from: data)
+    }
+
+    private var sharedFileURL: URL? {
+        FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: suiteName)?
+            .appendingPathComponent(sharedFileName, isDirectory: false)
+    }
+
+    private var usesSharedDefaults: Bool {
+        #if os(macOS)
+        false
+        #else
+        true
+        #endif
     }
 }

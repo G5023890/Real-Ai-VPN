@@ -154,7 +154,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     localNetworkAccessEnabled: localNetworkAccessEnabled,
                     ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
                 )
-                startUnavailableTrafficSampler(profileID: profileID, protocolKind: configuredProtocolKind == "unknown" ? "singBox" : configuredProtocolKind)
+                startSingBoxTrafficSampler(profileID: profileID, protocolKind: configuredProtocolKind == "unknown" ? "singBox" : configuredProtocolKind)
                 saveDiagnostic(stage: "started-vless", message: "sing-box tunnel start returned successfully.")
             } catch {
                 saveDiagnostic(stage: "vless-failed", message: error.localizedDescription)
@@ -262,6 +262,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func startUnavailableTrafficSampler(profileID: String, protocolKind: String) {
         trafficSampler = TunnelTrafficSampler(profileID: profileID, protocolKind: protocolKind) {
             (nil, nil, .unavailable)
+        }
+        trafficSampler?.start()
+    }
+
+    private func startSingBoxTrafficSampler(profileID: String, protocolKind: String) {
+        trafficSampler = TunnelTrafficSampler(profileID: profileID, protocolKind: protocolKind) { [weak self] in
+            guard let self else { return (nil, nil, .unavailable) }
+            return await self.singBoxRuntime.currentTrafficBytes()
         }
         trafficSampler?.start()
     }

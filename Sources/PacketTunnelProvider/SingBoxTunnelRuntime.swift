@@ -20,6 +20,7 @@ final class SingBoxTunnelRuntime {
     private weak var provider: NEPacketTunnelProvider?
     private var commandServer: LibboxCommandServer?
     private var platformInterface: SingBoxPlatformInterface?
+    private var trafficMonitor: SingBoxTrafficMonitor?
     private let diagnosticsStore = TunnelDiagnosticsStore()
 
     init(provider: NEPacketTunnelProvider) {
@@ -91,12 +92,15 @@ final class SingBoxTunnelRuntime {
 
         self.platformInterface = platformInterface
         self.commandServer = commandServer
+        startTrafficMonitor()
         singBoxLogger.info("sing-box runtime started")
         saveDiagnostic(stage: "singbox-started", message: "sing-box runtime started.")
         NSLog("RealAiVPN SingBoxTunnelRuntime started")
     }
 
     func stop() async {
+        trafficMonitor?.stop()
+        trafficMonitor = nil
         do {
             try commandServer?.closeService()
         } catch {
@@ -106,6 +110,19 @@ final class SingBoxTunnelRuntime {
         commandServer = nil
         platformInterface?.reset()
         platformInterface = nil
+    }
+
+    func currentTrafficBytes() async -> (UInt64?, UInt64?, TunnelTrafficSource) {
+        guard let snapshot = trafficMonitor?.snapshot else {
+            return (nil, nil, .unavailable)
+        }
+        return (snapshot.downlinkTotal, snapshot.uplinkTotal, .singBoxStatus)
+    }
+
+    private func startTrafficMonitor() {
+        let monitor = SingBoxTrafficMonitor()
+        trafficMonitor = monitor
+        monitor.start()
     }
 
     private static func runtimeDirectories() throws -> (base: URL, working: URL, temp: URL) {
@@ -150,6 +167,71 @@ final class SingBoxTunnelRuntime {
             message: message
         ))
     }
+}
+
+private final class SingBoxTrafficMonitor: NSObject, LibboxCommandClientHandlerProtocol {
+    private let lock = NSLock()
+    private var commandClient: LibboxCommandClient?
+    private var latestSnapshot: Snapshot?
+
+    struct Snapshot {
+        let uplinkTotal: UInt64
+        let downlinkTotal: UInt64
+    }
+
+    var snapshot: Snapshot? {
+        lock.withLock { latestSnapshot }
+    }
+
+    func start() {
+        let options = LibboxCommandClientOptions()
+        options.statusInterval = 1_000_000_000
+        options.addCommand(LibboxCommandStatus)
+
+        guard let client = LibboxNewCommandClient(self, options) else {
+            singBoxLogger.error("Could not create sing-box command client for traffic status")
+            return
+        }
+
+        do {
+            try client.connect()
+        } catch {
+            singBoxLogger.error("Could not connect sing-box command client: \(error.localizedDescription, privacy: .public)")
+            return
+        }
+
+        commandClient = client
+    }
+
+    func stop() {
+        try? commandClient?.disconnect()
+        commandClient = nil
+        lock.withLock {
+            latestSnapshot = nil
+        }
+    }
+
+    func writeStatus(_ message: LibboxStatusMessage?) {
+        guard let message, message.trafficAvailable else {
+            return
+        }
+        let uplinkTotal = UInt64(max(0, message.uplinkTotal))
+        let downlinkTotal = UInt64(max(0, message.downlinkTotal))
+        lock.withLock {
+            latestSnapshot = Snapshot(uplinkTotal: uplinkTotal, downlinkTotal: downlinkTotal)
+        }
+    }
+
+    func clearLogs() {}
+    func connected() {}
+    func disconnected(_: String?) {}
+    func initializeClashMode(_: LibboxStringIteratorProtocol?, currentMode _: String?) {}
+    func setDefaultLogLevel(_: Int32) {}
+    func updateClashMode(_: String?) {}
+    func write(_: LibboxConnectionEvents?) {}
+    func writeGroups(_: LibboxOutboundGroupIteratorProtocol?) {}
+    func writeLogs(_: LibboxLogIteratorProtocol?) {}
+    func writeOutbounds(_: LibboxOutboundGroupItemIteratorProtocol?) {}
 }
 
 private enum SingBoxTunnelRuntimeError: LocalizedError, CustomNSError {
@@ -562,6 +644,10 @@ final class SingBoxTunnelRuntime {
 
     func start(configJSON _: String, killSwitchEnabled _: Bool, localNetworkAccessEnabled _: Bool) async throws {
         throw PacketTunnelProviderError.singBoxRuntimeMissing
+    }
+
+    func currentTrafficBytes() async -> (UInt64?, UInt64?, TunnelTrafficSource) {
+        (nil, nil, .unavailable)
     }
 
     func stop() async {}
