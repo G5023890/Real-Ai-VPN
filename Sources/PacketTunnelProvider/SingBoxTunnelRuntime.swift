@@ -120,10 +120,12 @@ final class SingBoxTunnelRuntime {
            snapshot.uplinkTotal > 0 || snapshot.downlinkTotal > 0 {
             return (snapshot.downlinkTotal, snapshot.uplinkTotal, .singBoxStatus)
         }
+        #if os(iOS) || os(tvOS)
         if let fallback = interfaceTrafficSampler.currentDelta(),
            fallback.rxBytes > 0 || fallback.txBytes > 0 {
             return (fallback.rxBytes, fallback.txBytes, .networkInterface)
         }
+        #endif
         if let snapshot = trafficMonitor?.snapshot {
             return (snapshot.downlinkTotal, snapshot.uplinkTotal, .singBoxStatus)
         }
