@@ -9,7 +9,11 @@ CONFIGURATION="${CONFIGURATION:-Debug}"
 TEAM_ID="${TEAM_ID:-9FP39GTDT5}"
 XCODE_DEVELOPER_DIR="${XCODE_DEVELOPER_DIR:-/Applications/Xcode-beta.app/Contents/Developer}"
 XCODEBUILD_BIN="${XCODEBUILD_BIN:-$XCODE_DEVELOPER_DIR/usr/bin/xcodebuild}"
-IPHONEOS_SDKROOT="${IPHONEOS_SDKROOT:-$XCODE_DEVELOPER_DIR/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk}"
+IPHONEOS_SDKROOT="${IPHONEOS_SDKROOT:-$XCODE_DEVELOPER_DIR/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS27.0.sdk}"
+CLANG_BIN="${CLANG_BIN:-$XCODE_DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang}"
+DEVICE_ID="${DEVICE_ID:-}"
+INSTALL_ON_DEVICE="${INSTALL_ON_DEVICE:-0}"
+LAUNCH_AFTER_INSTALL="${LAUNCH_AFTER_INSTALL:-1}"
 DERIVED_DATA_ROOT="${DERIVED_DATA_ROOT:-$PROJECT_DIR/.build/xcode-ios-device}"
 APP_VERSION="${APP_VERSION:-0.96}"
 BUILD_STAMP="${BUILD_STAMP:-$(date '+%H%M%S%d%m%Y')}"
@@ -43,8 +47,10 @@ log "Build label: $BUILD_LABEL"
 "$PROJECT_DIR/scripts/prepare_third_party.sh"
 make -C "$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo" \
   ARCHS=arm64 \
+  ARCH=arm64 \
   PLATFORM_NAME=iphoneos \
   SDKROOT="$IPHONEOS_SDKROOT" \
+  CC="$CLANG_BIN" \
   DEPLOYMENT_TARGET_CLANG_FLAG_NAME=miphoneos-version-min \
   DEPLOYMENT_TARGET_CLANG_ENV_NAME=IPHONEOS_DEPLOYMENT_TARGET \
   IPHONEOS_DEPLOYMENT_TARGET=17.0 \
@@ -76,4 +82,17 @@ log "Building iOS app for a real device destination"
   build
 
 log "Built iOS products at: $DERIVED_DATA_ROOT/Build/Products/${CONFIGURATION}-iphoneos"
-log "No simulator was launched and nothing was installed on a phone."
+if [[ "$INSTALL_ON_DEVICE" == "1" ]]; then
+  if [[ -z "$DEVICE_ID" ]]; then
+    echo "INSTALL_ON_DEVICE=1 requires DEVICE_ID=<iPhone device id>" >&2
+    exit 1
+  fi
+  APP_PATH="$DERIVED_DATA_ROOT/Build/Products/${CONFIGURATION}-iphoneos/Real Ai Router.app"
+  log "Installing on device: $DEVICE_ID"
+  "$XCODE_DEVELOPER_DIR/usr/bin/devicectl" device install app --device "$DEVICE_ID" "$APP_PATH"
+  if [[ "$LAUNCH_AFTER_INSTALL" == "1" ]]; then
+    "$XCODE_DEVELOPER_DIR/usr/bin/devicectl" device process launch --device "$DEVICE_ID" com.codex.RealAiVPN.iOS
+  fi
+else
+  log "No simulator was launched and nothing was installed on a phone."
+fi

@@ -1133,6 +1133,13 @@ final class DashboardModel: ObservableObject {
         if vpnStatus.isConnectedOrConnecting, server.id == connectedID, currentTrafficStats.source != .unavailable {
             return currentTrafficStats
         }
+        let activeID = displayedConfigProfile?.id ?? activeConfigProfile?.id ?? activeServerID
+        if vpnStatus.isConnectedOrConnecting,
+           connectedID == nil,
+           server.id == activeID,
+           currentTrafficStats.source != .unavailable {
+            return currentTrafficStats
+        }
         return nil
     }
 
@@ -2102,6 +2109,7 @@ final class DashboardModel: ObservableObject {
             vpnErrorMessage = nil
             tunnelDiagnostic = nil
             markHighPriorityMonitoring()
+            loadTunnelTrafficStats()
             if let profileID = connectedConfigProfileID ?? displayedConfigProfile?.id ?? activeConfigProfile?.id {
                 dropRecoveryConnectedAt[profileID] = Date()
             }
@@ -2109,6 +2117,7 @@ final class DashboardModel: ObservableObject {
 
         if status == .reasserting {
             markHighPriorityMonitoring()
+            loadTunnelTrafficStats()
         }
 
         guard status == .disconnected else {

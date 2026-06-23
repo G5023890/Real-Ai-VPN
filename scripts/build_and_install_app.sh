@@ -15,7 +15,8 @@ ENTITLEMENTS="${ENTITLEMENTS:-$PROJECT_DIR/Config/RealAiVPN.entitlements}"
 TEAM_ID="${TEAM_ID:-9FP39GTDT5}"
 XCODE_DEVELOPER_DIR="${XCODE_DEVELOPER_DIR:-/Applications/Xcode-beta.app/Contents/Developer}"
 XCODEBUILD_BIN="${XCODEBUILD_BIN:-$XCODE_DEVELOPER_DIR/usr/bin/xcodebuild}"
-MACOS_SDKROOT="${MACOS_SDKROOT:-$XCODE_DEVELOPER_DIR/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk}"
+MACOS_SDKROOT="${MACOS_SDKROOT:-$XCODE_DEVELOPER_DIR/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk}"
+CLANG_BIN="${CLANG_BIN:-$XCODE_DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang}"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 SKIP_SIGN="${SKIP_SIGN:-0}"
 LAUNCH_AFTER_INSTALL="${LAUNCH_AFTER_INSTALL:-1}"
@@ -106,8 +107,10 @@ mkdir -p "$DIST_DIR"
 log "Building AmneziaWG userspace backend"
 make -C "$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo" \
   ARCHS=arm64 \
+  ARCH=arm64 \
   PLATFORM_NAME=macosx \
   SDKROOT="$MACOS_SDKROOT" \
+  CC="$CLANG_BIN" \
   CONFIGURATION_BUILD_DIR="$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo/out" \
   CONFIGURATION_TEMP_DIR="$PROJECT_DIR/.build/amneziawg-go-tmp" \
   build version-header

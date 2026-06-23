@@ -733,6 +733,13 @@ final class iOSDashboardModel: ObservableObject {
         if vpnStatus.isConnectedOrConnecting, server.id == connectedID, currentTrafficStats.source != .unavailable {
             return currentTrafficStats
         }
+        let activeID = displayedProfile?.id ?? activeProfile?.id
+        if vpnStatus.isConnectedOrConnecting,
+           connectedID == nil,
+           server.id == activeID,
+           currentTrafficStats.source != .unavailable {
+            return currentTrafficStats
+        }
         return nil
     }
 
@@ -1650,6 +1657,7 @@ final class iOSDashboardModel: ObservableObject {
             tunnelDiagnostic = nil
             tunnelWatchdogFailureCount = 0
             markHighPriorityMonitoring()
+            loadTunnelTrafficStats()
             reassertingRecoveryTask?.cancel()
             reassertingRecoveryTask = nil
             if let profileID = connectedProfileID ?? displayedProfile?.id ?? activeProfile?.id {
@@ -1661,6 +1669,7 @@ final class iOSDashboardModel: ObservableObject {
 
         if status == .reasserting {
             markHighPriorityMonitoring()
+            loadTunnelTrafficStats()
             scheduleReassertingRecovery(profileID: droppedProfileID, profileName: droppedProfileName)
         }
 
