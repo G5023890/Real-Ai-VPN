@@ -2,6 +2,7 @@ import AmneziaConfig
 import AppKit
 import Carbon
 import Combine
+import Darwin
 import IOKit.pwr_mgt
 import Network
 import RealVPNCore
@@ -17,6 +18,41 @@ private final class MacNotificationDelegate: NSObject, UNUserNotificationCenterD
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
         [.banner, .list, .sound]
+    }
+}
+
+private final class MacLocalTunnelTrafficReader {
+    struct Snapshot {
+        let rxBytes: UInt64
+        let txBytes: UInt64
+    }
+
+    func read() -> Snapshot? {
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let firstAddress = addresses else {
+            return nil
+        }
+        defer { freeifaddrs(addresses) }
+
+        var rxBytes: UInt64 = 0
+        var txBytes: UInt64 = 0
+        var foundInterface = false
+
+        for cursor in sequence(first: firstAddress, next: { $0.pointee.ifa_next }) {
+            let interface = cursor.pointee
+            guard (interface.ifa_flags & UInt32(IFF_UP)) != 0,
+                  let address = interface.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_LINK),
+                  String(cString: interface.ifa_name).hasPrefix("utun"),
+                  let data = interface.ifa_data?.assumingMemoryBound(to: if_data.self).pointee else {
+                continue
+            }
+            rxBytes += UInt64(data.ifi_ibytes)
+            txBytes += UInt64(data.ifi_obytes)
+            foundInterface = true
+        }
+
+        return foundInterface ? Snapshot(rxBytes: rxBytes, txBytes: txBytes) : nil
     }
 }
 
@@ -791,6 +827,7 @@ final class DashboardModel: ObservableObject {
     private let routingExceptionStore = RoutingExceptionStore()
     private let tunnelDiagnosticsStore = TunnelDiagnosticsStore()
     private let tunnelTrafficStatsStore = TunnelTrafficStatsStore()
+    private let localTunnelTrafficReader = MacLocalTunnelTrafficReader()
     private lazy var monitor = PreventiveVPNHealthMonitor(selector: selector, reliabilityAnalyzer: probeReliabilityAnalyzer)
     private var cancellables: Set<AnyCancellable> = []
     private var qualitySamples: [ServerQualitySample] = []
@@ -2335,7 +2372,37 @@ final class DashboardModel: ObservableObject {
     }
 
     private func loadTunnelTrafficStats() {
-        currentTrafficStats = tunnelTrafficStatsStore.load()
+        let storedStats = tunnelTrafficStatsStore.load()
+        if let fallbackStats = localTunnelTrafficStatsFallback(storedStats: storedStats) {
+            currentTrafficStats = fallbackStats
+        } else {
+            currentTrafficStats = storedStats
+        }
+    }
+
+    private func localTunnelTrafficStatsFallback(storedStats: TunnelTrafficStats?) -> TunnelTrafficStats? {
+        if let storedStats,
+           storedStats.source != .unavailable,
+           let totalBytes = storedStats.totalBytes,
+           totalBytes > 0 {
+            return nil
+        }
+        guard vpnStatus.isConnectedOrConnecting,
+              let profile = connectedConfigProfile ?? displayedConfigProfile ?? activeConfigProfile,
+              let snapshot = localTunnelTrafficReader.read(),
+              snapshot.rxBytes + snapshot.txBytes > 0 else {
+            return nil
+        }
+        return TunnelTrafficStats(
+            profileID: profile.id,
+            protocol: profile.kind == .singBoxVLESSReality ? VPNProtocolKind.singBox.rawValue : VPNProtocolKind.amneziaWG.rawValue,
+            startedAt: storedStats?.startedAt ?? Date(),
+            duration: storedStats?.duration ?? 0,
+            rxBytes: snapshot.rxBytes,
+            txBytes: snapshot.txBytes,
+            lastUpdatedAt: Date(),
+            source: .networkInterface
+        )
     }
 
     private func startMonitoring() {
