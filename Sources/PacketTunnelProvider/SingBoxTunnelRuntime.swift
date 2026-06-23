@@ -233,11 +233,12 @@ private final class SingBoxTrafficMonitor: NSObject, LibboxCommandClientHandlerP
     }
 
     private func storeStatus(_ message: LibboxStatusMessage?) {
-        guard let message, message.trafficAvailable else {
-            return
-        }
+        guard let message else { return }
         let uplinkTotal = UInt64(max(0, message.uplinkTotal))
         let downlinkTotal = UInt64(max(0, message.downlinkTotal))
+        guard message.trafficAvailable || uplinkTotal > 0 || downlinkTotal > 0 else {
+            return
+        }
         lock.withLock {
             latestSnapshot = Snapshot(uplinkTotal: uplinkTotal, downlinkTotal: downlinkTotal)
         }

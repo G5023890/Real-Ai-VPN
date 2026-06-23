@@ -20,7 +20,13 @@ public struct TunnelDiagnosticSnapshot: Codable, Equatable, Sendable {
 }
 
 public struct TunnelDiagnosticsStore: Sendable {
-    public static let suiteName = "group.com.codex.RealAiVPN.iOS"
+    public static let suiteName: String = {
+        #if os(macOS)
+        "9FP39GTDT5.group.com.codex.RealAiVPN"
+        #else
+        "group.com.codex.RealAiVPN.iOS"
+        #endif
+    }()
 
     private let suiteName: String
     private let key = "real_ai_vpn.last_tunnel_diagnostic"
@@ -42,7 +48,9 @@ public struct TunnelDiagnosticsStore: Sendable {
         if let sharedFileURL {
             try? data.write(to: sharedFileURL, options: [.atomic])
         }
+        #if !os(macOS)
         try? data.write(to: fallbackFileURL, options: [.atomic])
+        #endif
     }
 
     public func load() -> TunnelDiagnosticSnapshot? {
@@ -57,10 +65,14 @@ public struct TunnelDiagnosticsStore: Sendable {
            let snapshot = try? JSONDecoder().decode(TunnelDiagnosticSnapshot.self, from: data) {
             return snapshot
         }
+        #if os(macOS)
+        return nil
+        #else
         guard let data = try? Data(contentsOf: fallbackFileURL) else {
             return nil
         }
         return try? JSONDecoder().decode(TunnelDiagnosticSnapshot.self, from: data)
+        #endif
     }
 
     private var sharedFileURL: URL? {

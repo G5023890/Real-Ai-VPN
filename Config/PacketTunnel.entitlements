@@ -10,7 +10,7 @@
 	<true/>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.com.codex.RealAiVPN.iOS</string>
+		<string>9FP39GTDT5.group.com.codex.RealAiVPN</string>
 	</array>
 	<key>com.apple.security.network.client</key>
 	<true/>
