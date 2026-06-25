@@ -75,6 +75,46 @@ public struct SingBoxRouteOverrides: Equatable, Sendable {
         "in-addr.arpa",
         "ip6.arpa"
     ]
+    public static let googleProtectedDomainSuffixes = [
+        "google.com",
+        "googleapis.com",
+        "gstatic.com",
+        "googleusercontent.com",
+        "gmail.com",
+        "googlemail.com",
+        "ggpht.com",
+        "googlevideo.com",
+        "gvt1.com",
+        "gvt2.com",
+        "gvt3.com",
+        "youtube.com",
+        "ytimg.com"
+    ]
+    public static let appleAuthProtectedDomainSuffixes = [
+        "apple.com",
+        "icloud.com",
+        "icloud.com.cn",
+        "mzstatic.com",
+        "itunes.com",
+        "appstore.com",
+        "cdn-apple.com",
+        "aaplimg.com",
+        "apple-cloudkit.com",
+        "icloud-content.com",
+        "me.com",
+        "mac.com"
+    ]
+    public static let authCompatibilityDomainSuffixes = googleProtectedDomainSuffixes + appleAuthProtectedDomainSuffixes
+    public static let legacyMailCompatibilityPorts = [
+        25,
+        110,
+        143,
+        465,
+        585,
+        587,
+        993,
+        995
+    ]
 
     public var forceVPNDomainSuffixes: [String]
     public var bypassVPNDomainSuffixes: [String]
@@ -382,10 +422,12 @@ public struct SingBoxConfigBuilder: Sendable {
                 "action": "sniff"
             ]
         ]
-        let forceVPNDomainSuffixes = routeOverrides.forceVPNDomainSuffixes
+        let forceVPNDomainSuffixes = (SingBoxRouteOverrides.authCompatibilityDomainSuffixes + routeOverrides.forceVPNDomainSuffixes)
             .map(normalizedDomainSuffix)
             .filter { !$0.isEmpty }
             .uniqued()
+        appendQUICFallbackRule(to: &routeRules)
+        appendLegacyMailCompatibilityRule(to: &routeRules)
         appendRouteRules(
             to: &routeRules,
             domainSuffixes: forceVPNDomainSuffixes,
@@ -401,7 +443,6 @@ public struct SingBoxConfigBuilder: Sendable {
                 "169.254.0.0/16",
                 "172.16.0.0/12",
                 "192.168.0.0/16",
-                "17.0.0.0/8",
                 "224.0.0.0/4",
                 "255.255.255.255/32",
                 "77.88.8.88/32",
@@ -418,11 +459,12 @@ public struct SingBoxConfigBuilder: Sendable {
             "tag": "tun-in",
             "interface_name": "real-ai-vpn",
             "address": [
-                "172.19.0.1/30"
+                "172.19.0.1/30",
+                "fdfe:dcba:9876::1/126"
             ],
             "auto_route": true,
             "strict_route": false,
-            "stack": "system"
+            "stack": "gvisor"
         ]
 
         let routeExcludeAddresses = routeOverrides.systemRouteExcludeIPCIDRs
@@ -491,7 +533,7 @@ public struct SingBoxConfigBuilder: Sendable {
             "server": SingBoxRouteOverrides.providerDNSServers[1]
         ])
 
-        let forceVPNSuffixes = routeOverrides.forceVPNDomainSuffixes
+        let forceVPNSuffixes = (SingBoxRouteOverrides.authCompatibilityDomainSuffixes + routeOverrides.forceVPNDomainSuffixes)
             .map(normalizedDomainSuffix)
             .filter { !$0.isEmpty }
             .uniqued()
@@ -547,6 +589,24 @@ public struct SingBoxConfigBuilder: Sendable {
                 "outbound": outbound
             ])
         }
+    }
+
+    private func appendQUICFallbackRule(to rules: inout [[String: Any]]) {
+        rules.append([
+            "network": "udp",
+            "port": 443,
+            "action": "reject",
+            "method": "default",
+            "no_drop": true
+        ])
+    }
+
+    private func appendLegacyMailCompatibilityRule(to rules: inout [[String: Any]]) {
+        rules.append([
+            "network": "tcp",
+            "port": SingBoxRouteOverrides.legacyMailCompatibilityPorts,
+            "outbound": "direct"
+        ])
     }
 
     private func isLocalDiscoverySuffix(_ value: String) -> Bool {

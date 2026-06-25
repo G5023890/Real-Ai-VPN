@@ -417,7 +417,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let localProviderRanges = localRouteExcludes(
             localNetworkAccessEnabled: localNetworkAccessEnabled,
-            ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
+            ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled,
+            includeAppleServicesBypass: false
         )
         let ruRanges = subtract(forceHostRoutes: forceHostRoutes, from: loadBundledCIDRs(resource: "ru-aggregated", extension: "zone"))
         overrides.systemRouteExcludeIPCIDRs = localProviderRanges + ruRanges + overrides.bypassVPNIPCIDRs
@@ -647,23 +648,26 @@ private func subtract(forceHostRoutes: [String], from cidrs: [String]) -> [Strin
 
 private func localRouteExcludes(
     localNetworkAccessEnabled: Bool,
-    ipv6LeakProtectionEnabled: Bool
+    ipv6LeakProtectionEnabled: Bool,
+    includeAppleServicesBypass: Bool = true
 ) -> [String] {
     guard localNetworkAccessEnabled else {
         return []
     }
 
-    let ipv4LocalRanges = [
+    var ipv4LocalRanges = [
         "127.0.0.0/8",
         "10.0.0.0/8",
         "100.64.0.0/10",
         "169.254.0.0/16",
         "172.16.0.0/12",
         "192.168.0.0/16",
-        "17.0.0.0/8",
         "224.0.0.0/4",
         "255.255.255.255/32"
     ]
+    if includeAppleServicesBypass {
+        ipv4LocalRanges.append("17.0.0.0/8")
+    }
 
     guard !ipv6LeakProtectionEnabled else {
         return ipv4LocalRanges + [

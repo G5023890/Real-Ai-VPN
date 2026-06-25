@@ -1,8 +1,8 @@
 # Real Ai Router
 
-Current release: `0.96`.
+Current release: `0.97`.
 
-Current recovery point: `restore-0.95-protected-probes-ios-button`.
+Current recovery point: `restore-0.97-vless-mail-compatibility`.
 
 Real Ai Router is a SwiftUI VPN client for iOS and macOS. It imports AmneziaWG
 profiles, Shadowrocket VLESS Reality links/subscriptions, and runs them through
@@ -56,6 +56,27 @@ connected iPhone, not in a simulator.
 - Diagnostics: packet tunnel stop reasons and provider errors are persisted for
   investigation after disconnects.
 
+## Recent 0.97 Changes
+
+- Raised default app release version from `0.96` to `0.97` in XcodeGen and build
+  scripts.
+- Added a shared VLESS Reality compatibility route for Apple Mail account
+  flows on macOS and iOS.
+- Forced Apple/Google auth and account endpoints through the VPN/proxy DNS path
+  while preventing Google/Apple domains from falling into direct/provider DNS
+  suffix rules.
+- Rejected QUIC `UDP/443` in sing-box so Apple Mail/WebKit can fall back to a
+  predictable TCP/TLS path.
+- Routed legacy mail TCP ports (`25`, `110`, `143`, `465`, `585`, `587`,
+  `993`, `995`) through the direct compatibility path to avoid VLESS Reality
+  IMAP/SMTP TLS negotiation hangs seen in Apple Mail.
+- Removed the broad Apple `17.0.0.0/8` bypass from VLESS system route excludes
+  so Apple auth traffic is not accidentally split away from Google auth during
+  account setup.
+- Improved sing-box traffic snapshots so macOS avoids mirrored RX/TX totals and
+  iOS can use command connection deltas for more realistic upload/download
+  counters.
+
 ## Recent 0.96 Changes
 
 - Raised default app release version from `0.95` to `0.96` in XcodeGen and build
@@ -83,6 +104,9 @@ connected iPhone, not in a simulator.
 
 ## Recovery Points
 
+- `restore-0.97-vless-mail-compatibility`: recovery point after fixing Apple
+  Mail Google account authorization with VLESS Reality on macOS and iOS via
+  shared auth routing, QUIC fallback, and legacy mail TLS-port compatibility.
 - `restore-0.95-protected-probes-ios-button`: recovery point after protected
   probe exception blocking, iOS button responsiveness work, AirDrop/Bonjour
   route handling, iOS ReConnect fixes, Settings parity, and Stat/Core AI

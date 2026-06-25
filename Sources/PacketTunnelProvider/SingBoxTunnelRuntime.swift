@@ -83,8 +83,16 @@ final class SingBoxTunnelRuntime {
 
         do {
             try commandServer.start()
+            self.platformInterface = platformInterface
+            self.commandServer = commandServer
+            interfaceTrafficSampler.reset()
+            startTrafficMonitor()
             try commandServer.startOrReloadService(configJSON, options: LibboxOverrideOptions())
         } catch {
+            trafficMonitor?.stop()
+            trafficMonitor = nil
+            self.commandServer = nil
+            self.platformInterface = nil
             commandServer.close()
             singBoxLogger.error("sing-box service failed to start: \(error.localizedDescription, privacy: .public)")
             saveDiagnostic(stage: "singbox-service-failed", message: error.localizedDescription)
@@ -92,10 +100,6 @@ final class SingBoxTunnelRuntime {
             throw SingBoxTunnelRuntimeError.startFailed(error.localizedDescription)
         }
 
-        self.platformInterface = platformInterface
-        self.commandServer = commandServer
-        interfaceTrafficSampler.reset()
-        startTrafficMonitor()
         singBoxLogger.info("sing-box runtime started")
         saveDiagnostic(stage: "singbox-started", message: "sing-box runtime started.")
         NSLog("RealAiVPN SingBoxTunnelRuntime started")
@@ -117,7 +121,7 @@ final class SingBoxTunnelRuntime {
 
     func currentTrafficBytes() async -> (UInt64?, UInt64?, TunnelTrafficSource) {
         if let snapshot = trafficMonitor?.snapshot,
-           snapshot.uplinkTotal > 0 || snapshot.downlinkTotal > 0 {
+           (snapshot.uplinkTotal ?? 0) > 0 || (snapshot.downlinkTotal ?? 0) > 0 {
             return (snapshot.downlinkTotal, snapshot.uplinkTotal, .singBoxStatus)
         }
         #if os(iOS) || os(tvOS)
@@ -188,8 +192,8 @@ private final class SingBoxTrafficMonitor: NSObject, LibboxCommandClientHandlerP
     private var latestSnapshot: Snapshot?
 
     struct Snapshot {
-        let uplinkTotal: UInt64
-        let downlinkTotal: UInt64
+        let uplinkTotal: UInt64?
+        let downlinkTotal: UInt64?
     }
 
     var snapshot: Snapshot? {
@@ -199,6 +203,9 @@ private final class SingBoxTrafficMonitor: NSObject, LibboxCommandClientHandlerP
     func start() {
         let options = LibboxCommandClientOptions()
         options.statusInterval = 1_000_000_000
+        #if !os(macOS)
+        options.addCommand(LibboxCommandConnections)
+        #endif
         options.addCommand(LibboxCommandStatus)
 
         guard let client = LibboxNewCommandClient(self, options) else {
@@ -233,6 +240,16 @@ private final class SingBoxTrafficMonitor: NSObject, LibboxCommandClientHandlerP
     }
 
     private func storeStatus(_ message: LibboxStatusMessage?) {
+        #if os(macOS)
+        guard let message else { return }
+        let downlinkTotal = UInt64(max(0, message.downlinkTotal))
+        guard message.trafficAvailable || downlinkTotal > 0 else {
+            return
+        }
+        lock.withLock {
+            latestSnapshot = Snapshot(uplinkTotal: nil, downlinkTotal: downlinkTotal)
+        }
+        #else
         guard let message else { return }
         let uplinkTotal = UInt64(max(0, message.uplinkTotal))
         let downlinkTotal = UInt64(max(0, message.downlinkTotal))
@@ -242,6 +259,48 @@ private final class SingBoxTrafficMonitor: NSObject, LibboxCommandClientHandlerP
         lock.withLock {
             latestSnapshot = Snapshot(uplinkTotal: uplinkTotal, downlinkTotal: downlinkTotal)
         }
+        #endif
+    }
+
+    func writeConnectionEvents(_ events: LibboxConnectionEvents?) {
+        #if os(macOS)
+        return
+        #else
+        guard let events, let iterator = events.iterator() else {
+            return
+        }
+
+        lock.withLock {
+            if events.reset {
+                latestSnapshot = Snapshot(uplinkTotal: 0, downlinkTotal: 0)
+            }
+
+            var uplinkTotal = latestSnapshot?.uplinkTotal ?? 0
+            var downlinkTotal = latestSnapshot?.downlinkTotal ?? 0
+            while iterator.hasNext() {
+                guard let event = iterator.next() else {
+                    continue
+                }
+                guard Self.isTunnelInbound(event.connection) else {
+                    continue
+                }
+                uplinkTotal += UInt64(max(0, event.uplinkDelta))
+                downlinkTotal += UInt64(max(0, event.downlinkDelta))
+            }
+            latestSnapshot = Snapshot(uplinkTotal: uplinkTotal, downlinkTotal: downlinkTotal)
+        }
+        #endif
+    }
+
+    private static func isTunnelInbound(_ connection: LibboxConnection?) -> Bool {
+        guard let connection else {
+            return false
+        }
+        let inboundType = connection.inboundType.lowercased()
+        if inboundType == "tun" {
+            return true
+        }
+        return connection.inbound.lowercased().contains("tun")
     }
 
     func clearLogs() {}
