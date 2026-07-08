@@ -105,6 +105,26 @@ public struct SingBoxRouteOverrides: Equatable, Sendable {
         "mac.com"
     ]
     public static let authCompatibilityDomainSuffixes = googleProtectedDomainSuffixes + appleAuthProtectedDomainSuffixes
+    public static let yandexMapsCompatibilityDomainSuffixes = [
+        "yandex.ru",
+        "yandex.net",
+        "yastatic.net",
+        "yandex.st",
+        "maps.yandex.ru",
+        "maps.yandex.net",
+        "api-maps.yandex.ru",
+        "static-maps.yandex.ru",
+        "geocode-maps.yandex.ru",
+        "suggest-maps.yandex.ru",
+        "mobile.maps.yandex.net",
+        "mobile.yandex.net",
+        "mobile.yandex.ru",
+        "core-renderer-tiles.maps.yandex.net",
+        "vec.maps.yandex.net",
+        "sat.maps.yandex.net",
+        "yandexnavi.ru",
+        "yandexcloud.net"
+    ]
     public static let legacyMailCompatibilityPorts = [
         25,
         110,
@@ -389,7 +409,8 @@ public struct SingBoxConfigBuilder: Sendable {
     public func build(
         from profile: ShadowrocketVLESSConfig,
         routeOverrides: SingBoxRouteOverrides = SingBoxRouteOverrides(),
-        dnsProtectionEnabled: Bool = true
+        dnsProtectionEnabled: Bool = true,
+        ipv4OnlyCompatibilityEnabled: Bool = false
     ) throws -> SingBoxConfig {
         var outbound: [String: Any] = [
             "type": "vless",
@@ -422,10 +443,15 @@ public struct SingBoxConfigBuilder: Sendable {
                 "action": "sniff"
             ]
         ]
-        let forceVPNDomainSuffixes = (SingBoxRouteOverrides.authCompatibilityDomainSuffixes + routeOverrides.forceVPNDomainSuffixes)
+        let forceVPNDomainSuffixes = (
+            SingBoxRouteOverrides.authCompatibilityDomainSuffixes
+                + SingBoxRouteOverrides.yandexMapsCompatibilityDomainSuffixes
+                + routeOverrides.forceVPNDomainSuffixes
+        )
             .map(normalizedDomainSuffix)
             .filter { !$0.isEmpty }
             .uniqued()
+        appendYandexMapsQUICCompatibilityRule(to: &routeRules)
         appendQUICFallbackRule(to: &routeRules)
         appendLegacyMailCompatibilityRule(to: &routeRules)
         appendRouteRules(
@@ -434,9 +460,15 @@ public struct SingBoxConfigBuilder: Sendable {
             ipCIDRs: routeOverrides.forceVPNIPCIDRs,
             outbound: "proxy"
         )
+        let directDomainSuffixes = (["ru"] + SingBoxRouteOverrides.localDiscoveryDomainSuffixes + routeOverrides.bypassVPNDomainSuffixes)
+            .map(normalizedDomainSuffix)
+            .filter { suffix in
+                !suffix.isEmpty && !forceVPNDomainSuffixes.contains(suffix)
+            }
+            .uniqued()
         appendRouteRules(
             to: &routeRules,
-            domainSuffixes: ["ru"] + SingBoxRouteOverrides.localDiscoveryDomainSuffixes + routeOverrides.bypassVPNDomainSuffixes,
+            domainSuffixes: directDomainSuffixes,
             ipCIDRs: [
                 "10.0.0.0/8",
                 "100.64.0.0/10",
@@ -454,14 +486,18 @@ public struct SingBoxConfigBuilder: Sendable {
             outbound: "direct"
         )
 
+        let tunAddresses = ipv4OnlyCompatibilityEnabled
+            ? ["172.19.0.1/30"]
+            : [
+                "172.19.0.1/30",
+                "fdfe:dcba:9876::1/126"
+            ]
+
         var tunInbound: [String: Any] = [
             "type": "tun",
             "tag": "tun-in",
             "interface_name": "real-ai-vpn",
-            "address": [
-                "172.19.0.1/30",
-                "fdfe:dcba:9876::1/126"
-            ],
+            "address": tunAddresses,
             "auto_route": true,
             "strict_route": false,
             "stack": "gvisor"
@@ -479,7 +515,11 @@ public struct SingBoxConfigBuilder: Sendable {
                 "level": "warn",
                 "timestamp": true
             ],
-            "dns": dnsConfiguration(routeOverrides: routeOverrides, dnsProtectionEnabled: dnsProtectionEnabled),
+            "dns": dnsConfiguration(
+                routeOverrides: routeOverrides,
+                dnsProtectionEnabled: dnsProtectionEnabled,
+                ipv4OnlyCompatibilityEnabled: ipv4OnlyCompatibilityEnabled
+            ),
             "inbounds": [
                 tunInbound
             ],
@@ -503,7 +543,8 @@ public struct SingBoxConfigBuilder: Sendable {
 
     private func dnsConfiguration(
         routeOverrides: SingBoxRouteOverrides,
-        dnsProtectionEnabled: Bool
+        dnsProtectionEnabled: Bool,
+        ipv4OnlyCompatibilityEnabled: Bool
     ) -> [String: Any] {
         var servers: [[String: Any]] = [
             [
@@ -516,10 +557,14 @@ public struct SingBoxConfigBuilder: Sendable {
         ]
 
         guard dnsProtectionEnabled else {
-            return [
+            var dns: [String: Any] = [
                 "servers": servers,
                 "final": "cloudflare"
             ]
+            if ipv4OnlyCompatibilityEnabled {
+                dns["strategy"] = "ipv4_only"
+            }
+            return dns
         }
 
         servers.append([
@@ -533,34 +578,65 @@ public struct SingBoxConfigBuilder: Sendable {
             "server": SingBoxRouteOverrides.providerDNSServers[1]
         ])
 
-        let forceVPNSuffixes = (SingBoxRouteOverrides.authCompatibilityDomainSuffixes + routeOverrides.forceVPNDomainSuffixes)
+        let yandexMapsForceVPNSuffixes = SingBoxRouteOverrides.yandexMapsCompatibilityDomainSuffixes
             .map(normalizedDomainSuffix)
             .filter { !$0.isEmpty }
             .uniqued()
+        let forceVPNSuffixes = (
+            SingBoxRouteOverrides.authCompatibilityDomainSuffixes
+                + routeOverrides.forceVPNDomainSuffixes
+        )
+            .map(normalizedDomainSuffix)
+            .filter { !$0.isEmpty }
+            .filter { !yandexMapsForceVPNSuffixes.contains($0) }
+            .uniqued()
         let providerSuffixes = (SingBoxRouteOverrides.providerDNSDomainSuffixes + routeOverrides.bypassVPNDomainSuffixes)
             .map(normalizedDomainSuffix)
-            .filter { !$0.isEmpty && !forceVPNSuffixes.contains($0) && !isLocalDiscoverySuffix($0) }
+            .filter { !$0.isEmpty && !forceVPNSuffixes.contains($0) && !yandexMapsForceVPNSuffixes.contains($0) && !isLocalDiscoverySuffix($0) }
             .uniqued()
 
         var rules: [[String: Any]] = []
+        if !yandexMapsForceVPNSuffixes.isEmpty {
+            var yandexMapsRule: [String: Any] = [
+                "domain_suffix": yandexMapsForceVPNSuffixes,
+                "server": "cloudflare",
+                "strategy": "ipv4_only"
+            ]
+            if ipv4OnlyCompatibilityEnabled {
+                yandexMapsRule["strategy"] = "ipv4_only"
+            }
+            rules.append(yandexMapsRule)
+        }
         if !forceVPNSuffixes.isEmpty {
-            rules.append([
+            var forceRule: [String: Any] = [
                 "domain_suffix": forceVPNSuffixes,
                 "server": "cloudflare"
-            ])
+            ]
+            if ipv4OnlyCompatibilityEnabled {
+                forceRule["strategy"] = "ipv4_only"
+            }
+            rules.append(forceRule)
         }
         if !providerSuffixes.isEmpty {
-            rules.append([
+            var providerRule: [String: Any] = [
                 "domain_suffix": providerSuffixes,
                 "server": "provider-yandex"
-            ])
+            ]
+            if ipv4OnlyCompatibilityEnabled {
+                providerRule["strategy"] = "ipv4_only"
+            }
+            rules.append(providerRule)
         }
 
-        return [
+        var dns: [String: Any] = [
             "servers": servers,
             "rules": rules,
             "final": "cloudflare"
         ]
+        if ipv4OnlyCompatibilityEnabled {
+            dns["strategy"] = "ipv4_only"
+        }
+        return dns
     }
 
     private func appendRouteRules(
@@ -598,6 +674,18 @@ public struct SingBoxConfigBuilder: Sendable {
             "action": "reject",
             "method": "default",
             "no_drop": true
+        ])
+    }
+
+    private func appendYandexMapsQUICCompatibilityRule(to rules: inout [[String: Any]]) {
+        rules.append([
+            "network": "udp",
+            "port": 443,
+            "domain_suffix": SingBoxRouteOverrides.yandexMapsCompatibilityDomainSuffixes
+                .map(normalizedDomainSuffix)
+                .filter { !$0.isEmpty }
+                .uniqued(),
+            "outbound": "proxy"
         ])
     }
 

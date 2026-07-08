@@ -133,6 +133,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let dnsProtectionEnabled = optionBool("dnsProtectionEnabled", options: options, providerOptions: providerOptions, defaultValue: true)
         let localNetworkAccessEnabled = optionBool("localNetworkAccessEnabled", options: options, providerOptions: providerOptions, defaultValue: true)
         let ipv6LeakProtectionEnabled = optionBool("ipv6LeakProtectionEnabled", options: options, providerOptions: providerOptions, defaultValue: true)
+        let ipv4OnlyCompatibilityEnabled = optionBool("ipv4OnlyCompatibilityEnabled", options: options, providerOptions: providerOptions, defaultValue: false)
 
         guard let importedConfig, !importedConfig.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             packetTunnelLogger.error("Missing transient Amnezia config")
@@ -152,7 +153,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     killSwitchEnabled: killSwitchEnabled,
                     dnsProtectionEnabled: dnsProtectionEnabled,
                     localNetworkAccessEnabled: localNetworkAccessEnabled,
-                    ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
+                    ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled,
+                    ipv4OnlyCompatibilityEnabled: ipv4OnlyCompatibilityEnabled
                 )
                 startSingBoxTrafficSampler(profileID: profileID, protocolKind: configuredProtocolKind == "unknown" ? "singBox" : configuredProtocolKind)
                 saveDiagnostic(stage: "started-vless", message: "sing-box tunnel start returned successfully.")
@@ -359,7 +361,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         killSwitchEnabled: Bool,
         dnsProtectionEnabled: Bool,
         localNetworkAccessEnabled: Bool,
-        ipv6LeakProtectionEnabled: Bool
+        ipv6LeakProtectionEnabled: Bool,
+        ipv4OnlyCompatibilityEnabled: Bool
     ) async throws {
         let singBoxConfig = try SingBoxConfigBuilder().build(
             from: config,
@@ -368,14 +371,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 localNetworkAccessEnabled: localNetworkAccessEnabled,
                 ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
             ),
-            dnsProtectionEnabled: dnsProtectionEnabled
+            dnsProtectionEnabled: dnsProtectionEnabled,
+            ipv4OnlyCompatibilityEnabled: ipv4OnlyCompatibilityEnabled
         )
         packetTunnelLogger.info("Prepared sing-box config for \(config.endpoint, privacy: .public), bytes=\(singBoxConfig.jsonString.utf8.count, privacy: .public)")
         saveDiagnostic(
             stage: "singbox-config-built",
             message: dnsProtectionEnabled
-                ? "Config bytes: \(singBoxConfig.jsonString.utf8.count). Provider DNS lane: Yandex DNS."
-                : "Config bytes: \(singBoxConfig.jsonString.utf8.count). Profile DNS only."
+                ? "Config bytes: \(singBoxConfig.jsonString.utf8.count). Provider DNS lane: Yandex DNS.\(ipv4OnlyCompatibilityEnabled ? " IPv4-only compatibility enabled." : "")"
+                : "Config bytes: \(singBoxConfig.jsonString.utf8.count). Profile DNS only.\(ipv4OnlyCompatibilityEnabled ? " IPv4-only compatibility enabled." : "")"
         )
         try await singBoxRuntime.start(
             configJSON: singBoxConfig.jsonString,

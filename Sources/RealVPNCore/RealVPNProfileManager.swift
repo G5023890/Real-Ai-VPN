@@ -36,6 +36,7 @@ public struct VPNProfileConfiguration: Hashable, Codable, Sendable {
     public var dnsProtectionEnabled: Bool
     public var localNetworkAccessEnabled: Bool
     public var ipv6LeakProtectionEnabled: Bool
+    public var ipv4OnlyCompatibilityEnabled: Bool
     public var autoReconnectOnDemandEnabled: Bool
     public var preserveExistingOnDemandReconnect: Bool
 
@@ -49,6 +50,7 @@ public struct VPNProfileConfiguration: Hashable, Codable, Sendable {
         dnsProtectionEnabled: Bool = true,
         localNetworkAccessEnabled: Bool = true,
         ipv6LeakProtectionEnabled: Bool = true,
+        ipv4OnlyCompatibilityEnabled: Bool = false,
         autoReconnectOnDemandEnabled: Bool = false,
         preserveExistingOnDemandReconnect: Bool = false
     ) {
@@ -61,6 +63,7 @@ public struct VPNProfileConfiguration: Hashable, Codable, Sendable {
         self.dnsProtectionEnabled = dnsProtectionEnabled
         self.localNetworkAccessEnabled = localNetworkAccessEnabled
         self.ipv6LeakProtectionEnabled = ipv6LeakProtectionEnabled
+        self.ipv4OnlyCompatibilityEnabled = ipv4OnlyCompatibilityEnabled
         self.autoReconnectOnDemandEnabled = autoReconnectOnDemandEnabled
         self.preserveExistingOnDemandReconnect = preserveExistingOnDemandReconnect
     }
@@ -163,6 +166,7 @@ public final class RealVPNProfileManager: ObservableObject {
             options["dnsProtectionEnabled"] = NSNumber(value: configuration.dnsProtectionEnabled)
             options["localNetworkAccessEnabled"] = NSNumber(value: configuration.localNetworkAccessEnabled)
             options["ipv6LeakProtectionEnabled"] = NSNumber(value: configuration.ipv6LeakProtectionEnabled)
+            options["ipv4OnlyCompatibilityEnabled"] = NSNumber(value: configuration.ipv4OnlyCompatibilityEnabled)
             try manager.connection.startVPNTunnel(options: options)
             await waitForSettledStatus()
             vpnProfileLogger.info("startVPNTunnel returned status=\(self.status.rawValue, privacy: .public)")
@@ -262,7 +266,8 @@ public final class RealVPNProfileManager: ObservableObject {
             "killSwitchEnabled": NSNumber(value: configuration.killSwitchEnabled),
             "dnsProtectionEnabled": NSNumber(value: configuration.dnsProtectionEnabled),
             "localNetworkAccessEnabled": NSNumber(value: configuration.localNetworkAccessEnabled),
-            "ipv6LeakProtectionEnabled": NSNumber(value: configuration.ipv6LeakProtectionEnabled)
+            "ipv6LeakProtectionEnabled": NSNumber(value: configuration.ipv6LeakProtectionEnabled),
+            "ipv4OnlyCompatibilityEnabled": NSNumber(value: configuration.ipv4OnlyCompatibilityEnabled)
         ]
         protocolConfiguration.excludeLocalNetworks = configuration.localNetworkAccessEnabled
         if #available(iOS 17.4, macOS 14.4, *) {

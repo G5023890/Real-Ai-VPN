@@ -623,6 +623,8 @@ public struct CoreMLServerFeatureVector: Hashable, Codable, Sendable {
 }
 
 public struct CoreMLServerFeatureExtractor: Sendable {
+    public static let maxHistorySamplesPerServer = 1_024
+
     public init() {}
 
     public func vector(
@@ -768,8 +770,34 @@ public struct CoreMLServerFeatureExtractor: Sendable {
 
     public func trimToHistoryWindow(_ samples: [ServerQualitySample], now: Date = Date()) -> [ServerQualitySample] {
         let cutoff = now.addingTimeInterval(-CoreMLServerFeatureVector.historyWindow)
-        return samples
-            .filter { $0.timestamp >= cutoff }
+        let windowSamples = samples.filter { $0.timestamp >= cutoff }
+        let recentLimit = CoreMLServerFeatureVector.recentSampleLimit
+
+        return Dictionary(grouping: windowSamples, by: \.serverID)
+            .values
+            .flatMap { serverSamples -> [ServerQualitySample] in
+                let sorted = serverSamples.sorted { $0.timestamp < $1.timestamp }
+                guard sorted.count > Self.maxHistorySamplesPerServer else {
+                    return sorted
+                }
+
+                let recent = Array(sorted.suffix(recentLimit))
+                let older = sorted.dropLast(recent.count)
+                let olderLimit = Self.maxHistorySamplesPerServer - recent.count
+                guard older.count > olderLimit, olderLimit > 1 else {
+                    return Array(sorted.suffix(Self.maxHistorySamplesPerServer))
+                }
+
+                let lastIndex = older.count - 1
+                let sampledOlder = (0..<olderLimit).map { index in
+                    let offset = Int(
+                        (Double(index) * Double(lastIndex) / Double(olderLimit - 1))
+                            .rounded(.down)
+                    )
+                    return older[older.index(older.startIndex, offsetBy: offset)]
+                }
+                return sampledOlder + recent
+            }
             .sorted { $0.timestamp < $1.timestamp }
     }
 

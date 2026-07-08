@@ -208,6 +208,31 @@ final class SmartServerSelectionTests: XCTestCase {
         XCTAssertEqual(Int(vector.longTermLatencyMilliseconds), 30)
     }
 
+    func testHistoryTrimmingCapsEachServerWhilePreservingRecentAndLongTermSamples() {
+        let extractor = CoreMLServerFeatureExtractor()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let samples = (0..<2_000).map { index in
+            ServerQualitySample.sample(
+                serverID: "de-1",
+                region: "DE",
+                latency: Double(index),
+                handshake: 80,
+                loss: 0,
+                timestamp: now.addingTimeInterval(TimeInterval(index - 2_000) * 60)
+            )
+        }
+
+        let trimmed = extractor.trimToHistoryWindow(samples, now: now)
+        let recentLimit = CoreMLServerFeatureVector.recentSampleLimit
+
+        XCTAssertEqual(trimmed.count, CoreMLServerFeatureExtractor.maxHistorySamplesPerServer)
+        XCTAssertEqual(trimmed.first?.timestamp, samples.first?.timestamp)
+        XCTAssertEqual(
+            Array(trimmed.suffix(recentLimit)).map(\.timestamp),
+            Array(samples.suffix(recentLimit)).map(\.timestamp)
+        )
+    }
+
     func testDailyReportUsesOnlyTodaySamplesAndProbeHistory() {
         let builder = VPNChannelDailyReportBuilder()
         let now = Date(timeIntervalSince1970: 1_800_000_000)

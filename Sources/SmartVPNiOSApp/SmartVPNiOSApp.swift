@@ -150,6 +150,23 @@ private enum ConnectivityProbeRunner {
         }
     }
 
+    static func httpReachable(url: URL, headers: [String: String] = [:], timeout: TimeInterval = 5) async -> (succeeded: Bool, latency: Double?) {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = timeout
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        headers.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+        let start = Date()
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            return ((200..<500).contains(statusCode), Date().timeIntervalSince(start) * 1_000)
+        } catch {
+            return (false, nil)
+        }
+    }
+
     static func fetchText(url: URL, timeout: TimeInterval = 5) async -> String? {
         var request = URLRequest(url: url)
         request.timeoutInterval = timeout
@@ -472,6 +489,11 @@ final class iOSDashboardModel: ObservableObject {
     @Published var ipv6LeakProtectionEnabled = UserDefaults.standard.object(forKey: "ios.ipv6LeakProtectionEnabled") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(ipv6LeakProtectionEnabled, forKey: "ios.ipv6LeakProtectionEnabled")
+        }
+    }
+    @Published var ipv4OnlyCompatibilityEnabled = UserDefaults.standard.object(forKey: "ios.ipv4OnlyCompatibilityEnabled") as? Bool ?? false {
+        didSet {
+            UserDefaults.standard.set(ipv4OnlyCompatibilityEnabled, forKey: "ios.ipv4OnlyCompatibilityEnabled")
         }
     }
 
@@ -1769,6 +1791,7 @@ final class iOSDashboardModel: ObservableObject {
             dnsProtectionEnabled: dnsProtectionEnabled,
             localNetworkAccessEnabled: localNetworkAccessEnabled,
             ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled,
+            ipv4OnlyCompatibilityEnabled: ipv4OnlyCompatibilityEnabled,
             autoReconnectOnDemandEnabled: enableOnDemandReconnect && reconnectAfterDropEnabled,
             preserveExistingOnDemandReconnect: reconnectAfterDropEnabled
         )
@@ -1867,7 +1890,12 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     private func loadQualityHistory() {
-        qualitySamples = qualityHistoryStore.load()
+        let storedSamples = qualityHistoryStore.load()
+        let activeProfileIDs = Set(profiles.map(\.id))
+        qualitySamples = storedSamples.filter { activeProfileIDs.contains($0.serverID) }
+        if qualitySamples.count != storedSamples.count {
+            qualityHistoryStore.save(qualitySamples)
+        }
         qualitySamples.forEach { selector.record($0) }
         refreshRoutePreview()
     }
@@ -2036,6 +2064,7 @@ final class iOSDashboardModel: ObservableObject {
                 recordTunnelQualitySample(for: activeProfile, probes: tunnelProbes)
             }
             auditConnectedTunnel(profileID: activeID, probes: tunnelProbes)
+            updateYandexMapsCompatibilityStatus(from: tunnelProbes)
         }
 
         liveProbeResults = probes
@@ -2104,6 +2133,36 @@ final class iOSDashboardModel: ObservableObject {
         reconnectAfterUnexpectedDrop(profileID: profileID, profileName: profileName)
     }
 
+    private func updateYandexMapsCompatibilityStatus(from probes: [ConnectivityProbeResult]) {
+        let yandexMapsProbes = probes.filter { $0.targetID.hasPrefix("yandex-maps-") }
+        guard !yandexMapsProbes.isEmpty else {
+            return
+        }
+
+        let failedProbes = yandexMapsProbes.filter { !$0.succeeded }
+        if !failedProbes.isEmpty {
+            let failedTargets = failedProbes
+                .map { yandexMapsProbeLabel($0.targetID) }
+                .joined(separator: ", ")
+            message = "yandex-maps-compatibility-failed: \(failedProbes.count)/\(yandexMapsProbes.count) failed (\(failedTargets))."
+        }
+    }
+
+    private func yandexMapsProbeLabel(_ targetID: String) -> String {
+        switch targetID {
+        case "yandex-maps-web":
+            return "web"
+        case "yandex-maps-api":
+            return "api"
+        case "yandex-maps-static":
+            return "tiles"
+        case "yandex-maps-dns-a":
+            return "dns-a"
+        default:
+            return targetID.replacingOccurrences(of: "yandex-maps-", with: "")
+        }
+    }
+
     private var providerProbeTrust: PathProbeTrust {
         vpnStatus.isConnectedOrConnecting ? .untrustedWhileVPNActive : .trusted
     }
@@ -2166,13 +2225,19 @@ final class iOSDashboardModel: ObservableObject {
             ("doh-cloudflare-ya", ProbeTargetKind.dnsResolver, ProbeMethod.dnsQuery, { await ConnectivityProbeRunner.httpGet(url: URL(string: "https://cloudflare-dns.com/dns-query?name=ya.ru&type=A")!, headers: ["Accept": "application/dns-json"]) }),
             ("doh-quad9-ya", ProbeTargetKind.dnsResolver, ProbeMethod.dnsQuery, { await ConnectivityProbeRunner.httpGet(url: URL(string: "https://dns.quad9.net/dns-query?name=ya.ru&type=A")!, headers: ["Accept": "application/dns-json"]) })
         ]
+        let yandexMaps = [
+            ("yandex-maps-web", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpGet, { await ConnectivityProbeRunner.httpReachable(url: URL(string: "https://maps.yandex.ru")!) }),
+            ("yandex-maps-api", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpGet, { await ConnectivityProbeRunner.httpReachable(url: URL(string: "https://api-maps.yandex.ru/2.1/?lang=ru_RU")!) }),
+            ("yandex-maps-static", ProbeTargetKind.vpnProtectedEndpoint, ProbeMethod.httpGet, { await ConnectivityProbeRunner.httpReachable(url: URL(string: "https://static-maps.yandex.ru/1.x/?ll=37.620070,55.753630&z=10&size=1,1&l=map")!) }),
+            ("yandex-maps-dns-a", ProbeTargetKind.dnsResolver, ProbeMethod.dnsQuery, { await ConnectivityProbeRunner.httpGet(url: URL(string: "https://cloudflare-dns.com/dns-query?name=maps.yandex.ru&type=A")!, headers: ["Accept": "application/dns-json"]) })
+        ]
         let targets: [(String, ProbeTargetKind, ProbeMethod, () async -> (succeeded: Bool, latency: Double?))] = [
             lightweight.randomElement()!,
             publicWeb.randomElement()!,
             regional.randomElement()!,
             tcp.randomElement()!,
             doh.randomElement()!
-        ]
+        ] + yandexMaps
 
         var probes: [ConnectivityProbeResult] = []
         for target in targets {
@@ -3620,12 +3685,14 @@ private struct iOSSettingsScreen: View {
                     settingToggleRow(title: "DNS Protection", systemImage: "network", isOn: $model.dnsProtectionEnabled)
                     settingToggleRow(title: "Local Network Access", systemImage: "wifi.router", isOn: $model.localNetworkAccessEnabled)
                     settingToggleRow(title: "IPv6 Leak Protection", systemImage: "lock.icloud", isOn: $model.ipv6LeakProtectionEnabled)
+                    settingToggleRow(title: "IPv4-only Compatibility", systemImage: "4.circle", isOn: $model.ipv4OnlyCompatibilityEnabled)
                     settingToggleRow(title: "Auto Recovery", systemImage: "cross.case.fill", isOn: $model.automaticFailoverEnabled)
                     settingButtonRow(title: "Reset Security Settings", value: "", systemImage: "arrow.counterclockwise") {
                         model.killSwitchEnabled = false
                         model.dnsProtectionEnabled = true
                         model.localNetworkAccessEnabled = true
                         model.ipv6LeakProtectionEnabled = true
+                        model.ipv4OnlyCompatibilityEnabled = false
                         model.automaticFailoverEnabled = true
                     }
                 }

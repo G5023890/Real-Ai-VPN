@@ -753,6 +753,11 @@ final class DashboardModel: ObservableObject {
             UserDefaults.standard.set(ipv6LeakProtectionEnabled, forKey: "ipv6LeakProtectionEnabled")
         }
     }
+    @Published var ipv4OnlyCompatibilityEnabled = UserDefaults.standard.object(forKey: "ipv4OnlyCompatibilityEnabled") as? Bool ?? false {
+        didSet {
+            UserDefaults.standard.set(ipv4OnlyCompatibilityEnabled, forKey: "ipv4OnlyCompatibilityEnabled")
+        }
+    }
     @Published var launchAtLoginEnabled = UserDefaults.standard.object(forKey: "launchAtLogin") as? Bool ?? false {
         didSet {
             UserDefaults.standard.set(launchAtLoginEnabled, forKey: "launchAtLogin")
@@ -2180,6 +2185,7 @@ final class DashboardModel: ObservableObject {
             dnsProtectionEnabled: dnsProtectionEnabled,
             localNetworkAccessEnabled: localNetworkAccessEnabled,
             ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled,
+            ipv4OnlyCompatibilityEnabled: ipv4OnlyCompatibilityEnabled,
             autoReconnectOnDemandEnabled: false
         )
     }
@@ -2333,7 +2339,12 @@ final class DashboardModel: ObservableObject {
     }
 
     private func loadQualityHistory() {
-        qualitySamples = qualityHistoryStore.load()
+        let storedSamples = qualityHistoryStore.load()
+        let activeProfileIDs = Set(configProfiles.map(\.id))
+        qualitySamples = storedSamples.filter { activeProfileIDs.contains($0.serverID) }
+        if qualitySamples.count != storedSamples.count {
+            qualityHistoryStore.save(qualitySamples)
+        }
         qualitySamples.forEach { selector.record($0) }
         refresh()
     }
@@ -4425,6 +4436,7 @@ private struct MacSettingsWorkspace: View {
                 settingsToggle("DNS Protection", isOn: $model.dnsProtectionEnabled)
                 settingsToggle("Local Network Access", isOn: $model.localNetworkAccessEnabled)
                 settingsToggle("IPv6 Leak Protection", isOn: $model.ipv6LeakProtectionEnabled)
+                settingsToggle("IPv4-only Compatibility", isOn: $model.ipv4OnlyCompatibilityEnabled)
                 settingsToggle("Auto Recovery", isOn: $model.automaticFailoverEnabled)
             }
 
@@ -4433,6 +4445,7 @@ private struct MacSettingsWorkspace: View {
                 model.dnsProtectionEnabled = true
                 model.localNetworkAccessEnabled = true
                 model.ipv6LeakProtectionEnabled = true
+                model.ipv4OnlyCompatibilityEnabled = false
                 model.automaticFailoverEnabled = true
             } label: {
                 Label("Reset Security Settings", systemImage: "arrow.counterclockwise")
