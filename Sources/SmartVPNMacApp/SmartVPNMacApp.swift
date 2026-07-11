@@ -1481,7 +1481,7 @@ final class DashboardModel: ObservableObject {
         return false
     }
 
-    private func waitUntilVPNIsDisconnected(timeoutSeconds: Double = 3) async {
+    private func waitUntilVPNIsDisconnected(timeoutSeconds: Double = 15) async {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while Date() < deadline {
             if vpnStatus == .disconnected || vpnStatus == .invalid || vpnStatus == .unknown {
@@ -1940,6 +1940,17 @@ final class DashboardModel: ObservableObject {
                     self.vpnErrorMessage = self.userFacingVPNError(message)
                     self.tunnelDiagnostic = self.tunnelDiagnosticsStore.load()
                 }
+            }
+            .store(in: &cancellables)
+
+        vpnManager.$transitionDetail
+            .compactMap { $0 }
+            .receive(on: RunLoop.main)
+            .sink { [weak self] detail in
+                guard let self, self.vpnStatus != .connected else {
+                    return
+                }
+                self.monitorStatus = detail
             }
             .store(in: &cancellables)
     }

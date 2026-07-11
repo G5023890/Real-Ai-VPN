@@ -97,9 +97,11 @@ public final class RealVPNProfileManager: ObservableObject {
     @Published public private(set) var status: VPNConnectionStatus = .unknown
     @Published public private(set) var lastErrorMessage: String?
     @Published public private(set) var lastProviderBundleIdentifier: String?
+    @Published public private(set) var transitionDetail: String?
 
     private var manager: NETunnelProviderManager?
     private var observer: NSObjectProtocol?
+    private var operationGeneration = 0
 
     public init() {
         observer = NotificationCenter.default.addObserver(
@@ -144,7 +146,9 @@ public final class RealVPNProfileManager: ObservableObject {
         transientAmneziaKey: String? = nil,
         routingExceptions: RoutingExceptionCollection = RoutingExceptionCollection()
     ) async {
+        let operation = beginOperation()
         do {
+            reportTransition("Preparing VPN switch")
             vpnProfileLogger.info("Starting VPN provider=\(configuration.providerBundleIdentifier, privacy: .public) serverID=\(configuration.serverID, privacy: .public) hasConfig=\((transientAmneziaKey?.isEmpty == false), privacy: .public)")
             NSLog("RealAiVPN VPNProfileManager connect provider=%@ serverID=%@ hasConfig=%@",
                   configuration.providerBundleIdentifier,
@@ -152,9 +156,17 @@ public final class RealVPNProfileManager: ObservableObject {
                   (transientAmneziaKey?.isEmpty == false) ? "true" : "false")
             lastErrorMessage = nil
             lastProviderBundleIdentifier = configuration.providerBundleIdentifier
-            let manager = try await loadOrCreateManager(configuration: configuration)
+            try await stopAllRealAiManagers()
+            guard isCurrent(operation) else { return }
+
+            reportTransition("Loading selected VPN profile")
+            var manager = try await loadOrCreateManager(configuration: configuration)
+            guard isCurrent(operation) else { return }
             self.manager = manager
-            try await save(manager)
+            reportTransition("Saving selected VPN profile")
+            manager = try await saveAndReload(manager, configuration: configuration)
+            guard isCurrent(operation) else { return }
+            self.manager = manager
             var options: [String: NSObject] = [:]
             if let transientAmneziaKey {
                 options["amneziaVPNURL"] = transientAmneziaKey as NSString
@@ -167,28 +179,71 @@ public final class RealVPNProfileManager: ObservableObject {
             options["localNetworkAccessEnabled"] = NSNumber(value: configuration.localNetworkAccessEnabled)
             options["ipv6LeakProtectionEnabled"] = NSNumber(value: configuration.ipv6LeakProtectionEnabled)
             options["ipv4OnlyCompatibilityEnabled"] = NSNumber(value: configuration.ipv4OnlyCompatibilityEnabled)
+            reportTransition("Starting \(configuration.protocolKind) tunnel")
             try manager.connection.startVPNTunnel(options: options)
-            await waitForSettledStatus()
+            await waitForSettledStatus(manager, operation: operation)
+            guard isCurrent(operation) else { return }
             vpnProfileLogger.info("startVPNTunnel returned status=\(self.status.rawValue, privacy: .public)")
             NSLog("RealAiVPN VPNProfileManager startVPNTunnel returned status=%@",
                   self.status.rawValue)
             if status == .disconnected || status == .invalid {
                 lastErrorMessage = "NetworkExtension returned \(status.rawValue) after start for \(configuration.providerBundleIdentifier)."
+                reportTransition("Tunnel start ended as \(status.rawValue)")
+            } else {
+                reportTransition("Tunnel status: \(status.rawValue)")
             }
         } catch let error as RealVPNProfileError {
             vpnProfileLogger.error("VPN start failed: \(error.localizedDescription, privacy: .public)")
             NSLog("RealAiVPN VPNProfileManager start failed: %@", error.localizedDescription)
             lastErrorMessage = error.localizedDescription
             status = .disconnected
+            reportTransition("VPN switch failed: \(error.localizedDescription)")
         } catch {
             vpnProfileLogger.error("VPN start failed: \(error.localizedDescription, privacy: .public)")
             NSLog("RealAiVPN VPNProfileManager start failed: %@", error.localizedDescription)
             lastErrorMessage = RealVPNProfileError.startFailed(error.localizedDescription).localizedDescription
             status = .disconnected
+            reportTransition("VPN switch failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func stopAllRealAiManagers() async throws {
+        let managers: [NETunnelProviderManager]
+        do {
+            managers = try await NETunnelProviderManager.loadAllFromPreferences()
+        } catch {
+            throw RealVPNProfileError.preferencesLoadFailed(error.localizedDescription)
+        }
+
+        for manager in managers where manager.isRealAiRouterManager {
+            let status = VPNConnectionStatus(manager.connection.status)
+            reportTransition("Stopping \((manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier ?? "unknown")")
+            NSLog("RealAiVPN VPNProfileManager stopping conflicting provider=%@ status=%@ description=%@",
+                  (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier ?? "unknown",
+                  status.rawValue,
+                  manager.localizedDescription ?? "unknown")
+
+            if manager.isOnDemandEnabled {
+                manager.isOnDemandEnabled = false
+                manager.onDemandRules = nil
+                try await save(manager)
+            }
+
+            switch status {
+            case .connecting, .connected, .reasserting, .disconnecting:
+                manager.connection.stopVPNTunnel()
+                guard await waitForManagerToDisconnect(manager) else {
+                    throw RealVPNProfileError.startFailed("Timed out waiting for the previous VPN profile to disconnect.")
+                }
+            case .invalid, .disconnected, .unknown:
+                break
+            }
         }
     }
 
     public func disconnect() {
+        _ = beginOperation()
+        reportTransition("Disconnecting VPN")
         vpnProfileLogger.info("Stopping VPN tunnel")
         NSLog("RealAiVPN VPNProfileManager disconnect")
         manager?.connection.stopVPNTunnel()
@@ -196,6 +251,8 @@ public final class RealVPNProfileManager: ObservableObject {
     }
 
     public func disconnectDisablingOnDemand() async {
+        _ = beginOperation()
+        reportTransition("Disconnecting VPN")
         vpnProfileLogger.info("Stopping VPN tunnel after disabling On Demand")
         NSLog("RealAiVPN VPNProfileManager disconnectDisablingOnDemand")
         if let manager {
@@ -301,17 +358,93 @@ public final class RealVPNProfileManager: ObservableObject {
         }
     }
 
-    private func waitForSettledStatus(timeoutSeconds: Double = 8) async {
+    private func waitForSettledStatus(
+        _ expectedManager: NETunnelProviderManager,
+        operation: Int,
+        timeoutSeconds: Double = 15
+    ) async {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         repeat {
-            refreshStatus()
+            guard isCurrent(operation) else { return }
+            status = VPNConnectionStatus(expectedManager.connection.status)
             if status == .connected || status == .reasserting || status == .disconnected || status == .invalid {
                 return
             }
             try? await Task.sleep(for: .milliseconds(250))
         } while Date() < deadline
 
-        refreshStatus()
+        guard isCurrent(operation) else { return }
+        status = VPNConnectionStatus(expectedManager.connection.status)
+    }
+
+    private func waitForManagerToDisconnect(
+        _ manager: NETunnelProviderManager,
+        timeoutSeconds: Double = 15
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        repeat {
+            let status = VPNConnectionStatus(manager.connection.status)
+            if status == .disconnected || status == .invalid {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+        } while Date() < deadline
+        return false
+    }
+
+    private func saveAndReload(
+        _ manager: NETunnelProviderManager,
+        configuration: VPNProfileConfiguration
+    ) async throws -> NETunnelProviderManager {
+        try await save(manager)
+        let managers: [NETunnelProviderManager]
+        do {
+            managers = try await NETunnelProviderManager.loadAllFromPreferences()
+        } catch {
+            throw RealVPNProfileError.preferencesLoadFailed(error.localizedDescription)
+        }
+
+        guard let reloadedManager = managers.first(where: {
+            guard $0.localizedDescription == configuration.localizedDescription,
+                  let tunnelProtocol = $0.protocolConfiguration as? NETunnelProviderProtocol else {
+                return false
+            }
+            return tunnelProtocol.providerBundleIdentifier == configuration.providerBundleIdentifier
+        }) else {
+            throw RealVPNProfileError.missingManager
+        }
+
+        try await reloadedManager.loadFromPreferences()
+        return reloadedManager
+    }
+
+    private func beginOperation() -> Int {
+        operationGeneration += 1
+        return operationGeneration
+    }
+
+    private func isCurrent(_ operation: Int) -> Bool {
+        operation == operationGeneration
+    }
+
+    private func reportTransition(_ detail: String) {
+        transitionDetail = detail
+        vpnProfileLogger.info("VPN transition: \(detail, privacy: .public)")
+        NSLog("RealAiVPN VPNProfileManager transition=%@", detail)
+    }
+}
+
+private extension NETunnelProviderManager {
+    var isRealAiRouterManager: Bool {
+        guard protocolConfiguration is NETunnelProviderProtocol,
+              let description = localizedDescription else {
+            return false
+        }
+
+        return description == "Real Ai Router"
+            || description == "Real Ai VPN"
+            || description.hasPrefix("Real Ai Router ")
+            || description.hasPrefix("Real Ai VPN ")
     }
 }
 

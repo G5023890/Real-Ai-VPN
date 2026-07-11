@@ -2,7 +2,7 @@
 
 Current release: `0.97`.
 
-Current recovery point: `restore-0.97-vless-mail-compatibility`.
+Current recovery point: `restore-0.97-macos-profile-switching`.
 
 Real Ai Router is a SwiftUI VPN client for iOS and macOS. It imports AmneziaWG
 profiles, Shadowrocket VLESS Reality links/subscriptions, and runs them through
@@ -42,6 +42,14 @@ connected iPhone, not in a simulator.
 - Manual Disconnect disables NetworkExtension On Demand before stopping the
   tunnel, so user-initiated disconnects are not interrupted by automatic
   reconnect.
+- Profile switching: AWG and VLESS are serialized through one shared
+  NetworkExtension transition. The previous Real Ai Router tunnel must fully
+  disconnect before the selected profile is reloaded from system preferences
+  and started. This avoids stale-session races when switching protocols on
+  recent macOS and iOS releases.
+- Transition diagnostics: while a VPN is changing state, macOS and iOS show
+  the current system-profile stage: stopping the old tunnel, loading and
+  saving the selected profile, starting its provider, or a concrete failure.
 - iOS connect button behavior: the main Connect/Disconnect control has a larger
   tap target, an explicit busy state, and a full-area gesture handler to avoid
   missed taps during startup/status transitions.
@@ -58,6 +66,12 @@ connected iPhone, not in a simulator.
 
 ## Recent 0.97 Changes
 
+- Hardened AWG/VLESS system-profile switching for macOS 27 beta 3 and iOS:
+  overlapping connection attempts are superseded, all Real Ai Router tunnel
+  managers are stopped before a new provider starts, and the selected manager
+  is reloaded from `NetworkExtension` preferences after saving.
+- Increased profile-switch disconnect waits to 15 seconds so a slower system
+  extension teardown cannot race the next VLESS or AWG start.
 - Raised default app release version from `0.96` to `0.97` in XcodeGen and build
   scripts.
 - Added a shared VLESS Reality compatibility route for Apple Mail account
@@ -104,6 +118,10 @@ connected iPhone, not in a simulator.
 
 ## Recovery Points
 
+- `restore-0.97-macos-profile-switching`: recovery point for serialized AWG /
+  VLESS system-profile transitions, refreshed NetworkExtension preferences,
+  15-second teardown handling, and visible transition diagnostics on macOS and
+  iOS.
 - `restore-0.97-vless-mail-compatibility`: recovery point after fixing Apple
   Mail Google account authorization with VLESS Reality on macOS and iOS via
   shared auth routing, QUIC fallback, and legacy mail TLS-port compatibility.
