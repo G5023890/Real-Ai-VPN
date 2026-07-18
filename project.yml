@@ -233,6 +233,8 @@ targets:
         buildPhase: resources
       - path: Resources/CoreML
         buildPhase: resources
+      - path: THIRD_PARTY_NOTICES.md
+        buildPhase: resources
     dependencies:
       - target: WireGuardConfig
       - target: SmartServerSelection
@@ -264,6 +266,8 @@ targets:
       - path: Resources/Icons/IconApp.png
         buildPhase: resources
       - path: Resources/CoreML
+        buildPhase: resources
+      - path: THIRD_PARTY_NOTICES.md
         buildPhase: resources
     dependencies:
       - target: WireGuardConfigiOS

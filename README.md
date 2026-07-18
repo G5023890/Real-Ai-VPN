@@ -12,6 +12,13 @@ The app uses Apple Liquid Glass style across iOS and macOS and targets the lates
 Apple beta SDKs through Xcode-beta. iOS builds are validated on a physically
 connected iPhone, not in a simulator.
 
+## Licensing
+
+Real Ai Router does not implement a proprietary VPN protocol. WireGuard support
+uses the MIT-licensed official WireGuard Apple adapter; VLESS Reality uses
+GPL-3.0-or-later sing-box Libbox. See [third-party notices](THIRD_PARTY_NOTICES.md)
+for copyright, license, and corresponding-source information.
+
 ## Current Functionality
 
 - Platforms: native iOS and macOS apps with matched operational areas for Home,
@@ -77,6 +84,8 @@ connected iPhone, not in a simulator.
   instead of demonstration servers.
 - Matched the macOS and iOS profile workflow for WireGuard and VLESS Reality:
   import, select, rename, delete, reconnect, diagnostics, failover, and security controls.
+- Added in-app third-party license notices and a corresponding-source link for
+  the WireGuard and sing-box components used by the standard protocols.
 - Raised default app release version from `0.97` to `0.98` in XcodeGen and all
   macOS/iOS build scripts.
 
