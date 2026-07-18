@@ -20,7 +20,7 @@ CLANG_BIN="${CLANG_BIN:-$XCODE_DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 SKIP_SIGN="${SKIP_SIGN:-0}"
 LAUNCH_AFTER_INSTALL="${LAUNCH_AFTER_INSTALL:-1}"
-APP_VERSION="${APP_VERSION:-0.97}"
+APP_VERSION="${APP_VERSION:-0.98}"
 BUILD_STAMP="${BUILD_STAMP:-$(date '+%H%M%S%d%m%Y')}"
 BUILD_DISPLAY_STAMP="${BUILD_DISPLAY_STAMP:-$(date '+%H%M.%d.%y')}"
 BUILD_LABEL="${BUILD_LABEL:-${APP_VERSION} (${BUILD_DISPLAY_STAMP})}"
@@ -104,19 +104,19 @@ mkdir -p "$DIST_DIR"
 
 "$PROJECT_DIR/scripts/prepare_third_party.sh"
 
-log "Building AmneziaWG userspace backend"
-make -C "$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo" \
+log "Building WireGuard userspace backend"
+make -C "$PROJECT_DIR/third_party/wireguard-apple/Sources/WireGuardKitGo" \
   ARCHS=arm64 \
   ARCH=arm64 \
   PLATFORM_NAME=macosx \
   SDKROOT="$MACOS_SDKROOT" \
   CC="$CLANG_BIN" \
-  CONFIGURATION_BUILD_DIR="$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo/out" \
-  CONFIGURATION_TEMP_DIR="$PROJECT_DIR/.build/amneziawg-go-tmp" \
+  CONFIGURATION_BUILD_DIR="$PROJECT_DIR/third_party/wireguard-apple/Sources/WireGuardKitGo/out" \
+  CONFIGURATION_TEMP_DIR="$PROJECT_DIR/.build/wireguard-go-tmp" \
   build version-header
 mkdir -p "$PROJECT_DIR/Sources/WireGuardKitGo/out"
-cp "$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo/out/libwg-go.a" "$PROJECT_DIR/Sources/WireGuardKitGo/out/libwg-go.a"
-cp "$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo/out/wireguard-go-version.h" "$PROJECT_DIR/Sources/WireGuardKitGo/out/wireguard-go-version.h"
+cp "$PROJECT_DIR/third_party/wireguard-apple/Sources/WireGuardKitGo/out/libwg-go.a" "$PROJECT_DIR/Sources/WireGuardKitGo/out/libwg-go.a"
+cp "$PROJECT_DIR/third_party/wireguard-apple/Sources/WireGuardKitGo/out/wireguard-go-version.h" "$PROJECT_DIR/Sources/WireGuardKitGo/out/wireguard-go-version.h"
 
 log "Generating Xcode project"
 "$PROJECT_DIR/scripts/xcodegen_generate.sh"

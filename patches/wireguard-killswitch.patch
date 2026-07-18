@@ -1,0 +1,134 @@
+diff --git a/Package.swift b/Package.swift
+index 5d15a1b..3299cf0 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -1,4 +1,4 @@
+-// swift-tools-version:5.3
++// swift-tools-version:5.5
+ // The swift-tools-version declares the minimum version of Swift required to build this package.
+
+ import PackageDescription
+@@ -34,7 +34,10 @@ let package = Package(
+                 "Makefile"
+             ],
+             publicHeadersPath: ".",
+-            linkerSettings: [.linkedLibrary("wg-go")]
++            linkerSettings: [
++                .unsafeFlags(["-L", "Sources/WireGuardKitGo/out"]),
++                .linkedLibrary("wg-go")
++            ]
+         )
+     ]
+ )
+diff --git a/Sources/WireGuardKit/InterfaceConfiguration.swift b/Sources/WireGuardKit/InterfaceConfiguration.swift
+index d99d969..a17a4a5 100644
+--- a/Sources/WireGuardKit/InterfaceConfiguration.swift
++++ b/Sources/WireGuardKit/InterfaceConfiguration.swift
+@@ -11,6 +11,7 @@ public struct InterfaceConfiguration {
+     public var mtu: UInt16?
+     public var dns = [DNSServer]()
+     public var dnsSearch = [String]()
++    public var killSwitchEnabled = false
+
+     public init(privateKey: PrivateKey) {
+         self.privateKey = privateKey
+@@ -27,6 +28,7 @@ extension InterfaceConfiguration: Equatable {
+             lhs.listenPort == rhs.listenPort &&
+             lhs.mtu == rhs.mtu &&
+             lhs.dns == rhs.dns &&
+-            lhs.dnsSearch == rhs.dnsSearch
++            lhs.dnsSearch == rhs.dnsSearch &&
++            lhs.killSwitchEnabled == rhs.killSwitchEnabled
+     }
+ }
+diff --git a/Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift b/Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift
+index 3658956..36caf9a 100644
+--- a/Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift
++++ b/Sources/WireGuardKit/PacketTunnelSettingsGenerator.swift
+@@ -82,6 +82,12 @@ class PacketTunnelSettingsGenerator {
+          * a valid IP address that will actually route over the Internet.
+          */
+         let networkSettings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
++        if tunnelConfiguration.interface.killSwitchEnabled {
++            if #available(iOS 27.0, macOS 27.0, *) {
++                networkSettings.includeAllNetworks = .any
++                networkSettings.enforceRoutes = true
++            }
++        }
+
+         if !tunnelConfiguration.interface.dnsSearch.isEmpty || !tunnelConfiguration.interface.dns.isEmpty {
+             let dnsServerStrings = tunnelConfiguration.interface.dns.map { $0.stringRepresentation }
+@@ -115,13 +121,16 @@ class PacketTunnelSettingsGenerator {
+
+         let (ipv4Addresses, ipv6Addresses) = addresses()
+         let (ipv4IncludedRoutes, ipv6IncludedRoutes) = includedRoutes()
++        let (ipv4ExcludedRoutes, ipv6ExcludedRoutes) = excludedRoutes()
+
+         let ipv4Settings = NEIPv4Settings(addresses: ipv4Addresses.map { $0.destinationAddress }, subnetMasks: ipv4Addresses.map { $0.destinationSubnetMask })
+         ipv4Settings.includedRoutes = ipv4IncludedRoutes
++        ipv4Settings.excludedRoutes = ipv4ExcludedRoutes
+         networkSettings.ipv4Settings = ipv4Settings
+
+         let ipv6Settings = NEIPv6Settings(addresses: ipv6Addresses.map { $0.destinationAddress }, networkPrefixLengths: ipv6Addresses.map { $0.destinationNetworkPrefixLength })
+         ipv6Settings.includedRoutes = ipv6IncludedRoutes
++        ipv6Settings.excludedRoutes = ipv6ExcludedRoutes
+         networkSettings.ipv6Settings = ipv6Settings
+
+         return networkSettings
+@@ -173,6 +182,32 @@ class PacketTunnelSettingsGenerator {
+         return (ipv4IncludedRoutes, ipv6IncludedRoutes)
+     }
+
++    private func excludedRoutes() -> ([NEIPv4Route], [NEIPv6Route]) {
++        var ipv4Routes = [NEIPv4Route]()
++        var ipv6Routes = [NEIPv6Route]()
++        for endpoint in resolvedEndpoints {
++            guard let endpoint else { continue }
++            switch endpoint.host {
++            case .ipv4(let address):
++                ipv4Routes.append(NEIPv4Route(destinationAddress: "\(address)", subnetMask: "255.255.255.255"))
++            case .ipv6(let address):
++                ipv6Routes.append(NEIPv6Route(destinationAddress: "\(address)", networkPrefixLength: NSNumber(value: UInt8(128))))
++            default:
++                fatalError()
++            }
++        }
++        for peer in tunnelConfiguration.peers {
++            for range in peer.excludeIPs {
++                if range.address is IPv4Address {
++                    ipv4Routes.append(NEIPv4Route(destinationAddress: "\(range.address)", subnetMask: "\(range.subnetMask())"))
++                } else if range.address is IPv6Address {
++                    ipv6Routes.append(NEIPv6Route(destinationAddress: "\(range.address)", networkPrefixLength: NSNumber(value: range.networkPrefixLength)))
++                }
++            }
++        }
++        return (ipv4Routes, ipv6Routes)
++    }
++
+     private class func reresolveEndpoint(endpoint: Endpoint) -> EndpointResolutionResult {
+         return Result { (endpoint, try endpoint.withReresolvedIP()) }
+             .mapError { error -> DNSResolutionError in
+diff --git a/Sources/WireGuardKit/PeerConfiguration.swift b/Sources/WireGuardKit/PeerConfiguration.swift
+index bc9276f..9d92993 100644
+--- a/Sources/WireGuardKit/PeerConfiguration.swift
++++ b/Sources/WireGuardKit/PeerConfiguration.swift
+@@ -7,6 +7,7 @@ public struct PeerConfiguration {
+     public var publicKey: PublicKey
+     public var preSharedKey: PreSharedKey?
+     public var allowedIPs = [IPAddressRange]()
++    public var excludeIPs = [IPAddressRange]()
+     public var endpoint: Endpoint?
+     public var persistentKeepAlive: UInt16?
+     public var rxBytes: UInt64?
+diff --git a/Sources/WireGuardKitC/WireGuardKitC.h b/Sources/WireGuardKitC/WireGuardKitC.h
+index 54e4783..53b48cd 100644
+--- a/Sources/WireGuardKitC/WireGuardKitC.h
++++ b/Sources/WireGuardKitC/WireGuardKitC.h
+@@ -3,6 +3,7 @@
+
+ #include "key.h"
+ #include "x25519.h"
++#include <sys/types.h>
+
+ /* From <sys/kern_control.h> */
+ #define CTLIOCGINFO 0xc0644e03UL

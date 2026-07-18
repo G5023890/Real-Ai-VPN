@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-public enum AmneziaConfigProfileStoreError: LocalizedError, Equatable {
+public enum VPNProfileStoreError: LocalizedError, Equatable {
     case saveFailed(OSStatus)
     case readFailed(OSStatus)
     case deleteFailed(OSStatus)
@@ -10,22 +10,21 @@ public enum AmneziaConfigProfileStoreError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .saveFailed(let status):
-            return "Could not save Amnezia profiles to Keychain: \(status)."
+            return "Could not save VPN profiles to Keychain: \(status)."
         case .readFailed(let status):
-            return "Could not read Amnezia profiles from Keychain: \(status)."
+            return "Could not read VPN profiles from Keychain: \(status)."
         case .deleteFailed(let status):
-            return "Could not delete Amnezia profiles from Keychain: \(status)."
+            return "Could not delete VPN profiles from Keychain: \(status)."
         case .decodeFailed:
-            return "Stored Amnezia profiles could not be decoded."
+            return "Stored VPN profiles could not be decoded."
         }
     }
 }
 
-public struct StoredAmneziaConfigProfile: Codable, Equatable, Identifiable, Sendable {
+public struct StoredVPNProfile: Codable, Equatable, Identifiable, Sendable {
     public enum Kind: String, Codable, Sendable {
-        case awgConfig = "AWG Config"
+        case wireGuardConfig = "WireGuard Config"
         case singBoxVLESSReality = "VLESS Reality"
-        case premiumToken = "Premium Token"
         case unknown = "Config"
     }
 
@@ -56,16 +55,16 @@ public struct StoredAmneziaConfigProfile: Codable, Equatable, Identifiable, Send
     }
 }
 
-public struct AmneziaConfigProfileCollection: Codable, Equatable, Sendable {
+public struct VPNProfileCollection: Codable, Equatable, Sendable {
     public var activeProfileID: String?
-    public var profiles: [StoredAmneziaConfigProfile]
+    public var profiles: [StoredVPNProfile]
 
-    public init(activeProfileID: String? = nil, profiles: [StoredAmneziaConfigProfile] = []) {
+    public init(activeProfileID: String? = nil, profiles: [StoredVPNProfile] = []) {
         self.activeProfileID = activeProfileID
         self.profiles = profiles
     }
 
-    public var activeProfile: StoredAmneziaConfigProfile? {
+    public var activeProfile: StoredVPNProfile? {
         guard let activeProfileID else {
             return profiles.first
         }
@@ -74,8 +73,8 @@ public struct AmneziaConfigProfileCollection: Codable, Equatable, Sendable {
     }
 }
 
-public struct AmneziaConfigProfileStore: Sendable {
-    private let service = "com.local.real-ai-vpn.amnezia.profiles"
+public struct VPNProfileStore: Sendable {
+    private let service = "com.local.real-ai-vpn.profiles"
     private let account = "profiles-v1"
     private let accessGroup: String?
     private let allowsAuthenticationUI: Bool
@@ -88,7 +87,7 @@ public struct AmneziaConfigProfileStore: Sendable {
         self.allowsAuthenticationUI = allowsAuthenticationUI
     }
 
-    public func load() throws -> AmneziaConfigProfileCollection {
+    public func load() throws -> VPNProfileCollection {
         var query = baseQuery()
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -99,25 +98,25 @@ public struct AmneziaConfigProfileStore: Sendable {
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound {
-            return AmneziaConfigProfileCollection()
+            return VPNProfileCollection()
         }
 
         guard status == errSecSuccess else {
-            throw AmneziaConfigProfileStoreError.readFailed(status)
+            throw VPNProfileStoreError.readFailed(status)
         }
 
         guard let data = item as? Data else {
-            throw AmneziaConfigProfileStoreError.decodeFailed
+            throw VPNProfileStoreError.decodeFailed
         }
 
         do {
-            return try JSONDecoder().decode(AmneziaConfigProfileCollection.self, from: data)
+            return try JSONDecoder().decode(VPNProfileCollection.self, from: data)
         } catch {
-            throw AmneziaConfigProfileStoreError.decodeFailed
+            throw VPNProfileStoreError.decodeFailed
         }
     }
 
-    public func save(_ collection: AmneziaConfigProfileCollection) throws {
+    public func save(_ collection: VPNProfileCollection) throws {
         let data = try JSONEncoder().encode(collection)
         let query = baseQuery()
         let attributes: [String: Any] = [
@@ -131,18 +130,18 @@ public struct AmneziaConfigProfileStore: Sendable {
         }
 
         if updateStatus != errSecItemNotFound {
-            throw AmneziaConfigProfileStoreError.saveFailed(updateStatus)
+            throw VPNProfileStoreError.saveFailed(updateStatus)
         }
 
         var addQuery = query
         attributes.forEach { addQuery[$0.key] = $0.value }
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
         guard addStatus == errSecSuccess else {
-            throw AmneziaConfigProfileStoreError.saveFailed(addStatus)
+            throw VPNProfileStoreError.saveFailed(addStatus)
         }
     }
 
-    public func upsert(_ profile: StoredAmneziaConfigProfile, makeActive: Bool = true) throws {
+    public func upsert(_ profile: StoredVPNProfile, makeActive: Bool = true) throws {
         var collection = try load()
         if let index = collection.profiles.firstIndex(where: { $0.id == profile.id }) {
             collection.profiles[index] = profile
@@ -190,7 +189,7 @@ public struct AmneziaConfigProfileStore: Sendable {
     public func deleteAll() throws {
         let status = SecItemDelete(baseQuery() as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw AmneziaConfigProfileStoreError.deleteFailed(status)
+            throw VPNProfileStoreError.deleteFailed(status)
         }
     }
 

@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-public enum AmneziaPremiumKeyStoreError: LocalizedError, Equatable {
+public enum WireGuardConfigKeyStoreError: LocalizedError, Equatable {
     case invalidKey
     case saveFailed(OSStatus)
     case readFailed(OSStatus)
@@ -10,22 +10,22 @@ public enum AmneziaPremiumKeyStoreError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .invalidKey:
-            return "Enter a valid Amnezia Premium key or vpn:// import link."
+            return "Enter a standard WireGuard .conf configuration."
         case .saveFailed(let status):
-            return "Could not save Amnezia key to Keychain: \(status)."
+            return "Could not save WireGuard config to Keychain: \(status)."
         case .readFailed(let status):
-            return "Could not read Amnezia key from Keychain: \(status)."
+            return "Could not read WireGuard config from Keychain: \(status)."
         case .deleteFailed(let status):
-            return "Could not delete Amnezia key from Keychain: \(status)."
+            return "Could not delete WireGuard config from Keychain: \(status)."
         }
     }
 }
 
-public struct AmneziaPremiumKeyStore: Sendable {
+public struct WireGuardConfigKeyStore: Sendable {
     public static let sharedAccessGroup = "9FP39GTDT5.com.codex.RealAiVPN"
 
-    private let service = "com.local.real-ai-vpn.amnezia"
-    private let account = "premium-key"
+    private let service = "com.local.real-ai-vpn.wireguard"
+    private let account = "wireguard-config"
     private let accessGroup: String?
     private let allowsLegacyFallback: Bool
     private let allowsAuthenticationUI: Bool
@@ -42,8 +42,8 @@ public struct AmneziaPremiumKeyStore: Sendable {
 
     public func save(_ key: String) throws {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isPlausibleAmneziaKey(trimmed), let data = trimmed.data(using: .utf8) else {
-            throw AmneziaPremiumKeyStoreError.invalidKey
+        guard isPlausibleWireGuardConfig(trimmed), let data = trimmed.data(using: .utf8) else {
+            throw WireGuardConfigKeyStoreError.invalidKey
         }
 
         let query: [String: Any] = baseQuery()
@@ -58,21 +58,21 @@ public struct AmneziaPremiumKeyStore: Sendable {
         }
 
         if updateStatus != errSecItemNotFound {
-            throw AmneziaPremiumKeyStoreError.saveFailed(updateStatus)
+            throw WireGuardConfigKeyStoreError.saveFailed(updateStatus)
         }
 
         var addQuery = query
         attributes.forEach { addQuery[$0.key] = $0.value }
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
         guard addStatus == errSecSuccess else {
-            throw AmneziaPremiumKeyStoreError.saveFailed(addStatus)
+            throw WireGuardConfigKeyStoreError.saveFailed(addStatus)
         }
     }
 
     public func read() throws -> String? {
         do {
             return try read(using: baseQuery(includeAccessGroup: true))
-        } catch AmneziaPremiumKeyStoreError.readFailed(let status) where status == errSecItemNotFound {
+        } catch WireGuardConfigKeyStoreError.readFailed(let status) where status == errSecItemNotFound {
             return nil
         } catch {
             throw error
@@ -106,7 +106,7 @@ public struct AmneziaPremiumKeyStore: Sendable {
         }
 
         guard status == errSecSuccess else {
-            throw AmneziaPremiumKeyStoreError.readFailed(status)
+            throw WireGuardConfigKeyStoreError.readFailed(status)
         }
 
         guard let data = item as? Data else {
@@ -119,25 +119,21 @@ public struct AmneziaPremiumKeyStore: Sendable {
     public func delete() throws {
         let status = SecItemDelete(baseQuery(includeAccessGroup: true) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw AmneziaPremiumKeyStoreError.deleteFailed(status)
+            throw WireGuardConfigKeyStoreError.deleteFailed(status)
         }
 
         if accessGroup != nil {
             let legacyStatus = SecItemDelete(baseQuery(includeAccessGroup: false) as CFDictionary)
             guard legacyStatus == errSecSuccess || legacyStatus == errSecItemNotFound else {
-                throw AmneziaPremiumKeyStoreError.deleteFailed(legacyStatus)
+                throw WireGuardConfigKeyStoreError.deleteFailed(legacyStatus)
             }
         }
     }
 
-    public func isPlausibleAmneziaKey(_ key: String) -> Bool {
+    public func isPlausibleWireGuardConfig(_ key: String) -> Bool {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 16 else {
             return false
-        }
-
-        if trimmed.hasPrefix("vpn://") {
-            return true
         }
 
         if trimmed.localizedCaseInsensitiveContains("[Interface]"),
@@ -145,7 +141,7 @@ public struct AmneziaPremiumKeyStore: Sendable {
             return true
         }
 
-        return trimmed.range(of: #"^[A-Za-z0-9_\-:.=+/]{16,}$"#, options: .regularExpression) != nil
+        return false
     }
 
     private func baseQuery() -> [String: Any] {

@@ -2,9 +2,10 @@
 
 ## Goal
 
-Build one Apple-native VPN product for iOS and macOS that imports Amnezia
-configuration links and decides whether traffic should go through the encrypted
-tunnel or directly through the current network provider.
+Build one Apple-native VPN product for iOS and macOS that imports standard
+WireGuard configuration files plus VLESS Reality links, subscriptions, and Xray JSON, then
+decides whether traffic should go through the encrypted tunnel or directly through the current
+network provider.
 
 ## Apple Components
 
@@ -18,9 +19,10 @@ tunnel or directly through the current network provider.
 
 ## Import Flow
 
-1. User imports a `vpn://` link, QR code, `.vpn`, `.conf`, or `.json` file.
-2. The app decodes the native Amnezia payload locally.
-3. The payload is normalized into an internal protocol model.
+1. User imports a WireGuard `.conf`, QR code, VLESS configuration, subscription, or Xray JSON.
+2. The app validates standard WireGuard fields or extracts the VLESS Reality outbound locally.
+3. The configuration is normalized into an internal protocol model; Xray DNS, inbounds, and
+   routing are deliberately not imported because the packet tunnel owns those policies.
 4. Secrets are moved into Keychain.
 5. The app creates or updates an `NETunnelProviderManager` profile.
 
@@ -64,7 +66,7 @@ type, provider ASN metadata, and recent quality samples. Later, the scorer can b
 replaced by a compact Core ML ranking model without changing the routing layer.
 
 Quality history is local-only and should contain technical route metrics, not raw
-`vpn://` links, decoded Amnezia payloads, private keys, or full domain names.
+private keys, raw configurations, or full domain names.
 
 ## Preventive Health Monitoring
 
@@ -93,16 +95,14 @@ success. Deterministic safety rules still win over model output.
 
 ## Protocol Plan
 
-### Phase 1: Amnezia Native Link Import
+### Phase 1: WireGuard Profile Import
 
-Decode Amnezia native `vpn://` payloads and identify the inner protocol. The
-current `AmneziaConfig` module covers the Base64 URL and Qt-compressed payload
-layer.
+Validate a standard `.conf` profile containing `[Interface]` and `[Peer]`.
+The `WireGuardConfig` module rejects AmneziaWG-only obfuscation fields.
 
-### Phase 2: AmneziaWG
+### Phase 2: WireGuard
 
-Add an AmneziaWG userspace adapter for the packet tunnel extension. This is the
-most practical first protocol because it is close to WireGuard's tunnel model.
+Run the official WireGuard userspace adapter in the packet tunnel extension.
 
 ### Phase 3: Routing Rules
 
@@ -120,9 +120,11 @@ Continuously evaluate direct and VPN path probes to avoid common VPN hangs.
 Recover by refreshing DNS, rehandshaking, changing tunnel parameters, switching
 servers, or reconnecting.
 
-### Phase 4: XRay/OpenVPN
+### Phase 4: VLESS Reality / Xray
 
-Add protocol adapters after the AmneziaWG path is stable.
+Run VLESS Reality through the sing-box packet tunnel. Import VLESS URLs and subscriptions,
+and extract compatible VLESS Reality outbounds from Xray JSON. Other Xray outbound protocols
+and OpenVPN are not supported.
 
 ## Security Notes
 

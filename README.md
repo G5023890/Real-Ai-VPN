@@ -1,12 +1,12 @@
 # Real Ai Router
 
-Current release: `0.97`.
+Current release: `0.98`.
 
-Current recovery point: `restore-0.97-macos-profile-switching`.
+Current recovery point: `restore-0.98-wireguard-vless-xray-macos-profile-import`.
 
-Real Ai Router is a SwiftUI VPN client for iOS and macOS. It imports AmneziaWG
-profiles, Shadowrocket VLESS Reality links/subscriptions, and runs them through
-Apple `NetworkExtension` packet tunnel providers.
+Real Ai Router is a SwiftUI VPN client for iOS and macOS. It imports standard
+WireGuard profiles, VLESS Reality links/subscriptions, and Xray VLESS Reality
+JSON configurations, and runs them through Apple `NetworkExtension` packet tunnel providers.
 
 The app uses Apple Liquid Glass style across iOS and macOS and targets the latest
 Apple beta SDKs through Xcode-beta. iOS builds are validated on a physically
@@ -16,10 +16,10 @@ connected iPhone, not in a simulator.
 
 - Platforms: native iOS and macOS apps with matched operational areas for Home,
   Profiles, Route, Settings, Stat, and About.
-- VPN engine: `NEPacketTunnelProvider` profiles for AmneziaWG and sing-box VLESS
+- VPN engine: `NEPacketTunnelProvider` profiles for WireGuard and sing-box VLESS
   Reality.
-- Imports: Amnezia native `vpn://` links, raw AmneziaWG configs, VLESS Reality
-  URLs, and base64 Shadowrocket subscription payloads.
+- Imports: standard WireGuard `.conf` profiles, VLESS Reality URLs, direct HTTPS
+  subscriptions, base64 Shadowrocket subscription payloads, and Xray VLESS/Reality JSON.
 - Routing: user-managed `Bypass VPN` and `Through VPN` rules for exact domains,
   suffixes, IP addresses, and CIDR ranges.
 - Protected probe endpoints: provider and VPN health-check names/IPs cannot be
@@ -42,7 +42,7 @@ connected iPhone, not in a simulator.
 - Manual Disconnect disables NetworkExtension On Demand before stopping the
   tunnel, so user-initiated disconnects are not interrupted by automatic
   reconnect.
-- Profile switching: AWG and VLESS are serialized through one shared
+- Profile switching: WireGuard and VLESS are serialized through one shared
   NetworkExtension transition. The previous Real Ai Router tunnel must fully
   disconnect before the selected profile is reloaded from system preferences
   and started. This avoids stale-session races when switching protocols on
@@ -64,14 +64,30 @@ connected iPhone, not in a simulator.
 - Diagnostics: packet tunnel stop reasons and provider errors are persisted for
   investigation after disconnects.
 
+## Recent 0.98 Changes
+
+- Replaced AmneziaWG with the official WireGuard userspace adapter on iOS and
+  macOS. Standard WireGuard `.conf` profiles are now the native WireGuard path;
+  AmneziaWG-only obfuscation fields are rejected with an explicit import error.
+- Added import of full Xray VLESS Reality JSON configurations alongside VLESS
+  URLs and subscriptions. The app extracts the VLESS outbound and Reality
+  parameters while retaining its own secure iOS/macOS tunnel routing and DNS policy.
+- Restored the macOS profile-add flow: the `+` menu is always available, and an
+  empty profile list presents `Paste configuration` and `Choose file` actions
+  instead of demonstration servers.
+- Matched the macOS and iOS profile workflow for WireGuard and VLESS Reality:
+  import, select, rename, delete, reconnect, diagnostics, failover, and security controls.
+- Raised default app release version from `0.97` to `0.98` in XcodeGen and all
+  macOS/iOS build scripts.
+
 ## Recent 0.97 Changes
 
-- Hardened AWG/VLESS system-profile switching for macOS 27 beta 3 and iOS:
+- Hardened WireGuard/VLESS system-profile switching for macOS 27 beta 3 and iOS:
   overlapping connection attempts are superseded, all Real Ai Router tunnel
   managers are stopped before a new provider starts, and the selected manager
   is reloaded from `NetworkExtension` preferences after saving.
 - Increased profile-switch disconnect waits to 15 seconds so a slower system
-  extension teardown cannot race the next VLESS or AWG start.
+  extension teardown cannot race the next VLESS or WireGuard start.
 - Raised default app release version from `0.96` to `0.97` in XcodeGen and build
   scripts.
 - Added a shared VLESS Reality compatibility route for Apple Mail account
@@ -106,10 +122,10 @@ connected iPhone, not in a simulator.
 
 ## Core Modules
 
-- `AmneziaConfig`: decodes and normalizes imported VPN profiles.
+- `WireGuardConfig`: validates and normalizes standard WireGuard profiles.
 - `RealVPNCore`: owns NetworkExtension profile creation, routing exception
   persistence, protected probe validation, and tunnel diagnostics.
-- `PacketTunnelProvider`: starts AmneziaWG or sing-box tunnels and compiles
+- `PacketTunnelProvider`: starts WireGuard or sing-box tunnels and compiles
   routing exceptions into tunnel configuration.
 - `SmartServerSelection`: ranks and selects profiles with deterministic and
   heuristic logic; this is the Core AI/CoreML scoring integration point.
@@ -118,7 +134,10 @@ connected iPhone, not in a simulator.
 
 ## Recovery Points
 
-- `restore-0.97-macos-profile-switching`: recovery point for serialized AWG /
+- `restore-0.98-wireguard-vless-xray-macos-profile-import`: recovery point for
+  the WireGuard migration, Xray/VLESS Reality JSON import, and restored macOS
+  profile-add experience with iOS feature parity.
+- `restore-0.97-macos-profile-switching`: recovery point for serialized WireGuard /
   VLESS system-profile transitions, refreshed NetworkExtension preferences,
   15-second teardown handling, and visible transition diagnostics on macOS and
   iOS.

@@ -614,7 +614,7 @@ private extension SmartVPNServer {
         id: "il-1",
         region: "IL",
         displayName: "Israel 1",
-        protocolKind: .amneziaWG,
+        protocolKind: .wireGuard,
         lastLatencyMilliseconds: 160
     )
 
@@ -622,7 +622,7 @@ private extension SmartVPNServer {
         id: "de-1",
         region: "DE",
         displayName: "Germany 1",
-        protocolKind: .amneziaWG,
+        protocolKind: .wireGuard,
         lastLatencyMilliseconds: 220
     )
 }

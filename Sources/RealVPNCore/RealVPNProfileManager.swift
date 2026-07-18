@@ -143,17 +143,17 @@ public final class RealVPNProfileManager: ObservableObject {
 
     public func connect(
         configuration: VPNProfileConfiguration,
-        transientAmneziaKey: String? = nil,
+        transientWireGuardConfig: String? = nil,
         routingExceptions: RoutingExceptionCollection = RoutingExceptionCollection()
     ) async {
         let operation = beginOperation()
         do {
             reportTransition("Preparing VPN switch")
-            vpnProfileLogger.info("Starting VPN provider=\(configuration.providerBundleIdentifier, privacy: .public) serverID=\(configuration.serverID, privacy: .public) hasConfig=\((transientAmneziaKey?.isEmpty == false), privacy: .public)")
+            vpnProfileLogger.info("Starting VPN provider=\(configuration.providerBundleIdentifier, privacy: .public) serverID=\(configuration.serverID, privacy: .public) hasConfig=\((transientWireGuardConfig?.isEmpty == false), privacy: .public)")
             NSLog("RealAiVPN VPNProfileManager connect provider=%@ serverID=%@ hasConfig=%@",
                   configuration.providerBundleIdentifier,
                   configuration.serverID,
-                  (transientAmneziaKey?.isEmpty == false) ? "true" : "false")
+                  (transientWireGuardConfig?.isEmpty == false) ? "true" : "false")
             lastErrorMessage = nil
             lastProviderBundleIdentifier = configuration.providerBundleIdentifier
             try await stopAllRealAiManagers()
@@ -168,8 +168,8 @@ public final class RealVPNProfileManager: ObservableObject {
             guard isCurrent(operation) else { return }
             self.manager = manager
             var options: [String: NSObject] = [:]
-            if let transientAmneziaKey {
-                options["amneziaVPNURL"] = transientAmneziaKey as NSString
+            if let transientWireGuardConfig {
+                options["wireGuardConfig"] = transientWireGuardConfig as NSString
             }
             if let encodedExceptions = RoutingExceptionCodec.encode(routingExceptions) {
                 options["routingExceptions"] = encodedExceptions as NSString

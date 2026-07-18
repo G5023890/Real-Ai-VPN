@@ -1,4 +1,4 @@
-import AmneziaConfig
+import WireGuardConfig
 import AppKit
 import Carbon
 import Combine
@@ -674,8 +674,7 @@ enum ConnectivityProbeRunner {
 final class DashboardModel: ObservableObject {
     enum StoredConfigKind: String {
         case none = "No Config"
-        case premiumToken = "Premium Token"
-        case awgConfig = "AWG Config"
+        case wireGuardConfig = "WireGuard Config"
         case singBoxVLESSReality = "VLESS Reality"
         case unknown = "Config"
     }
@@ -700,9 +699,9 @@ final class DashboardModel: ObservableObject {
     @Published private(set) var vpnStatus: VPNConnectionStatus = .disconnected
     @Published private(set) var vpnErrorMessage: String?
     @Published private(set) var tunnelDiagnostic: TunnelDiagnosticSnapshot?
-    @Published private(set) var hasAmneziaPremiumKey = false
+    @Published private(set) var hasWireGuardConfig = false
     @Published private(set) var storedConfigKind: StoredConfigKind = .none
-    @Published private(set) var configProfiles: [StoredAmneziaConfigProfile] = []
+    @Published private(set) var configProfiles: [StoredVPNProfile] = []
     @Published private(set) var connectedConfigProfileID: String?
     @Published private(set) var observedExitIP: String?
     @Published private(set) var observedExitCountry: String?
@@ -779,17 +778,17 @@ final class DashboardModel: ObservableObject {
     }
 
     let servers: [SmartVPNServer] = [
-        SmartVPNServer(id: "il-1", region: "IL", displayName: "Israel Prime", protocolKind: .amneziaWG, lastLatencyMilliseconds: 135),
-        SmartVPNServer(id: "de-1", region: "DE", displayName: "Frankfurt Fast", protocolKind: .amneziaWG, lastLatencyMilliseconds: 82),
-        SmartVPNServer(id: "nl-1", region: "NL", displayName: "Amsterdam Relay", protocolKind: .amneziaWG, lastLatencyMilliseconds: 97, healthState: .degraded)
+        SmartVPNServer(id: "il-1", region: "IL", displayName: "Israel Prime", protocolKind: .wireGuard, lastLatencyMilliseconds: 135),
+        SmartVPNServer(id: "de-1", region: "DE", displayName: "Frankfurt Fast", protocolKind: .wireGuard, lastLatencyMilliseconds: 82),
+        SmartVPNServer(id: "nl-1", region: "NL", displayName: "Amsterdam Relay", protocolKind: .wireGuard, lastLatencyMilliseconds: 97, healthState: .degraded)
     ]
 
     private let selector = SmartServerSelector()
-    private let amneziaDecoder = AmneziaConfigDecoder()
+    private let wireGuardDecoder = WireGuardConfigDecoder()
     private let shadowrocketParser = ShadowrocketVLESSConfigParser()
     private let vpnManager = RealVPNProfileManager()
-    private let premiumKeyStore = AmneziaPremiumKeyStore(accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup)
-    private let profileStore = AmneziaConfigProfileStore(accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup)
+    private let configKeyStore = WireGuardConfigKeyStore(accessGroup: WireGuardConfigKeyStore.sharedAccessGroup)
+    private let profileStore = VPNProfileStore(accessGroup: WireGuardConfigKeyStore.sharedAccessGroup)
     private let qualityHistoryStore = LocalProfileQualityHistoryStore()
     private let probeReliabilityHistoryStore = LocalProbeReliabilityHistoryStore()
     private let probeReliabilityAnalyzer = ProbeReliabilityAnalyzer()
@@ -867,7 +866,7 @@ final class DashboardModel: ObservableObject {
         bindSystemWakeNotifications()
         bindGlobalConnectHotKey()
         refresh()
-        refreshPremiumKeyState()
+        refreshProfileState()
         loadQualityHistory()
         loadProbeReliabilityHistory()
         loadTunnelTrafficStats()
@@ -893,7 +892,7 @@ final class DashboardModel: ObservableObject {
         channelTestingWakeLock.release()
     }
 
-    var activeConfigProfile: StoredAmneziaConfigProfile? {
+    var activeConfigProfile: StoredVPNProfile? {
         guard let activeConfigProfileID else {
             return configProfiles.first
         }
@@ -901,7 +900,7 @@ final class DashboardModel: ObservableObject {
         return configProfiles.first { $0.id == activeConfigProfileID } ?? configProfiles.first
     }
 
-    var connectedConfigProfile: StoredAmneziaConfigProfile? {
+    var connectedConfigProfile: StoredVPNProfile? {
         guard let connectedConfigProfileID else {
             return nil
         }
@@ -909,11 +908,11 @@ final class DashboardModel: ObservableObject {
         return configProfiles.first { $0.id == connectedConfigProfileID }
     }
 
-    var displayedConfigProfile: StoredAmneziaConfigProfile? {
+    var displayedConfigProfile: StoredVPNProfile? {
         vpnStatus.isConnectedOrConnecting ? (connectedConfigProfile ?? activeConfigProfile) : activeConfigProfile
     }
 
-    var configProfilesByCoreAIScore: [StoredAmneziaConfigProfile] {
+    var configProfilesByCoreAIScore: [StoredVPNProfile] {
         let scoresByID = Dictionary(uniqueKeysWithValues: rankedServers.map { ($0.server.id, $0.score) })
         return configProfiles.sorted { lhs, rhs in
             let lhsScore = scoresByID[lhs.id] ?? -1
@@ -1073,7 +1072,7 @@ final class DashboardModel: ObservableObject {
         }
 
         guard displayedConfigProfile?.kind == .singBoxVLESSReality else {
-            return "Profile DNS only · split-dns-provider-lane unavailable for AWG"
+            return "Profile DNS only · split-dns-provider-lane unavailable for WireGuard"
         }
 
         return "Provider DNS lane: Yandex DNS"
@@ -1254,17 +1253,17 @@ final class DashboardModel: ObservableObject {
         vpnErrorMessage = nil
         Task {
             let profileForConnect = activeConfigProfile
-            let amneziaKey = profileForConnect?.config ?? (try? premiumKeyStore.read())
-            guard let amneziaKey, !amneziaKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                vpnErrorMessage = "Import an AmneziaWG .conf profile in Settings before connecting."
+            let wireGuardConfigText = profileForConnect?.config ?? (try? configKeyStore.read())
+            guard let wireGuardConfigText, !wireGuardConfigText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                vpnErrorMessage = "Import a WireGuard .conf profile in Settings before connecting."
                 vpnStatus = .disconnected
                 return
             }
 
             do {
-                try validateConfigForConnect(amneziaKey, profileKind: profileForConnect?.kind)
+                try validateConfigForConnect(wireGuardConfigText, profileKind: profileForConnect?.kind)
             } catch {
-                vpnErrorMessage = "The saved Amnezia config cannot be used yet: \(error.localizedDescription)"
+                vpnErrorMessage = "The saved WireGuard config cannot be used yet: \(error.localizedDescription)"
                 vpnStatus = .disconnected
                 return
             }
@@ -1281,7 +1280,7 @@ final class DashboardModel: ObservableObject {
             }
             await vpnManager.connect(
                 configuration: vpnConfiguration(for: profileForConnect),
-                transientAmneziaKey: amneziaKey,
+                transientWireGuardConfig: wireGuardConfigText,
                 routingExceptions: routingExceptions
             )
             tunnelDiagnostic = tunnelDiagnosticsStore.load()
@@ -1532,7 +1531,7 @@ final class DashboardModel: ObservableObject {
         await finishChannelTesting(originalProfileID: originalProfileID, reconnectOriginal: wasConnected, cancelled: false)
     }
 
-    private func testProfileThroughTunnel(_ profile: StoredAmneziaConfigProfile) async -> Bool {
+    private func testProfileThroughTunnel(_ profile: StoredVPNProfile) async -> Bool {
         if vpnStatus.isConnectedOrConnecting {
             suppressExpectedDisconnectNotification = true
             await vpnManager.disconnectDisablingOnDemand()
@@ -1540,7 +1539,7 @@ final class DashboardModel: ObservableObject {
         }
 
         activeConfigProfileID = profile.id
-        refreshPremiumKeyState()
+        refreshProfileState()
         connectVPN()
 
         guard await waitForDropRecoveryConnection(profileID: profile.id, timeoutSeconds: 25) else {
@@ -1579,7 +1578,7 @@ final class DashboardModel: ObservableObject {
         return allProbes.contains(where: \.succeeded)
     }
 
-    private func recordTunnelQualitySample(for profile: StoredAmneziaConfigProfile, probes: [ConnectivityProbeResult]) {
+    private func recordTunnelQualitySample(for profile: StoredVPNProfile, probes: [ConnectivityProbeResult]) {
         let latencies = probes.compactMap(\.latencyMilliseconds)
         let averageLatency = latencies.isEmpty ? 3_000 : latencies.reduce(0, +) / Double(latencies.count)
         let failures = probes.filter { !$0.succeeded }.count
@@ -1600,7 +1599,7 @@ final class DashboardModel: ObservableObject {
         recordQualitySample(sample)
     }
 
-    private func recordFailedTunnelSample(for profile: StoredAmneziaConfigProfile) {
+    private func recordFailedTunnelSample(for profile: StoredVPNProfile) {
         let sample = ServerQualitySample(
             serverID: profile.id,
             region: RegionCode(profile.regionCode ?? "ZZ"),
@@ -1674,7 +1673,7 @@ final class DashboardModel: ObservableObject {
         if let originalProfileID,
            configProfiles.contains(where: { $0.id == originalProfileID }) {
             activeConfigProfileID = originalProfileID
-            refreshPremiumKeyState()
+            refreshProfileState()
         }
 
         channelTestingWakeLock.release()
@@ -1726,7 +1725,7 @@ final class DashboardModel: ObservableObject {
         connectVPN()
     }
 
-    func saveAmneziaPremiumKey(_ key: String) -> String? {
+    func saveWireGuardConfig(_ key: String) -> String? {
         do {
             let shadowrocketEntries = (try? shadowrocketParser.parseEntries(key)) ?? []
             if let entry = shadowrocketEntries.first {
@@ -1735,51 +1734,51 @@ final class DashboardModel: ObservableObject {
                     fallbackName: entry.profile.title,
                     makeFirstActive: true
                 )
-                refreshPremiumKeyState()
+                refreshProfileState()
                 vpnErrorMessage = nil
                 return nil
             }
 
-            let decoded = try amneziaDecoder.decodeImportedWireGuardConfig(from: key)
-            try premiumKeyStore.save(key)
+            let decoded = try wireGuardDecoder.decodeImportedWireGuardConfig(from: key)
+            try configKeyStore.save(key)
             let profile = makeProfile(
                 name: "Manual Config",
                 rawConfig: key,
                 decodedConfig: decoded
             )
             try profileStore.upsert(profile)
-            refreshPremiumKeyState()
+            refreshProfileState()
             vpnErrorMessage = nil
             return nil
         } catch {
-            refreshPremiumKeyState()
-            return "The Amnezia config cannot be used yet: \(error.localizedDescription)"
+            refreshProfileState()
+            return "The WireGuard config cannot be used yet: \(error.localizedDescription)"
         }
     }
 
-    func importAmneziaConfigProfile(name: String, rawConfig: String) -> String? {
-        importAmneziaConfigProfileSync(name: name, rawConfig: rawConfig)
+    func importWireGuardConfigProfile(name: String, rawConfig: String) -> String? {
+        importWireGuardConfigProfileSync(name: name, rawConfig: rawConfig)
     }
 
-    func importAmneziaConfigProfile(name: String, rawConfig: String) async -> String? {
+    func importWireGuardConfigProfile(name: String, rawConfig: String) async -> String? {
         do {
             if let subscriptionURL = try shadowrocketParser.subscriptionURL(from: rawConfig) {
                 let subscriptionText = try await fetchSubscription(from: subscriptionURL)
                 let entries = try shadowrocketParser.parseEntries(subscriptionText)
                 try upsertShadowrocketEntries(entries, fallbackName: name, makeFirstActive: true)
-                refreshPremiumKeyState()
+                refreshProfileState()
                 vpnErrorMessage = nil
                 return nil
             }
 
-            return importAmneziaConfigProfileSync(name: name, rawConfig: rawConfig)
+            return importWireGuardConfigProfileSync(name: name, rawConfig: rawConfig)
         } catch {
-            refreshPremiumKeyState()
+            refreshProfileState()
             return "The subscription cannot be imported yet: \(error.localizedDescription)"
         }
     }
 
-    private func importAmneziaConfigProfileSync(name: String, rawConfig: String) -> String? {
+    private func importWireGuardConfigProfileSync(name: String, rawConfig: String) -> String? {
         do {
             let shadowrocketEntries = (try? shadowrocketParser.parseEntries(rawConfig)) ?? []
             if !shadowrocketEntries.isEmpty {
@@ -1788,21 +1787,21 @@ final class DashboardModel: ObservableObject {
                     fallbackName: name,
                     makeFirstActive: true
                 )
-                refreshPremiumKeyState()
+                refreshProfileState()
                 vpnErrorMessage = nil
                 return nil
             }
 
-            let decoded = try amneziaDecoder.decodeImportedWireGuardConfig(from: rawConfig)
+            let decoded = try wireGuardDecoder.decodeImportedWireGuardConfig(from: rawConfig)
             let profile = makeProfile(name: name, rawConfig: rawConfig, decodedConfig: decoded)
             try profileStore.upsert(profile)
-            try premiumKeyStore.save(rawConfig)
-            refreshPremiumKeyState()
+            try configKeyStore.save(rawConfig)
+            refreshProfileState()
             vpnErrorMessage = nil
             return nil
         } catch {
-            refreshPremiumKeyState()
-            return "The config cannot be used yet as AmneziaWG or Shadowrocket VLESS/Reality: \(error.localizedDescription)"
+            refreshProfileState()
+            return "The config cannot be used yet as WireGuard or Shadowrocket VLESS/Reality: \(error.localizedDescription)"
         }
     }
 
@@ -1834,25 +1833,25 @@ final class DashboardModel: ObservableObject {
         }
     }
 
-    func deleteAmneziaPremiumKey() -> String? {
+    func deleteWireGuardConfig() -> String? {
         do {
-            try premiumKeyStore.delete()
+            try configKeyStore.delete()
             try profileStore.deleteAll()
-            refreshPremiumKeyState()
+            refreshProfileState()
             return nil
         } catch {
-            refreshPremiumKeyState()
+            refreshProfileState()
             return error.localizedDescription
         }
     }
 
-    func loadAmneziaPremiumKeyForEditing() -> String {
-        activeConfigProfile?.config ?? (try? premiumKeyStore.read()) ?? ""
+    func loadWireGuardConfigForEditing() -> String {
+        activeConfigProfile?.config ?? (try? configKeyStore.read()) ?? ""
     }
 
     func deleteActiveConfigProfile() -> String? {
         guard let id = activeConfigProfile?.id else {
-            return deleteAmneziaPremiumKey()
+            return deleteWireGuardConfig()
         }
 
         return deleteConfigProfile(id: id)
@@ -1866,11 +1865,11 @@ final class DashboardModel: ObservableObject {
 
         do {
             try profileStore.renameProfile(id: id, displayName: trimmedName)
-            refreshPremiumKeyState()
+            refreshProfileState()
             monitorStatus = "Renamed profile to \(trimmedName)"
             return nil
         } catch {
-            refreshPremiumKeyState()
+            refreshProfileState()
             return error.localizedDescription
         }
     }
@@ -1883,7 +1882,7 @@ final class DashboardModel: ObservableObject {
 
         do {
             try profileStore.deleteProfile(id: id)
-            refreshPremiumKeyState()
+            refreshProfileState()
             if configProfiles.isEmpty {
                 if wasConnected {
                     suppressExpectedDisconnectNotification = true
@@ -1909,7 +1908,7 @@ final class DashboardModel: ObservableObject {
             }
             return nil
         } catch {
-            refreshPremiumKeyState()
+            refreshProfileState()
             return error.localizedDescription
         }
     }
@@ -2132,13 +2131,13 @@ final class DashboardModel: ObservableObject {
         return message
     }
 
-    private func refreshPremiumKeyState() {
-        let collection = (try? profileStore.load()) ?? AmneziaConfigProfileCollection()
+    private func refreshProfileState() {
+        let collection = (try? profileStore.load()) ?? VPNProfileCollection()
         configProfiles = collection.profiles
         activeConfigProfileID = collection.activeProfile?.id
 
-        let stored = activeConfigProfile?.config ?? (try? premiumKeyStore.read()) ?? nil
-        hasAmneziaPremiumKey = stored?.isEmpty == false
+        let stored = activeConfigProfile?.config ?? (try? configKeyStore.read()) ?? nil
+        hasWireGuardConfig = stored?.isEmpty == false
         storedConfigKind = stored.map(configKind(for:)) ?? .none
     }
 
@@ -2150,21 +2149,17 @@ final class DashboardModel: ObservableObject {
 
         if trimmed.localizedCaseInsensitiveContains("[Interface]"),
            trimmed.localizedCaseInsensitiveContains("[Peer]") {
-            return .awgConfig
+            return .wireGuardConfig
         }
 
         if (try? shadowrocketParser.parseEntries(trimmed))?.isEmpty == false {
             return .singBoxVLESSReality
         }
 
-        if trimmed.hasPrefix("vpn://") {
-            return .premiumToken
-        }
-
         return .unknown
     }
 
-    private func validateConfigForConnect(_ value: String, profileKind: StoredAmneziaConfigProfile.Kind?) throws {
+    private func validateConfigForConnect(_ value: String, profileKind: StoredVPNProfile.Kind?) throws {
         if profileKind == .singBoxVLESSReality {
             let entries = try shadowrocketParser.parseEntries(value)
             if entries.isEmpty {
@@ -2177,21 +2172,21 @@ final class DashboardModel: ObservableObject {
             return
         }
 
-        _ = try amneziaDecoder.decodeImportedWireGuardConfig(from: value)
+        _ = try wireGuardDecoder.decodeImportedWireGuardConfig(from: value)
     }
 
     private var vpnConfiguration: VPNProfileConfiguration {
         vpnConfiguration(for: activeConfigProfile)
     }
 
-    private func vpnConfiguration(for profile: StoredAmneziaConfigProfile?) -> VPNProfileConfiguration {
+    private func vpnConfiguration(for profile: StoredVPNProfile?) -> VPNProfileConfiguration {
         let server = servers.first { $0.id == activeServerID } ?? servers[0]
         return VPNProfileConfiguration(
             localizedDescription: localizedVPNDescription(for: profile),
             providerBundleIdentifier: providerBundleIdentifier(for: profile),
             serverID: profile?.id ?? server.id,
             regionCode: profile?.regionCode ?? server.region.rawValue,
-            protocolKind: profile?.kind == .singBoxVLESSReality ? VPNProtocolKind.singBox.rawValue : VPNProtocolKind.amneziaWG.rawValue,
+            protocolKind: profile?.kind == .singBoxVLESSReality ? VPNProtocolKind.singBox.rawValue : VPNProtocolKind.wireGuard.rawValue,
             killSwitchEnabled: killSwitchEnabled,
             dnsProtectionEnabled: dnsProtectionEnabled,
             localNetworkAccessEnabled: localNetworkAccessEnabled,
@@ -2201,11 +2196,11 @@ final class DashboardModel: ObservableObject {
         )
     }
 
-    private func localizedVPNDescription(for profile: StoredAmneziaConfigProfile?) -> String {
-        profile?.kind == .singBoxVLESSReality ? "Real Ai Router VLESS" : "Real Ai Router AWG"
+    private func localizedVPNDescription(for profile: StoredVPNProfile?) -> String {
+        profile?.kind == .singBoxVLESSReality ? "Real Ai Router VLESS" : "Real Ai Router WireGuard"
     }
 
-    private func providerBundleIdentifier(for profile: StoredAmneziaConfigProfile?) -> String {
+    private func providerBundleIdentifier(for profile: StoredVPNProfile?) -> String {
         profile?.kind == .singBoxVLESSReality
             ? "com.codex.RealAiVPN.SingBoxPacketTunnel"
             : "com.codex.RealAiVPN.PacketTunnel"
@@ -2221,7 +2216,7 @@ final class DashboardModel: ObservableObject {
                 id: profile.id,
                 region: RegionCode(profile.regionCode ?? "ZZ"),
                 displayName: profile.displayName,
-                protocolKind: profile.kind == .singBoxVLESSReality ? .singBox : .amneziaWG,
+                protocolKind: profile.kind == .singBoxVLESSReality ? .singBox : .wireGuard,
                 lastLatencyMilliseconds: lastLatency(for: profile.id),
                 healthState: .healthy
             )
@@ -2274,7 +2269,7 @@ final class DashboardModel: ObservableObject {
         profileQuarantineUntil[id] = date
     }
 
-    private func makeProfile(name: String, rawConfig: String, decodedConfig: AmneziaWireGuardConfig) -> StoredAmneziaConfigProfile {
+    private func makeProfile(name: String, rawConfig: String, decodedConfig: WireGuardConfig) -> StoredVPNProfile {
         let region = inferRegion(from: name) ?? inferRegion(from: decodedConfig.endpoint)
         let endpointHost = decodedConfig.endpoint.split(separator: ":").first.map(String.init)
         var displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2282,9 +2277,9 @@ final class DashboardModel: ObservableObject {
             displayName.removeLast(".conf".count)
         }
 
-        return StoredAmneziaConfigProfile(
+        return StoredVPNProfile(
             displayName: displayName.isEmpty ? "Imported Config" : displayName,
-            kind: .awgConfig,
+            kind: .wireGuardConfig,
             regionCode: region,
             endpointHost: endpointHost,
             config: rawConfig
@@ -2295,7 +2290,7 @@ final class DashboardModel: ObservableObject {
         name: String,
         rawConfig: String,
         shadowrocketConfig: ShadowrocketVLESSConfig
-    ) -> StoredAmneziaConfigProfile {
+    ) -> StoredVPNProfile {
         var displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if displayName.lowercased().hasSuffix(".json") {
             displayName.removeLast(".json".count)
@@ -2304,7 +2299,7 @@ final class DashboardModel: ObservableObject {
             displayName = shadowrocketConfig.title.isEmpty ? "VLESS Reality" : shadowrocketConfig.title
         }
 
-        return StoredAmneziaConfigProfile(
+        return StoredVPNProfile(
             displayName: displayName,
             kind: .singBoxVLESSReality,
             regionCode: shadowrocketConfig.regionCode ?? inferRegion(from: displayName),
@@ -2325,7 +2320,7 @@ final class DashboardModel: ObservableObject {
     private func saveActiveProfileSelection() {
         do {
             try profileStore.setActiveProfile(id: activeConfigProfileID)
-            refreshPremiumKeyState()
+            refreshProfileState()
             refresh()
         } catch {
             vpnErrorMessage = error.localizedDescription
@@ -2334,8 +2329,8 @@ final class DashboardModel: ObservableObject {
 
     private func migrateLegacySingleConfigIfNeeded() {
         guard ((try? profileStore.load().profiles.isEmpty) ?? true),
-              let legacy = try? premiumKeyStore.read(),
-              let decoded = try? amneziaDecoder.decodeImportedWireGuardConfig(from: legacy) else {
+              let legacy = try? configKeyStore.read(),
+              let decoded = try? wireGuardDecoder.decodeImportedWireGuardConfig(from: legacy) else {
             return
         }
 
@@ -2680,13 +2675,13 @@ final class DashboardModel: ObservableObject {
         return normalized.isEmpty ? nil : normalized
     }
 
-    private func endpoint(for profile: StoredAmneziaConfigProfile) -> ProfileEndpoint? {
+    private func endpoint(for profile: StoredVPNProfile) -> ProfileEndpoint? {
         if profile.kind == .singBoxVLESSReality,
            let parsed = try? shadowrocketParser.parse(profile.config) {
             return ProfileEndpoint(host: parsed.host, port: parsed.port)
         }
 
-        guard let decoded = try? amneziaDecoder.decodeImportedWireGuardConfig(from: profile.config) else {
+        guard let decoded = try? wireGuardDecoder.decodeImportedWireGuardConfig(from: profile.config) else {
             return profile.endpointHost.map { ProfileEndpoint(host: $0, port: 51820) }
         }
 
@@ -4187,8 +4182,6 @@ private struct MacStatisticsWorkspace: View {
 
     private func protocolLabel(_ protocolKind: VPNProtocolKind) -> String {
         switch protocolKind {
-        case .amneziaWG:
-            return "AmneziaWG"
         case .wireGuard:
             return "WireGuard"
         case .singBox:
@@ -4287,7 +4280,7 @@ private struct MacSettingsWorkspace: View {
     @Binding var selectedSection: MacSettingsSection
     let theme: MacLiquidTheme
     @AppStorage("appVisibilityMode") private var appVisibilityModeRaw = AppVisibilityMode.dockAndMenuBar.rawValue
-    @State private var amneziaKey = ""
+    @State private var wireGuardConfigText = ""
     @State private var message: String?
     @State private var showConfigImporter = false
     @State private var showCurrentRegions = false
@@ -4297,7 +4290,7 @@ private struct MacSettingsWorkspace: View {
     var body: some View {
         settingsMainContent
         .onAppear {
-            amneziaKey = model.loadAmneziaPremiumKeyForEditing()
+            wireGuardConfigText = model.loadWireGuardConfigForEditing()
         }
         .fileImporter(
             isPresented: $showConfigImporter,
@@ -4364,7 +4357,7 @@ private struct MacSettingsWorkspace: View {
     }
 
     private var connectionSettings: some View {
-        MacSettingsSectionCard(title: "Amnezia Profiles", theme: theme) {
+        MacSettingsSectionCard(title: "VPN Profiles", theme: theme) {
             if model.configProfiles.isEmpty {
                 Text("No imported profiles yet.")
                     .foregroundStyle(theme.secondaryText)
@@ -4380,7 +4373,7 @@ private struct MacSettingsWorkspace: View {
                 .pickerStyle(.menu)
             }
 
-            SecureField("Paste Amnezia Premium key, vpn:// link, or raw config", text: $amneziaKey)
+            SecureField("Paste WireGuard .conf configuration, or raw config", text: $wireGuardConfigText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12, design: .monospaced))
                 .padding(10)
@@ -4389,10 +4382,10 @@ private struct MacSettingsWorkspace: View {
 
             HStack {
                 Button("Save") {
-                    if let error = model.saveAmneziaPremiumKey(amneziaKey) {
+                    if let error = model.saveWireGuardConfig(wireGuardConfigText) {
                         message = error
                     } else {
-                        message = "Saved Amnezia config in Keychain."
+                        message = "Saved WireGuard config in Keychain."
                     }
                 }
                 .buttonStyle(.borderedProminent)
@@ -4407,7 +4400,7 @@ private struct MacSettingsWorkspace: View {
                     if let error = model.deleteActiveConfigProfile() {
                         message = error
                     } else {
-                        amneziaKey = ""
+                        wireGuardConfigText = ""
                         message = "Deleted active profile."
                     }
                 }
@@ -4505,7 +4498,7 @@ private struct MacSettingsWorkspace: View {
         AppVisibilityMode(rawValue: appVisibilityModeRaw) ?? .dockAndMenuBar
     }
 
-    private func profileRowTitle(_ profile: StoredAmneziaConfigProfile) -> String {
+    private func profileRowTitle(_ profile: StoredVPNProfile) -> String {
         [profile.displayName, profile.regionCode, profile.endpointHost]
             .compactMap { $0 }
             .joined(separator: " · ")
@@ -4522,10 +4515,10 @@ private struct MacSettingsWorkspace: View {
                 }
                 let imported = try String(contentsOf: url, encoding: .utf8)
                 Task {
-                    if let error = await model.importAmneziaConfigProfile(name: url.lastPathComponent, rawConfig: imported) {
+                    if let error = await model.importWireGuardConfigProfile(name: url.lastPathComponent, rawConfig: imported) {
                         message = error
                     } else {
-                        amneziaKey = model.loadAmneziaPremiumKeyForEditing()
+                        wireGuardConfigText = model.loadWireGuardConfigForEditing()
                         message = "Imported \(url.lastPathComponent) as active profile."
                     }
                 }
@@ -4856,7 +4849,7 @@ struct ConnectionPanel: View {
                         CapsuleLabel(text: "Current \(model.currentRegion.rawValue)", symbol: "location.fill", tint: .cyan)
                         CapsuleLabel(text: "Home \(model.homeRegion.rawValue)", symbol: "house.fill", tint: .mint)
                         CapsuleLabel(text: model.vpnStatus.rawValue.capitalized, symbol: "powerplug.fill", tint: statusTint)
-                        if model.hasAmneziaPremiumKey {
+                        if model.hasWireGuardConfig {
                             CapsuleLabel(text: model.activeConfigSummary, symbol: "key.fill", tint: .yellow)
                         }
                     }
@@ -4970,21 +4963,19 @@ struct ServerRankingPanel: View {
     @State private var showPasteImport = false
     @State private var showConfImporter = false
     @State private var showJSONImporter = false
-    @State private var renamingProfile: StoredAmneziaConfigProfile?
-    @State private var deletingProfile: StoredAmneziaConfigProfile?
+    @State private var renamingProfile: StoredVPNProfile?
+    @State private var deletingProfile: StoredVPNProfile?
     @State private var actionMessage: String?
 
     var body: some View {
         Panel(
-            title: model.configProfiles.isEmpty ? "Servers" : "Imported Profiles",
+            title: "VPN Profiles",
             symbol: "server.rack"
         ) {
-            if !model.configProfiles.isEmpty {
-                profileImportMenu
-            }
+            profileImportMenu
         } content: {
             if model.configProfiles.isEmpty {
-                rankedServerRows
+                emptyProfiles
             } else {
                 importedProfileRows
             }
@@ -4992,7 +4983,7 @@ struct ServerRankingPanel: View {
         .sheet(isPresented: $showPasteImport) {
             ProfilePasteImportSheet { name, rawConfig in
                 Task {
-                    if let error = await model.importAmneziaConfigProfile(name: name, rawConfig: rawConfig) {
+                    if let error = await model.importWireGuardConfigProfile(name: name, rawConfig: rawConfig) {
                         actionMessage = error
                     } else {
                         actionMessage = "Imported \(name.isEmpty ? "Pasted Profile" : name) as active profile."
@@ -5079,6 +5070,39 @@ struct ServerRankingPanel: View {
                 .background(rowBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
         }
+    }
+
+    private var emptyProfiles: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("No profiles added yet")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(primaryText)
+
+            Text("Add a WireGuard .conf, VLESS Reality link, subscription, or Xray JSON configuration to connect.")
+                .font(.system(size: 12))
+                .foregroundStyle(secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                Button {
+                    showPasteImport = true
+                } label: {
+                    Label("Paste configuration", systemImage: "doc.on.clipboard")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
+
+                Button {
+                    showConfImporter = true
+                } label: {
+                    Label("Choose file", systemImage: "folder")
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(12)
+        .background(rowBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var importedProfileRows: some View {
@@ -5180,7 +5204,7 @@ struct ServerRankingPanel: View {
         .accessibilityLabel("Add profile")
     }
 
-    private func profileSummary(_ profile: StoredAmneziaConfigProfile) -> some View {
+    private func profileSummary(_ profile: StoredVPNProfile) -> some View {
         Group {
             Image(systemName: profile.id == model.displayedConfigProfile?.id ? "checkmark.circle.fill" : "circle")
                 .foregroundStyle(profile.id == model.displayedConfigProfile?.id ? .teal : secondaryText.opacity(0.62))
@@ -5242,7 +5266,7 @@ struct ServerRankingPanel: View {
                 }
                 let imported = try String(contentsOf: url, encoding: .utf8)
                 Task {
-                    if let error = await model.importAmneziaConfigProfile(name: url.lastPathComponent, rawConfig: imported) {
+                    if let error = await model.importWireGuardConfigProfile(name: url.lastPathComponent, rawConfig: imported) {
                         actionMessage = error
                     } else {
                         actionMessage = "Imported \(url.lastPathComponent) as active profile."
@@ -5256,7 +5280,7 @@ struct ServerRankingPanel: View {
         }
     }
 
-    private func profileDetail(_ profile: StoredAmneziaConfigProfile) -> String {
+    private func profileDetail(_ profile: StoredVPNProfile) -> String {
         var parts: [String] = []
         if let regionCode = profile.regionCode {
             parts.append(regionCode)
@@ -5289,7 +5313,7 @@ struct ProfilePasteImportSheet: View {
                 Text("Add Profile")
                     .font(.system(size: 24, weight: .bold))
                     .foregroundStyle(.white)
-                Text("Paste a vpn:// key, VLESS URL, subscription URL, or raw config.")
+                Text("Paste a WireGuard .conf, VLESS URL, subscription URL, or raw config.")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.white.opacity(0.62))
             }
@@ -5347,11 +5371,11 @@ struct ProfilePasteImportSheet: View {
 
 struct ProfileRenameSheet: View {
     @Environment(\.dismiss) private var dismiss
-    let profile: StoredAmneziaConfigProfile
+    let profile: StoredVPNProfile
     let onSave: (String) -> Void
     @State private var displayName: String
 
-    init(profile: StoredAmneziaConfigProfile, onSave: @escaping (String) -> Void) {
+    init(profile: StoredVPNProfile, onSave: @escaping (String) -> Void) {
         self.profile = profile
         self.onSave = onSave
         _displayName = State(initialValue: profile.displayName)
@@ -5601,7 +5625,7 @@ struct SettingsView: View {
     @ObservedObject var model: DashboardModel
     @Environment(\.dismiss) private var dismiss
     @AppStorage("appVisibilityMode") private var appVisibilityModeRaw = AppVisibilityMode.dockAndMenuBar.rawValue
-    @State private var amneziaKey = ""
+    @State private var wireGuardConfigText = ""
     @State private var message: String?
     @State private var selectedTab: SettingsTab = .app
     @State private var showConfigImporter = false
@@ -5677,10 +5701,10 @@ struct SettingsView: View {
 
                 HStack {
                     Button("Save") {
-                        if let error = model.saveAmneziaPremiumKey(amneziaKey) {
+                        if let error = model.saveWireGuardConfig(wireGuardConfigText) {
                             message = error
                         } else {
-                            message = "Saved Amnezia config in Keychain."
+                            message = "Saved WireGuard config in Keychain."
                         }
                     }
                     .buttonStyle(.borderedProminent)
@@ -5696,8 +5720,8 @@ struct SettingsView: View {
                         if let error = model.deleteActiveConfigProfile() {
                             message = error
                         } else {
-                            amneziaKey = ""
-                            message = "Deleted active Amnezia config."
+                            wireGuardConfigText = ""
+                            message = "Deleted active WireGuard config."
                         }
                     }
                     .buttonStyle(.bordered)
@@ -5723,7 +5747,7 @@ struct SettingsView: View {
                 .stroke(.white.opacity(0.16), lineWidth: 1)
         )
         .onAppear {
-            amneziaKey = model.loadAmneziaPremiumKeyForEditing()
+            wireGuardConfigText = model.loadWireGuardConfigForEditing()
         }
         .fileImporter(
             isPresented: $showConfigImporter,
@@ -5750,10 +5774,10 @@ struct SettingsView: View {
                     }
                     let imported = try String(contentsOf: url, encoding: .utf8)
                     Task {
-                        if let error = await model.importAmneziaConfigProfile(name: url.lastPathComponent, rawConfig: imported) {
+                        if let error = await model.importWireGuardConfigProfile(name: url.lastPathComponent, rawConfig: imported) {
                             message = error
                         } else {
-                            amneziaKey = model.loadAmneziaPremiumKeyForEditing()
+                            wireGuardConfigText = model.loadWireGuardConfigForEditing()
                             message = "Imported \(url.lastPathComponent) as the active profile."
                         }
                     }
@@ -5767,7 +5791,7 @@ struct SettingsView: View {
     }
 
     private var connectionSettings: some View {
-        SettingsCard(title: "Amnezia Profiles") {
+        SettingsCard(title: "VPN Profiles") {
             VStack(alignment: .leading, spacing: 12) {
                 if model.configProfiles.isEmpty {
                     Text("No imported profiles yet.")
@@ -5786,7 +5810,7 @@ struct SettingsView: View {
                     .colorScheme(.dark)
                 }
 
-                SecureField("Paste Amnezia Premium key, vpn:// link, or import an AWG .conf", text: $amneziaKey)
+                SecureField("Paste WireGuard .conf configuration, or import a WireGuard .conf", text: $wireGuardConfigText)
                     .textFieldStyle(.plain)
                     .font(.system(size: 13, design: .monospaced))
                     .foregroundStyle(.white)
@@ -5799,14 +5823,14 @@ struct SettingsView: View {
                     )
 
                 HStack(spacing: 8) {
-                    Image(systemName: model.hasAmneziaPremiumKey ? "checkmark.seal.fill" : "key")
-                        .foregroundStyle(model.hasAmneziaPremiumKey ? .mint : .white.opacity(0.58))
-                    Text(model.hasAmneziaPremiumKey ? "\(model.activeConfigSummary) is stored in macOS Keychain." : "No Amnezia config is stored yet.")
+                    Image(systemName: model.hasWireGuardConfig ? "checkmark.seal.fill" : "key")
+                        .foregroundStyle(model.hasWireGuardConfig ? .mint : .white.opacity(0.58))
+                    Text(model.hasWireGuardConfig ? "\(model.activeConfigSummary) is stored in macOS Keychain." : "No WireGuard config is stored yet.")
                         .font(.callout)
                         .foregroundStyle(.white.opacity(0.72))
                 }
 
-                Text("Imported .conf profiles are mutually exclusive with the raw Premium token for Connect: the selected ready-to-use AWG profile is used. Secrets stay in Keychain and are not written to logs, UserDefaults, or test fixtures.")
+                Text("Imported .conf profiles are mutually exclusive with the raw Premium token for Connect: the selected ready-to-use WireGuard profile is used. Secrets stay in Keychain and are not written to logs, UserDefaults, or test fixtures.")
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.58))
             }
@@ -5965,7 +5989,7 @@ struct SettingsView: View {
         AppVisibilityMode(rawValue: appVisibilityModeRaw) ?? .dockAndMenuBar
     }
 
-    private func profileRowTitle(_ profile: StoredAmneziaConfigProfile) -> String {
+    private func profileRowTitle(_ profile: StoredVPNProfile) -> String {
         var parts = [profile.displayName]
         if let regionCode = profile.regionCode {
             parts.append(regionCode)

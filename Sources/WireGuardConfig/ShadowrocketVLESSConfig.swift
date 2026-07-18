@@ -219,6 +219,12 @@ public struct ShadowrocketVLESSConfigParser: Sendable {
     }
 
     public func subscriptionURL(from text: String) throws -> URL? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let directURL = URL(string: trimmed),
+           ["http", "https"].contains(directURL.scheme?.lowercased() ?? "") {
+            return directURL
+        }
+
         let data = Data(text.utf8)
         guard let json = try? JSONSerialization.jsonObject(with: data),
               let object = json as? [String: Any] else {
@@ -252,6 +258,10 @@ public struct ShadowrocketVLESSConfigParser: Sendable {
     }
 
     private func parse(_ object: [String: Any]) throws -> ShadowrocketVLESSConfig {
+        if object["outbounds"] != nil {
+            return try parseXrayVLESSConfiguration(object)
+        }
+
         let type = stringValue("type", in: object) ?? ""
         guard type.caseInsensitiveCompare("VLESS") == .orderedSame else {
             throw ShadowrocketVLESSConfigError.unsupportedType(type.isEmpty ? "unknown" : type)
@@ -287,6 +297,61 @@ public struct ShadowrocketVLESSConfigParser: Sendable {
             fingerprint: stringValue("fp", in: object),
             spiderX: stringValue("spx", in: object),
             udp: intValue("udp", in: object).map { $0 != 0 } ?? true
+        )
+    }
+
+    /// Imports the VLESS outbound from an Xray configuration file.  Local DNS,
+    /// inbounds and routing are intentionally not imported: those are supplied
+    /// by the packet tunnel so iOS can manage the VPN interface safely.
+    private func parseXrayVLESSConfiguration(_ object: [String: Any]) throws -> ShadowrocketVLESSConfig {
+        guard let outbounds = object["outbounds"] as? [[String: Any]],
+              let outbound = outbounds.first(where: {
+                  (stringValue("protocol", in: $0) ?? "").caseInsensitiveCompare("vless") == .orderedSame
+              }) else {
+            throw ShadowrocketVLESSConfigError.unsupportedType("Xray configuration without VLESS outbound")
+        }
+
+        guard let settings = outbound["settings"] as? [String: Any],
+              let vnext = settings["vnext"] as? [[String: Any]],
+              let server = vnext.first else {
+            throw ShadowrocketVLESSConfigError.missingHost
+        }
+
+        guard let host = stringValue("address", in: server), !host.isEmpty else {
+            throw ShadowrocketVLESSConfigError.missingHost
+        }
+        guard let portString = stringValue("port", in: server), let port = UInt16(portString) else {
+            throw ShadowrocketVLESSConfigError.missingPort
+        }
+        guard let users = server["users"] as? [[String: Any]],
+              let user = users.first,
+              let uuid = stringValue("id", in: user), !uuid.isEmpty else {
+            throw ShadowrocketVLESSConfigError.missingUUID
+        }
+
+        let streamSettings = outbound["streamSettings"] as? [String: Any] ?? [:]
+        let realitySettings = streamSettings["realitySettings"] as? [String: Any] ?? [:]
+        guard let publicKey = stringValue("publicKey", in: realitySettings), !publicKey.isEmpty else {
+            throw ShadowrocketVLESSConfigError.missingRealityPublicKey
+        }
+
+        let shortID = firstNonEmpty(
+            stringValue("shortId", in: realitySettings),
+            (realitySettings["shortIds"] as? [String])?.first
+        )
+        return ShadowrocketVLESSConfig(
+            title: stringValue("remarks", in: object) ?? stringValue("tag", in: outbound) ?? "VLESS Reality",
+            regionCode: nil,
+            host: host,
+            port: port,
+            uuid: uuid,
+            peer: stringValue("serverName", in: realitySettings),
+            publicKey: publicKey,
+            shortID: shortID,
+            flow: stringValue("flow", in: user),
+            fingerprint: stringValue("fingerprint", in: realitySettings),
+            spiderX: stringValue("spiderX", in: realitySettings),
+            udp: true
         )
     }
 

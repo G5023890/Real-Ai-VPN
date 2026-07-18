@@ -1,4 +1,4 @@
-import AmneziaConfig
+import WireGuardConfig
 import Darwin
 import Foundation
 import Network
@@ -91,16 +91,16 @@ private final class TunnelTrafficSampler {
 }
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
-    private let decoder = AmneziaConfigDecoder()
+    private let decoder = WireGuardConfigDecoder()
     private let shadowrocketParser = ShadowrocketVLESSConfigParser()
     private let diagnosticsStore = TunnelDiagnosticsStore()
     private var trafficSampler: TunnelTrafficSampler?
-    private let profileStore = AmneziaConfigProfileStore(
-        accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup,
+    private let profileStore = VPNProfileStore(
+        accessGroup: WireGuardConfigKeyStore.sharedAccessGroup,
         allowsAuthenticationUI: false
     )
-    private let premiumKeyStore = AmneziaPremiumKeyStore(
-        accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup,
+    private let configKeyStore = WireGuardConfigKeyStore(
+        accessGroup: WireGuardConfigKeyStore.sharedAccessGroup,
         allowsAuthenticationUI: false
     )
     private lazy var singBoxRuntime = SingBoxTunnelRuntime(provider: self)
@@ -119,10 +119,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         packetTunnelLogger.info("Starting Real Ai Router packet tunnel")
         saveDiagnostic(stage: "startTunnel", message: "PacketTunnelProvider entered startTunnel.")
         NSLog("RealAiVPN PacketTunnel startTunnel optionsHasConfig=%@",
-              (((options?["amneziaVPNURL"] as? String) ?? (options?["amneziaVPNURL"] as? NSString).map(String.init))?.isEmpty == false) ? "true" : "false")
+              (((options?["wireGuardConfig"] as? String) ?? (options?["wireGuardConfig"] as? NSString).map(String.init))?.isEmpty == false) ? "true" : "false")
 
-        let importedConfig = ((options?["amneziaVPNURL"] as? String) ?? (options?["amneziaVPNURL"] as? NSString).map(String.init))
-            ?? storedAmneziaConfig()
+        let importedConfig = ((options?["wireGuardConfig"] as? String) ?? (options?["wireGuardConfig"] as? NSString).map(String.init))
+            ?? storedWireGuardConfig()
         let routingExceptions = RoutingExceptionCodec.decode(
             (options?["routingExceptions"] as? String) ?? (options?["routingExceptions"] as? NSString).map(String.init)
         )
@@ -136,10 +136,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let ipv4OnlyCompatibilityEnabled = optionBool("ipv4OnlyCompatibilityEnabled", options: options, providerOptions: providerOptions, defaultValue: false)
 
         guard let importedConfig, !importedConfig.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            packetTunnelLogger.error("Missing transient Amnezia config")
+            packetTunnelLogger.error("Missing transient WireGuard config")
             saveDiagnostic(stage: "missing-config", message: "No transient or stored config was available.")
             NSLog("RealAiVPN PacketTunnel missing transient config")
-            throw PacketTunnelProviderError.missingAmneziaKey
+            throw PacketTunnelProviderError.missingWireGuardConfig
         }
 
         if let shadowrocketConfig = try? shadowrocketParser.parse(importedConfig) {
@@ -167,39 +167,39 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
 #if SINGBOX_TUNNEL
         saveDiagnostic(stage: "invalid-singbox-config", message: "SingBox provider received a non-VLESS config.")
-        throw PacketTunnelProviderError.invalidAmneziaConfig
+        throw PacketTunnelProviderError.invalidConfiguration
 #else
-        let config: AmneziaWireGuardConfig
+        let config: WireGuardConfig
         do {
             config = try decoder.decodeImportedWireGuardConfig(from: importedConfig)
-            packetTunnelLogger.info("Decoded Amnezia config: \(config.redactedSummary, privacy: .public)")
-            saveDiagnostic(stage: "decoded-awg", message: config.redactedSummary)
-            NSLog("RealAiVPN PacketTunnel decoded Amnezia config=%@", config.redactedSummary)
+            packetTunnelLogger.info("Decoded WireGuard config: \(config.redactedSummary, privacy: .public)")
+            saveDiagnostic(stage: "decoded-wireguard", message: config.redactedSummary)
+            NSLog("RealAiVPN PacketTunnel decoded WireGuard config=%@", config.redactedSummary)
         } catch {
-            packetTunnelLogger.error("Failed to decode Amnezia config: \(error.localizedDescription, privacy: .public)")
+            packetTunnelLogger.error("Failed to decode WireGuard config: \(error.localizedDescription, privacy: .public)")
             saveDiagnostic(stage: "decode-failed", message: error.localizedDescription)
             NSLog("RealAiVPN PacketTunnel failed to decode config: %@", error.localizedDescription)
-            throw PacketTunnelProviderError.invalidAmneziaConfig
+            throw PacketTunnelProviderError.invalidConfiguration
         }
 
         do {
             if dnsProtectionEnabled {
                 saveDiagnostic(
                     stage: "split-dns-provider-lane-unavailable",
-                    message: "split-dns-provider-lane unavailable for AWG; using profile DNS only."
+                    message: "split-dns-provider-lane unavailable for WireGuard; using profile DNS only."
                 )
             }
-            try await startAmneziaWireGuardTunnel(
+            try await startWireGuardTunnel(
                 with: config,
                 routingExceptions: routingExceptions,
                 killSwitchEnabled: killSwitchEnabled,
                 localNetworkAccessEnabled: localNetworkAccessEnabled,
                 ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled
             )
-            startWireGuardTrafficSampler(profileID: profileID, protocolKind: configuredProtocolKind == "unknown" ? "amneziaWG" : configuredProtocolKind)
-            saveDiagnostic(stage: "started-awg", message: "AmneziaWG tunnel start returned successfully.")
+            startWireGuardTrafficSampler(profileID: profileID, protocolKind: configuredProtocolKind == "unknown" ? "wireGuard" : configuredProtocolKind)
+            saveDiagnostic(stage: "started-wireguard", message: "WireGuard tunnel start returned successfully.")
         } catch {
-            saveDiagnostic(stage: "awg-failed", message: error.localizedDescription)
+            saveDiagnostic(stage: "wireguard-failed", message: error.localizedDescription)
             throw error
         }
 #endif
@@ -213,12 +213,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ))
     }
 
-    private func storedAmneziaConfig() -> String? {
+    private func storedWireGuardConfig() -> String? {
         if let profile = try? profileStore.load().activeProfile {
             return profile.config
         }
 
-        return try? premiumKeyStore.read()
+        return try? configKeyStore.read()
     }
 
     private func storedProviderConfiguration() -> [String: Any] {
@@ -324,15 +324,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 #endif
 
-    private func startAmneziaWireGuardTunnel(
-        with config: AmneziaWireGuardConfig,
+    private func startWireGuardTunnel(
+        with config: WireGuardConfig,
         routingExceptions: RoutingExceptionCollection,
         killSwitchEnabled: Bool,
         localNetworkAccessEnabled: Bool,
         ipv6LeakProtectionEnabled: Bool
     ) async throws {
 #if SINGBOX_TUNNEL
-        throw PacketTunnelProviderError.invalidAmneziaConfig
+        throw PacketTunnelProviderError.invalidConfiguration
 #else
         let tunnelConfiguration = try config.makeTunnelConfiguration(
             named: "Real Ai Router",
@@ -347,7 +347,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 if let error {
                     continuation.resume(throwing: PacketTunnelProviderError.adapterStartFailed(String(describing: error)))
                 } else {
-                    packetTunnelLogger.info("AmneziaWG tunnel started")
+                    packetTunnelLogger.info("WireGuard tunnel started")
                     continuation.resume()
                 }
             }
@@ -445,9 +445,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             adapter.stop { error in
                 if let error {
                     if case .invalidState = error {
-                        packetTunnelLogger.debug("AmneziaWG adapter was already stopped")
+                        packetTunnelLogger.debug("WireGuard adapter was already stopped")
                     } else {
-                        packetTunnelLogger.error("Failed to stop AmneziaWG adapter: \(String(describing: error), privacy: .public)")
+                        packetTunnelLogger.error("Failed to stop WireGuard adapter: \(String(describing: error), privacy: .public)")
                     }
                 }
                 continuation.resume()
@@ -554,22 +554,22 @@ private extension NEProviderStopReason {
 }
 
 enum PacketTunnelProviderError: LocalizedError {
-    case missingAmneziaKey
-    case invalidAmneziaConfig
+    case missingWireGuardConfig
+    case invalidConfiguration
     case invalidWireGuardConfig(String)
     case adapterStartFailed(String)
     case singBoxRuntimeMissing
 
     var errorDescription: String? {
         switch self {
-        case .missingAmneziaKey:
-            return "Connect from Real Ai Router after saving an Amnezia Premium vpn:// key or importing an AmneziaWG .conf in Settings."
-        case .invalidAmneziaConfig:
-            return "The saved Amnezia Premium key could not be decoded into a tunnel configuration."
+        case .missingWireGuardConfig:
+            return "Import a standard WireGuard .conf profile in Settings before connecting."
+        case .invalidConfiguration:
+            return "The saved WireGuard configuration could not be decoded into a tunnel configuration."
         case .invalidWireGuardConfig(let message):
-            return "The Amnezia config is missing required WireGuard fields: \(message)."
+            return "The WireGuard config is missing required WireGuard fields: \(message)."
         case .adapterStartFailed(let message):
-            return "AmneziaWG adapter failed to start: \(message)."
+            return "WireGuard adapter failed to start: \(message)."
         case .singBoxRuntimeMissing:
             return "Shadowrocket VLESS/Reality profiles require the sing-box Packet Tunnel runtime. Import works, but libbox.xcframework is not bundled yet."
         }
@@ -690,7 +690,7 @@ private func localRouteExcludes(
 }
 
 #if !SINGBOX_TUNNEL
-private extension AmneziaWireGuardConfig {
+private extension WireGuardConfig {
     func makeTunnelConfiguration(
         named name: String,
         routingExceptions: RoutingExceptionCollection,
@@ -715,22 +715,6 @@ private extension AmneziaWireGuardConfig {
         interface.dns = parseCommaList(dns).compactMap(DNSServer.init(from:))
         interface.killSwitchEnabled = killSwitchEnabled
         interface.mtu = mtu.flatMap(UInt16.init(exactly:))
-        interface.junkPacketCount = parseUInt16(jc)
-        interface.junkPacketMinSize = parseUInt16(jmin)
-        interface.junkPacketMaxSize = parseUInt16(jmax)
-        interface.initPacketJunkSize = parseUInt16(s1)
-        interface.responsePacketJunkSize = parseUInt16(s2)
-        interface.cookieReplyPacketJunkSize = parseUInt16(s3)
-        interface.transportPacketJunkSize = parseUInt16(s4)
-        interface.initPacketMagicHeader = h1
-        interface.responsePacketMagicHeader = h2
-        interface.underloadPacketMagicHeader = h3
-        interface.transportPacketMagicHeader = h4
-        interface.specialJunk1 = i1
-        interface.specialJunk2 = i2
-        interface.specialJunk3 = i3
-        interface.specialJunk4 = i4
-        interface.specialJunk5 = i5
 
         var peer = PeerConfiguration(publicKey: publicKey)
         if let presharedKey {

@@ -15,12 +15,12 @@ DEVICE_ID="${DEVICE_ID:-}"
 INSTALL_ON_DEVICE="${INSTALL_ON_DEVICE:-0}"
 LAUNCH_AFTER_INSTALL="${LAUNCH_AFTER_INSTALL:-1}"
 DERIVED_DATA_ROOT="${DERIVED_DATA_ROOT:-$PROJECT_DIR/.build/xcode-ios-device}"
-APP_VERSION="${APP_VERSION:-0.97}"
+APP_VERSION="${APP_VERSION:-0.98}"
 BUILD_STAMP="${BUILD_STAMP:-$(date '+%H%M%S%d%m%Y')}"
 BUILD_DISPLAY_STAMP="${BUILD_DISPLAY_STAMP:-$(date '+%H%M.%d.%y')}"
 BUILD_LABEL="${BUILD_LABEL:-${APP_VERSION} (${BUILD_DISPLAY_STAMP})}"
 TOP_LEVEL_GO_OUT="$PROJECT_DIR/Sources/WireGuardKitGo/out"
-IOS_GO_OUT="$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo/out-iphoneos"
+IOS_GO_OUT="$PROJECT_DIR/third_party/wireguard-apple/Sources/WireGuardKitGo/out-iphoneos"
 MACOS_LIB_BACKUP="$PROJECT_DIR/.build/libwg-go.macos.backup.a"
 
 log() {
@@ -42,10 +42,10 @@ if [[ -f "$TOP_LEVEL_GO_OUT/libwg-go.a" ]]; then
   cp "$TOP_LEVEL_GO_OUT/libwg-go.a" "$MACOS_LIB_BACKUP"
 fi
 
-log "Preparing AmneziaWG userspace backend for iPhone"
+log "Preparing WireGuard userspace backend for iPhone"
 log "Build label: $BUILD_LABEL"
 "$PROJECT_DIR/scripts/prepare_third_party.sh"
-make -C "$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo" \
+make -C "$PROJECT_DIR/third_party/wireguard-apple/Sources/WireGuardKitGo" \
   ARCHS=arm64 \
   ARCH=arm64 \
   PLATFORM_NAME=iphoneos \
@@ -55,7 +55,7 @@ make -C "$PROJECT_DIR/third_party/amneziawg-apple/Sources/WireGuardKitGo" \
   DEPLOYMENT_TARGET_CLANG_ENV_NAME=IPHONEOS_DEPLOYMENT_TARGET \
   IPHONEOS_DEPLOYMENT_TARGET=17.0 \
   CONFIGURATION_BUILD_DIR="$IOS_GO_OUT" \
-  CONFIGURATION_TEMP_DIR="$PROJECT_DIR/.build/amneziawg-go-ios-tmp" \
+  CONFIGURATION_TEMP_DIR="$PROJECT_DIR/.build/wireguard-go-ios-tmp" \
   build version-header
 
 mkdir -p "$TOP_LEVEL_GO_OUT"

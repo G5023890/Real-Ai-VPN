@@ -14,8 +14,8 @@ let package = Package(
             targets: ["SmartVPNMacApp"]
         ),
         .library(
-            name: "AmneziaConfig",
-            targets: ["AmneziaConfig"]
+            name: "WireGuardConfig",
+            targets: ["WireGuardConfig"]
         ),
         .library(
             name: "SmartServerSelection",
@@ -28,7 +28,7 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "AmneziaConfig"
+            name: "WireGuardConfig"
         ),
         .target(
             name: "SmartServerSelection"
@@ -39,7 +39,7 @@ let package = Package(
         .executableTarget(
             name: "SmartVPNMacApp",
             dependencies: [
-                "AmneziaConfig",
+                "WireGuardConfig",
                 "RealVPNCore",
                 "SmartServerSelection"
             ],
@@ -49,8 +49,8 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "AmneziaConfigTests",
-            dependencies: ["AmneziaConfig"]
+            name: "WireGuardConfigTests",
+            dependencies: ["WireGuardConfig"]
         ),
         .testTarget(
             name: "SmartServerSelectionTests",

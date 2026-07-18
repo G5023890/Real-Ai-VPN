@@ -3,22 +3,22 @@ options:
   createIntermediateGroups: true
 packages:
   WireGuardKit:
-    path: third_party/amneziawg-apple
+    path: third_party/wireguard-apple
 configs:
   Debug: debug
   Release: release
 targets:
-  AmneziaConfig:
+  WireGuardConfig:
     type: library.static
     platform: macOS
     deploymentTarget: "14.0"
     sources:
-      - path: Sources/AmneziaConfig
+      - path: Sources/WireGuardConfig
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.AmneziaConfig
-        PRODUCT_NAME: AmneziaConfig
-        PRODUCT_MODULE_NAME: AmneziaConfig
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.WireGuardConfig
+        PRODUCT_NAME: WireGuardConfig
+        PRODUCT_MODULE_NAME: WireGuardConfig
         SWIFT_VERSION: 5.0
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
@@ -53,17 +53,17 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         MACOSX_DEPLOYMENT_TARGET: 14.0
-  AmneziaConfigiOS:
+  WireGuardConfigiOS:
     type: library.static
     platform: iOS
     deploymentTarget: "17.0"
     sources:
-      - path: Sources/AmneziaConfig
+      - path: Sources/WireGuardConfig
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.iOS.AmneziaConfig
-        PRODUCT_NAME: AmneziaConfig
-        PRODUCT_MODULE_NAME: AmneziaConfig
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.iOS.WireGuardConfig
+        PRODUCT_NAME: WireGuardConfig
+        PRODUCT_MODULE_NAME: WireGuardConfig
         SWIFT_VERSION: 5.0
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
@@ -107,7 +107,7 @@ targets:
       - path: Resources/Routing
         buildPhase: resources
     dependencies:
-      - target: AmneziaConfig
+      - target: WireGuardConfig
       - target: RealVPNCore
       - package: WireGuardKit
     settings:
@@ -121,7 +121,7 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         MACOSX_DEPLOYMENT_TARGET: 14.0
-        MARKETING_VERSION: 0.97
+        MARKETING_VERSION: 0.98
         CURRENT_PROJECT_VERSION: 77
   RealAiVPNPacketTunneliOS:
     type: app-extension
@@ -132,7 +132,7 @@ targets:
       - path: Resources/Routing
         buildPhase: resources
     dependencies:
-      - target: AmneziaConfigiOS
+      - target: WireGuardConfigiOS
       - target: RealVPNCoreiOS
       - package: WireGuardKit
     settings:
@@ -146,7 +146,7 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         IPHONEOS_DEPLOYMENT_TARGET: 17.0
-        MARKETING_VERSION: 0.97
+        MARKETING_VERSION: 0.98
         CURRENT_PROJECT_VERSION: 77
   RealAiVPNSingBoxPacketTunnel:
     type: app-extension
@@ -157,7 +157,7 @@ targets:
       - path: Resources/Routing
         buildPhase: resources
     dependencies:
-      - target: AmneziaConfig
+      - target: WireGuardConfig
       - target: RealVPNCore
       - framework: third_party/sing-box/Libbox.xcframework
       - sdk: CoreText.framework
@@ -183,7 +183,7 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         MACOSX_DEPLOYMENT_TARGET: 14.0
-        MARKETING_VERSION: 0.97
+        MARKETING_VERSION: 0.98
         CURRENT_PROJECT_VERSION: 77
   RealAiVPNSingBoxPacketTunneliOS:
     type: app-extension
@@ -194,7 +194,7 @@ targets:
       - path: Resources/Routing
         buildPhase: resources
     dependencies:
-      - target: AmneziaConfigiOS
+      - target: WireGuardConfigiOS
       - target: RealVPNCoreiOS
       - framework: third_party/sing-box/Libbox.xcframework
       - sdk: CoreText.framework
@@ -219,7 +219,7 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         IPHONEOS_DEPLOYMENT_TARGET: 17.0
-        MARKETING_VERSION: 0.97
+        MARKETING_VERSION: 0.98
         CURRENT_PROJECT_VERSION: 77
   RealAiVPN:
     type: application
@@ -234,7 +234,7 @@ targets:
       - path: Resources/CoreML
         buildPhase: resources
     dependencies:
-      - target: AmneziaConfig
+      - target: WireGuardConfig
       - target: SmartServerSelection
       - target: RealVPNCore
       - target: RealAiVPNPacketTunnel
@@ -250,7 +250,7 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         MACOSX_DEPLOYMENT_TARGET: 14.0
-        MARKETING_VERSION: 0.97
+        MARKETING_VERSION: 0.98
         CURRENT_PROJECT_VERSION: 77
         ENABLE_HARDENED_RUNTIME: YES
   RealAiVPNiOS:
@@ -266,7 +266,7 @@ targets:
       - path: Resources/CoreML
         buildPhase: resources
     dependencies:
-      - target: AmneziaConfigiOS
+      - target: WireGuardConfigiOS
       - target: SmartServerSelectioniOS
       - target: RealVPNCoreiOS
       - target: RealAiVPNPacketTunneliOS
@@ -283,5 +283,5 @@ targets:
         DEVELOPMENT_TEAM: 9FP39GTDT5
         IPHONEOS_DEPLOYMENT_TARGET: 17.0
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        MARKETING_VERSION: 0.97
+        MARKETING_VERSION: 0.98
         CURRENT_PROJECT_VERSION: 77

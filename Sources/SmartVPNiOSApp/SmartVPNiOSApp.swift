@@ -1,4 +1,4 @@
-import AmneziaConfig
+import WireGuardConfig
 import Combine
 import Darwin
 import Network
@@ -407,7 +407,7 @@ struct iOSChannelTestingState: Equatable {
 
 @MainActor
 final class iOSDashboardModel: ObservableObject {
-    @Published private(set) var profiles: [StoredAmneziaConfigProfile] = []
+    @Published private(set) var profiles: [StoredVPNProfile] = []
     @Published private(set) var activeProfileID: String?
     @Published private(set) var connectedProfileID: String?
     @Published private(set) var observedExitIP: String?
@@ -418,7 +418,7 @@ final class iOSDashboardModel: ObservableObject {
     @Published private(set) var tunnelDiagnostic: TunnelDiagnosticSnapshot?
     @Published private(set) var vpnActionInFlight = false
     @Published private(set) var vpnActionTitle: String?
-    @Published private(set) var message = "Import an AmneziaWG .conf profile to start."
+    @Published private(set) var message = "Import a WireGuard .conf profile to start."
     @Published private(set) var routeTitle = "Ready"
     @Published private(set) var confidence = 0
     @Published private(set) var routingExceptions = RoutingExceptionCollection()
@@ -497,9 +497,9 @@ final class iOSDashboardModel: ObservableObject {
         }
     }
 
-    private let decoder = AmneziaConfigDecoder()
+    private let decoder = WireGuardConfigDecoder()
     private let shadowrocketParser = ShadowrocketVLESSConfigParser()
-    private let profileStore = AmneziaConfigProfileStore(accessGroup: AmneziaPremiumKeyStore.sharedAccessGroup)
+    private let profileStore = VPNProfileStore(accessGroup: WireGuardConfigKeyStore.sharedAccessGroup)
     private let routingExceptionStore = RoutingExceptionStore()
     private let tunnelDiagnosticsStore = TunnelDiagnosticsStore()
     private let tunnelTrafficStatsStore = TunnelTrafficStatsStore()
@@ -621,25 +621,25 @@ final class iOSDashboardModel: ObservableObject {
         vpnActionInFlight ? "hourglass" : (isConnectedOrConnecting ? "stop.fill" : "power")
     }
 
-    var activeProfile: StoredAmneziaConfigProfile? {
+    var activeProfile: StoredVPNProfile? {
         guard let activeProfileID else {
             return profiles.first
         }
         return profiles.first { $0.id == activeProfileID } ?? profiles.first
     }
 
-    var connectedProfile: StoredAmneziaConfigProfile? {
+    var connectedProfile: StoredVPNProfile? {
         guard let connectedProfileID else {
             return nil
         }
         return profiles.first { $0.id == connectedProfileID }
     }
 
-    var displayedProfile: StoredAmneziaConfigProfile? {
+    var displayedProfile: StoredVPNProfile? {
         vpnStatus.isConnectedOrConnecting ? (connectedProfile ?? activeProfile) : activeProfile
     }
 
-    var profilesByCoreAIScore: [StoredAmneziaConfigProfile] {
+    var profilesByCoreAIScore: [StoredVPNProfile] {
         let scoresByID = Dictionary(uniqueKeysWithValues: rankedServers.map { ($0.server.id, $0.score) })
         return profiles.sorted { lhs, rhs in
             let lhsScore = scoresByID[lhs.id] ?? -1
@@ -781,7 +781,7 @@ final class iOSDashboardModel: ObservableObject {
         }
 
         guard displayedProfile?.kind == .singBoxVLESSReality else {
-            return "Profile DNS only · split-dns-provider-lane unavailable for AWG"
+            return "Profile DNS only · split-dns-provider-lane unavailable for WireGuard"
         }
 
         return "Provider DNS lane: Yandex DNS"
@@ -882,9 +882,9 @@ final class iOSDashboardModel: ObservableObject {
             let decoded = try decoder.decodeImportedWireGuardConfig(from: rawConfig)
             let endpointHost = Self.endpointHost(from: decoded.endpoint)
             let regionCode = Self.regionCode(from: displayName, endpointHost: endpointHost)
-            let profile = StoredAmneziaConfigProfile(
+            let profile = StoredVPNProfile(
                 displayName: displayName,
-                kind: .awgConfig,
+                kind: .wireGuardConfig,
                 regionCode: regionCode,
                 endpointHost: endpointHost,
                 config: rawConfig
@@ -916,7 +916,7 @@ final class iOSDashboardModel: ObservableObject {
     ) throws {
         for (index, entry) in entries.enumerated() {
             let displayName = entry.profile.title.isEmpty ? fallbackName : entry.profile.title
-            let profile = StoredAmneziaConfigProfile(
+            let profile = StoredVPNProfile(
                 displayName: displayName,
                 kind: .singBoxVLESSReality,
                 regionCode: entry.profile.regionCode ?? Self.regionCode(from: displayName, endpointHost: entry.profile.host),
@@ -983,7 +983,7 @@ final class iOSDashboardModel: ObservableObject {
             return
         }
         guard let activeProfile else {
-            message = "Import an AmneziaWG .conf profile first."
+            message = "Import a WireGuard .conf profile first."
             return
         }
 
@@ -1068,7 +1068,7 @@ final class iOSDashboardModel: ObservableObject {
         NSLog("RealAiVPN iOS connect() entered connectedOrConnecting=%@", isConnectedOrConnecting ? "true" : "false")
         guard let activeProfile else {
             NSLog("RealAiVPN iOS connect() no active profile")
-            message = "Import an AmneziaWG .conf profile first."
+            message = "Import a WireGuard .conf profile first."
             return
         }
 
@@ -1085,7 +1085,7 @@ final class iOSDashboardModel: ObservableObject {
                   providerBundleIdentifier(for: connectProfile))
             await vpnManager.connect(
                 configuration: vpnConfiguration(for: connectProfile, enableOnDemandReconnect: reconnectAfterDropEnabled),
-                transientAmneziaKey: connectProfile.config,
+                transientWireGuardConfig: connectProfile.config,
                 routingExceptions: routingExceptions
             )
             tunnelDiagnostic = tunnelDiagnosticsStore.load()
@@ -1366,7 +1366,7 @@ final class iOSDashboardModel: ObservableObject {
         await finishChannelTesting(originalProfileID: originalProfileID, reconnectOriginal: wasConnected, cancelled: false)
     }
 
-    private func testProfileThroughTunnel(_ profile: StoredAmneziaConfigProfile) async -> Bool {
+    private func testProfileThroughTunnel(_ profile: StoredVPNProfile) async -> Bool {
         do {
             if vpnStatus.isConnectedOrConnecting {
                 suppressExpectedDisconnectNotification = true
@@ -1419,7 +1419,7 @@ final class iOSDashboardModel: ObservableObject {
         }
     }
 
-    private func recordTunnelQualitySample(for profile: StoredAmneziaConfigProfile, probes: [ConnectivityProbeResult]) {
+    private func recordTunnelQualitySample(for profile: StoredVPNProfile, probes: [ConnectivityProbeResult]) {
         let latencies = probes.compactMap(\.latencyMilliseconds)
         let averageLatency = latencies.isEmpty ? 3_000 : latencies.reduce(0, +) / Double(latencies.count)
         let failures = probes.filter { !$0.succeeded }.count
@@ -1440,7 +1440,7 @@ final class iOSDashboardModel: ObservableObject {
         recordQualitySample(sample)
     }
 
-    private func recordFailedTunnelSample(for profile: StoredAmneziaConfigProfile) {
+    private func recordFailedTunnelSample(for profile: StoredVPNProfile) {
         let sample = ServerQualitySample(
             serverID: profile.id,
             region: RegionCode(profile.regionCode ?? "ZZ"),
@@ -1668,11 +1668,11 @@ final class iOSDashboardModel: ObservableObject {
         case .disconnecting:
             message = "Disconnecting from \(profileName)..."
         case .disconnected:
-            message = profiles.isEmpty ? "Import an AmneziaWG .conf profile to start." : "Disconnected. Ready to connect \(profileName)."
+            message = profiles.isEmpty ? "Import a WireGuard .conf profile to start." : "Disconnected. Ready to connect \(profileName)."
         case .invalid:
             message = "VPN profile is invalid. Reinstall or recreate the VPN profile."
         case .unknown:
-            message = profiles.isEmpty ? "Import an AmneziaWG .conf profile to start." : "Checking VPN status for \(profileName)..."
+            message = profiles.isEmpty ? "Import a WireGuard .conf profile to start." : "Checking VPN status for \(profileName)..."
         }
         refreshRoutePreview()
     }
@@ -1788,7 +1788,7 @@ final class iOSDashboardModel: ObservableObject {
     }
 
     private func vpnConfiguration(
-        for profile: StoredAmneziaConfigProfile?,
+        for profile: StoredVPNProfile?,
         enableOnDemandReconnect: Bool = false
     ) -> VPNProfileConfiguration {
         VPNProfileConfiguration(
@@ -1796,7 +1796,7 @@ final class iOSDashboardModel: ObservableObject {
             providerBundleIdentifier: providerBundleIdentifier(for: profile),
             serverID: profile?.id ?? "real-ai-vpn-ios",
             regionCode: profile?.regionCode ?? "ZZ",
-            protocolKind: profile?.kind == .singBoxVLESSReality ? VPNProtocolKind.singBox.rawValue : VPNProtocolKind.amneziaWG.rawValue,
+            protocolKind: profile?.kind == .singBoxVLESSReality ? VPNProtocolKind.singBox.rawValue : VPNProtocolKind.wireGuard.rawValue,
             killSwitchEnabled: killSwitchEnabled,
             dnsProtectionEnabled: dnsProtectionEnabled,
             localNetworkAccessEnabled: localNetworkAccessEnabled,
@@ -1807,17 +1807,17 @@ final class iOSDashboardModel: ObservableObject {
         )
     }
 
-    private func localizedVPNDescription(for profile: StoredAmneziaConfigProfile?) -> String {
-        profile?.kind == .singBoxVLESSReality ? "Real Ai Router VLESS" : "Real Ai Router AWG"
+    private func localizedVPNDescription(for profile: StoredVPNProfile?) -> String {
+        profile?.kind == .singBoxVLESSReality ? "Real Ai Router VLESS" : "Real Ai Router WireGuard"
     }
 
-    private func providerBundleIdentifier(for profile: StoredAmneziaConfigProfile?) -> String {
+    private func providerBundleIdentifier(for profile: StoredVPNProfile?) -> String {
         profile?.kind == .singBoxVLESSReality
             ? "com.codex.RealAiVPN.iOS.SingBoxPacketTunnel"
             : "com.codex.RealAiVPN.iOS.PacketTunnel"
     }
 
-    private func resolveProfileForConnect(_ profile: StoredAmneziaConfigProfile) async -> StoredAmneziaConfigProfile {
+    private func resolveProfileForConnect(_ profile: StoredVPNProfile) async -> StoredVPNProfile {
         guard profile.kind != .singBoxVLESSReality else {
             return profile
         }
@@ -1829,7 +1829,7 @@ final class iOSDashboardModel: ObservableObject {
         return profile
     }
 
-    private func repairLegacyShadowrocketProfileIfNeeded(_ profile: StoredAmneziaConfigProfile) async -> StoredAmneziaConfigProfile? {
+    private func repairLegacyShadowrocketProfileIfNeeded(_ profile: StoredVPNProfile) async -> StoredVPNProfile? {
         let rawConfig = profile.config.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawConfig.isEmpty else {
             return nil
@@ -1880,7 +1880,7 @@ final class iOSDashboardModel: ObservableObject {
                 id: profile.id,
                 region: RegionCode(profile.regionCode ?? "ZZ"),
                 displayName: profile.displayName,
-                protocolKind: profile.kind == .singBoxVLESSReality ? .singBox : .amneziaWG,
+                protocolKind: profile.kind == .singBoxVLESSReality ? .singBox : .wireGuard,
                 lastLatencyMilliseconds: lastLatency(for: profile.id),
                 healthState: .healthy
             )
@@ -1939,7 +1939,7 @@ final class iOSDashboardModel: ObservableObject {
         }
         return TunnelTrafficStats(
             profileID: profile.id,
-            protocol: profile.kind == .singBoxVLESSReality ? VPNProtocolKind.singBox.rawValue : VPNProtocolKind.amneziaWG.rawValue,
+            protocol: profile.kind == .singBoxVLESSReality ? VPNProtocolKind.singBox.rawValue : VPNProtocolKind.wireGuard.rawValue,
             startedAt: storedStats?.startedAt ?? Date(),
             duration: storedStats?.duration ?? 0,
             rxBytes: snapshot.rxBytes,
@@ -2036,7 +2036,7 @@ final class iOSDashboardModel: ObservableObject {
     private func runMonitoringCycle() async {
         loadTunnelTrafficStats()
         guard !profiles.isEmpty else {
-            message = "Import an AmneziaWG .conf profile to start."
+            message = "Import a WireGuard .conf profile to start."
             return
         }
 
@@ -2447,7 +2447,7 @@ final class iOSDashboardModel: ObservableObject {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    private func endpoint(for profile: StoredAmneziaConfigProfile) -> ProfileEndpoint? {
+    private func endpoint(for profile: StoredVPNProfile) -> ProfileEndpoint? {
         if profile.kind == .singBoxVLESSReality,
            let shadowrocket = try? shadowrocketParser.parse(profile.config) {
             return ProfileEndpoint(host: shadowrocket.host, port: shadowrocket.port)
@@ -2517,7 +2517,7 @@ final class iOSDashboardModel: ObservableObject {
 
     private static func routeTitle(
         for decision: RouteDecision,
-        activeProfile: StoredAmneziaConfigProfile?,
+        activeProfile: StoredVPNProfile?,
         status: VPNConnectionStatus
     ) -> String {
         if status == .connected, let activeProfile {
@@ -2614,7 +2614,7 @@ private struct iOSHomeScreen: View {
     let openRoute: () -> Void
     let openProfiles: () -> Void
 
-    private var activeProfile: StoredAmneziaConfigProfile? {
+    private var activeProfile: StoredVPNProfile? {
         model.displayedProfile ?? model.activeProfile
     }
 
@@ -3003,7 +3003,7 @@ private struct iOSRouteScreen: View {
     @ObservedObject var model: iOSDashboardModel
     @State private var selectedProfileID: String?
 
-    private var selectedProfile: StoredAmneziaConfigProfile? {
+    private var selectedProfile: StoredVPNProfile? {
         model.profiles.first { $0.id == selectedProfileID } ?? model.activeProfile
     }
 
@@ -3552,8 +3552,6 @@ private struct iOSStatisticsScreen: View {
 
     private func protocolLabel(_ protocolKind: VPNProtocolKind) -> String {
         switch protocolKind {
-        case .amneziaWG:
-            return "AmneziaWG"
         case .wireGuard:
             return "WireGuard"
         case .singBox:
@@ -4213,7 +4211,7 @@ private struct LegacyiOSDashboardView: View {
         return "Active: \(profile.displayName) · \(profile.endpointHost ?? "endpoint hidden")"
     }
 
-    private func routeEndpointText(for profile: StoredAmneziaConfigProfile) -> String {
+    private func routeEndpointText(for profile: StoredVPNProfile) -> String {
         var parts = ["endpoint \(profile.endpointHost ?? "hidden")"]
         if let observedExitIP = model.observedExitIP {
             parts.append("exit \(observedExitIP)")
@@ -4563,8 +4561,8 @@ private struct iOSProfilesScreen: View {
     @State private var showingPasteImport = false
     @State private var importingConfProfile = false
     @State private var importingJSONProfile = false
-    @State private var renamingProfile: StoredAmneziaConfigProfile?
-    @State private var deletingProfile: StoredAmneziaConfigProfile?
+    @State private var renamingProfile: StoredVPNProfile?
+    @State private var deletingProfile: StoredVPNProfile?
 
     var body: some View {
         ScrollView {
@@ -4656,7 +4654,7 @@ private struct iOSProfilesScreen: View {
             Label("No imported profiles", systemImage: "server.rack")
                 .font(.headline)
                 .foregroundStyle(AppTheme.primaryText)
-            Text("Use the import button on the main screen to add AmneziaWG .conf or Shadowrocket VLESS profiles.")
+            Text("Use the import button on the main screen to add WireGuard .conf or Shadowrocket VLESS profiles.")
                 .font(.callout)
                 .foregroundStyle(AppTheme.secondaryText)
         }
@@ -4665,7 +4663,7 @@ private struct iOSProfilesScreen: View {
         .background(AppTheme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
-    private func profileRow(_ profile: StoredAmneziaConfigProfile) -> some View {
+    private func profileRow(_ profile: StoredVPNProfile) -> some View {
         HStack(spacing: 10) {
             Button {
                 NSLog("RealAiVPN iOS profile row tapped id=%@ name=%@ kind=%@ endpoint=%@",
@@ -4784,7 +4782,7 @@ private struct iOSProfilePasteImportSheet: View {
                 }
 
                 Section {
-                    Text("Paste a vpn:// key, VLESS URL, subscription URL, or raw config. Secrets stay local.")
+                    Text("Paste a WireGuard .conf, VLESS URL, subscription URL, or raw config. Secrets stay local.")
                         .font(.footnote)
                         .foregroundStyle(AppTheme.secondaryText)
                 }
@@ -4813,11 +4811,11 @@ private struct iOSProfilePasteImportSheet: View {
 
 private struct iOSProfileRenameSheet: View {
     @Environment(\.dismiss) private var dismiss
-    let profile: StoredAmneziaConfigProfile
+    let profile: StoredVPNProfile
     let onSave: (String) -> Void
     @State private var displayName: String
 
-    init(profile: StoredAmneziaConfigProfile, onSave: @escaping (String) -> Void) {
+    init(profile: StoredVPNProfile, onSave: @escaping (String) -> Void) {
         self.profile = profile
         self.onSave = onSave
         _displayName = State(initialValue: profile.displayName)
