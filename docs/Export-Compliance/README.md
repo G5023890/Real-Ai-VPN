@@ -1,7 +1,7 @@
 # Real Ai Router — export-compliance record
 
-Prepared: 18 July 2026  
-Product: Real Ai Router 0.98  
+Prepared: 20 August 2026
+Product: Real Ai Router 0.98.5 (87)
 iOS bundle identifier: `com.codex.RealAiVPN.iOS`
 
 This folder is a technical record to support the App Store Connect encryption

@@ -2,8 +2,8 @@
 
 ## Goal
 
-Build one Apple-native VPN product for iOS and macOS that imports standard
-WireGuard configuration files plus VLESS Reality links, subscriptions, and Xray JSON, then
+Build one Apple-native VPN product for iOS and macOS that imports VLESS Reality
+links, subscriptions, and Xray JSON, then
 decides whether traffic should go through the encrypted tunnel or directly through the current
 network provider.
 
@@ -19,14 +19,31 @@ network provider.
 
 ## Import Flow
 
-1. User imports a WireGuard `.conf`, QR code, VLESS configuration, subscription, or Xray JSON.
-2. The app validates standard WireGuard fields or extracts the VLESS Reality outbound locally.
+1. User imports a VLESS configuration, subscription, or Xray JSON. Standard
+   WireGuard files may still be parsed for compatibility, but are not tunnel
+   backends in the current release.
+2. The app extracts the VLESS Reality outbound locally.
 3. The configuration is normalized into an internal protocol model; Xray DNS, inbounds, and
    routing are deliberately not imported because the packet tunnel owns those policies.
 4. Secrets are moved into Keychain.
 5. The app creates or updates an `NETunnelProviderManager` profile.
 
 The raw imported link should never be logged or written to a fixture.
+
+## Remote Catalog Flow
+
+1. The app downloads the public `user.signed.json` or `admin.signed.json`
+   envelope directly from the configured GitHub raw-content URL.
+2. Admin access is gated locally by the password hash published in
+   `admin-access.json`; no GitHub token or Cloudflare service is used by the app.
+3. The app verifies the Ed25519 signature against its configured public key and
+   rejects expired or incompatible manifest versions.
+4. The update is applied atomically. Only remote-owned profiles in that same
+   catalog can be replaced or withdrawn; local imports are retained.
+
+The GitHub credential and the signing private key must never be delivered in an
+app binary, sent to a client, or committed to either repository. The Admin
+password itself is never published; only its SHA-256 hash is stored.
 
 ## Routing Model
 
@@ -93,18 +110,21 @@ predict impending stalls from latency, packet loss, handshake jitter, repeated
 DNS failures, network type, provider ASN, time of day, and historical recovery
 success. Deterministic safety rules still win over model output.
 
-## Protocol Plan
+## Protocol Status
 
-### Phase 1: WireGuard Profile Import
+### Current: VLESS Reality
 
-Validate a standard `.conf` profile containing `[Interface]` and `[Peer]`.
-The `WireGuardConfig` module rejects AmneziaWG-only obfuscation fields.
+Run VLESS Reality through the sing-box packet tunnel. Import VLESS URLs and
+subscriptions, and extract compatible VLESS Reality outbounds from Xray JSON.
+Other Xray outbound protocols and OpenVPN are not supported.
 
-### Phase 2: WireGuard
+### Deferred: WireGuard runtime
 
-Run the official WireGuard userspace adapter in the packet tunnel extension.
+The standard WireGuard parser remains in the shared modules for import and
+migration compatibility, but the WireGuard userspace runtime, extension
+targets, and `libwg-go` are excluded from the 0.98.5 iOS and macOS products.
 
-### Phase 3: Routing Rules
+### Routing Rules
 
 Add rule storage, route compilation, and diagnostics showing whether a
 destination is routed through VPN or direct.
@@ -119,12 +139,6 @@ server for foreign traffic. Keep hard regional rules above the scorer.
 Continuously evaluate direct and VPN path probes to avoid common VPN hangs.
 Recover by refreshing DNS, rehandshaking, changing tunnel parameters, switching
 servers, or reconnecting.
-
-### Phase 4: VLESS Reality / Xray
-
-Run VLESS Reality through the sing-box packet tunnel. Import VLESS URLs and subscriptions,
-and extract compatible VLESS Reality outbounds from Xray JSON. Other Xray outbound protocols
-and OpenVPN are not supported.
 
 ## Security Notes
 

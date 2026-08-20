@@ -710,6 +710,8 @@ final class DashboardModel: ObservableObject {
     @Published private(set) var lastRecoveryDecisionLog = ""
     @Published private(set) var routingExceptions = RoutingExceptionCollection()
     @Published private(set) var channelTesting = MacChannelTestingState()
+    @Published private(set) var remoteCatalogStatus = "Remote catalog is not configured."
+    @Published private(set) var remoteCatalogIsSyncing = false
     @Published var automaticFailoverEnabled = UserDefaults.standard.object(forKey: "automaticFailoverEnabled") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(automaticFailoverEnabled, forKey: "automaticFailoverEnabled")
@@ -789,6 +791,10 @@ final class DashboardModel: ObservableObject {
     private let vpnManager = RealVPNProfileManager()
     private let configKeyStore = WireGuardConfigKeyStore(accessGroup: WireGuardConfigKeyStore.sharedAccessGroup)
     private let profileStore = VPNProfileStore(accessGroup: WireGuardConfigKeyStore.sharedAccessGroup)
+    private let remoteCatalogClient = RemoteCatalogClient()
+    private let remoteCatalogConfigurationStore = RemoteCatalogConfigurationStore()
+    private let remoteCatalogCredentialStore = RemoteCatalogAccessCredentialStore(accessGroup: WireGuardConfigKeyStore.sharedAccessGroup)
+    private let remoteCatalogSyncStateStore = RemoteCatalogSyncStateStore()
     private let qualityHistoryStore = LocalProfileQualityHistoryStore()
     private let probeReliabilityHistoryStore = LocalProbeReliabilityHistoryStore()
     private let probeReliabilityAnalyzer = ProbeReliabilityAnalyzer()
@@ -861,6 +867,7 @@ final class DashboardModel: ObservableObject {
 
         seedHistory()
         migrateLegacySingleConfigIfNeeded()
+        _ = try? profileStore.migrateLegacyProfilesIfNeeded()
         routingExceptions = routingExceptionStore.load()
         bindVPNManagerState()
         bindSystemWakeNotifications()
@@ -875,6 +882,9 @@ final class DashboardModel: ObservableObject {
         Task {
             await vpnManager.prepareProfile(configuration: vpnConfiguration)
             await connectOnStartIfNeeded()
+            // The User catalog is public and must be available immediately on
+            // a new Mac, without any Admin password or manual setup.
+            syncRemoteCatalog(role: .user)
         }
     }
 
@@ -1760,6 +1770,98 @@ final class DashboardModel: ObservableObject {
         importWireGuardConfigProfileSync(name: name, rawConfig: rawConfig)
     }
 
+    var remoteCatalogConfiguration: RemoteCatalogConfiguration? {
+        remoteCatalogConfigurationStore.load()
+    }
+
+    func configureRemoteCatalog(
+        catalogID: String,
+        endpointURL: String,
+        signingPublicKey: String,
+        adminPassword: String
+    ) {
+        let trimmedCatalogID = catalogID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = signingPublicKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedCatalogID.isEmpty,
+              let url = URL(string: endpointURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+              url.scheme == "https",
+              url.host == "raw.githubusercontent.com",
+              !trimmedKey.isEmpty else {
+            remoteCatalogStatus = "Enter a catalog ID, raw.githubusercontent.com catalog URL, and Ed25519 public key."
+            return
+        }
+        do {
+            try remoteCatalogConfigurationStore.save(RemoteCatalogConfiguration(
+                catalogID: trimmedCatalogID,
+                endpoint: RemoteCatalogEndpoint(baseURL: url, signingPublicKey: trimmedKey)
+            ))
+            let admin = adminPassword.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !admin.isEmpty { try remoteCatalogCredentialStore.save(admin, catalogID: trimmedCatalogID, role: .admin) }
+            remoteCatalogStatus = "Remote catalog saved."
+            monitorStatus = "Remote catalog is ready to sync."
+        } catch {
+            remoteCatalogStatus = "Could not save remote catalog: \(error.localizedDescription)"
+        }
+    }
+
+    func syncRemoteCatalog(role: RemoteCatalogRole, adminPassword: String? = nil) {
+        guard let configuration = remoteCatalogConfiguration else {
+            remoteCatalogStatus = "Configure the remote catalog first."
+            return
+        }
+        guard !remoteCatalogIsSyncing else { return }
+        if role == .admin, let adminPassword {
+            let password = adminPassword.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !password.isEmpty {
+                do {
+                    try remoteCatalogCredentialStore.save(password, catalogID: configuration.catalogID, role: .admin)
+                } catch {
+                    remoteCatalogStatus = "Could not save the Admin password: \(error.localizedDescription)"
+                    return
+                }
+            }
+        }
+        remoteCatalogIsSyncing = true
+        remoteCatalogStatus = "Syncing \(role.rawValue) catalog…"
+        Task {
+            defer { remoteCatalogIsSyncing = false }
+            do {
+                let token = try remoteCatalogCredentialStore.read(catalogID: configuration.catalogID, role: role)
+                if role == .admin, token?.isEmpty != false {
+                    throw RemoteCatalogError.adminPasswordRequired
+                }
+                let stateID = "\(configuration.catalogID).\(role.rawValue)"
+                let state = remoteCatalogSyncStateStore.load(catalogID: stateID)
+                let fetched = try await remoteCatalogClient.fetch(
+                    endpoint: configuration.endpoint, role: role, accessToken: token, eTag: state.eTag
+                )
+                if fetched.notModified {
+                    remoteCatalogStatus = "\(role.rawValue.capitalized) catalog is already current."
+                    monitorStatus = remoteCatalogStatus
+                    return
+                }
+                guard let manifest = fetched.manifest else { throw RemoteCatalogError.invalidResponse }
+                guard manifest.catalogID == configuration.catalogID else { throw RemoteCatalogError.invalidResponse }
+                let result = try profileStore.synchronizeRemoteCatalog(
+                    catalogID: manifest.catalogID,
+                    role: manifest.role.rawValue,
+                    revision: manifest.revision,
+                    profiles: manifest.profiles.map { $0.storedProfile() }
+                )
+                remoteCatalogSyncStateStore.save(
+                    RemoteCatalogSyncState(eTag: fetched.eTag, lastSuccessfulSync: Date(), revision: manifest.revision),
+                    catalogID: stateID
+                )
+                refreshProfileState()
+                remoteCatalogStatus = "\(role.rawValue.capitalized): +\(result.inserted), updated \(result.updated), removed \(result.removed)."
+                monitorStatus = "Remote catalog synchronized. Personal profiles were kept."
+            } catch {
+                remoteCatalogStatus = "Sync failed: \(error.localizedDescription)"
+                monitorStatus = remoteCatalogStatus
+            }
+        }
+    }
+
     func importWireGuardConfigProfile(name: String, rawConfig: String) async -> String? {
         do {
             if let subscriptionURL = try shadowrocketParser.subscriptionURL(from: rawConfig) {
@@ -2202,8 +2304,8 @@ final class DashboardModel: ObservableObject {
 
     private func providerBundleIdentifier(for profile: StoredVPNProfile?) -> String {
         profile?.kind == .singBoxVLESSReality
-            ? "com.codex.RealAiVPN.SingBoxPacketTunnel"
-            : "com.codex.RealAiVPN.PacketTunnel"
+            ? "com.codex.RealAiVPN.iOS.SingBoxPacketTunnel"
+            : "com.codex.RealAiVPN.iOS.PacketTunnel"
     }
 
     private var effectiveServers: [SmartVPNServer] {
@@ -2725,7 +2827,12 @@ final class DashboardModel: ObservableObject {
         guard !channelTesting.isRunning else {
             return
         }
-        guard automaticFailoverEnabled, vpnStatus.isConnectedOrConnecting else {
+        // A packet tunnel has not yet received traffic while NetworkExtension
+        // reports `.connecting`. Treating that transitional state as a failed
+        // tunnel can cancel the system start request before the provider gets
+        // a chance to invoke its completion handler.
+        guard automaticFailoverEnabled,
+              vpnStatus == .connected || vpnStatus == .reasserting else {
             return
         }
 
@@ -3264,7 +3371,7 @@ private struct MacDashboardHome: View {
 
     private var heroTextBlock: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(model.vpnStatus.isConnectedOrConnecting ? "Connected" : "Disconnected")
+            Text(connectionTitle)
                 .font(.system(size: 26, weight: .semibold))
                 .foregroundStyle(theme.primaryText)
                 .minimumScaleFactor(0.78)
@@ -3279,6 +3386,17 @@ private struct MacDashboardHome: View {
             Text("\(Int((model.routeConfidence * 100).rounded()))% confidence")
                 .font(.system(size: 16, weight: .bold))
                 .foregroundStyle(.teal)
+        }
+    }
+
+    private var connectionTitle: String {
+        switch model.vpnStatus {
+        case .connected:
+            return "Connected"
+        case .connecting, .reasserting:
+            return "Connecting…"
+        case .invalid, .disconnected, .disconnecting, .unknown:
+            return "Disconnected"
         }
     }
 
@@ -3779,6 +3897,7 @@ private struct MacRoutingWorkspace: View {
 private struct MacProfilesWorkspace: View {
     @ObservedObject var model: DashboardModel
     let theme: MacLiquidTheme
+    @State private var showingRemoteCatalog = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -3792,10 +3911,83 @@ private struct MacProfilesWorkspace: View {
                         .foregroundStyle(theme.secondaryText)
                 }
                 Spacer()
+                Button {
+                    showingRemoteCatalog = true
+                } label: {
+                    Label("Remote Catalogs", systemImage: "externaldrive.badge.icloud")
+                }
+                .buttonStyle(.bordered)
+                .tint(theme.accent)
             }
 
             ServerRankingPanel(model: model)
                 .frame(minHeight: 520)
+        }
+        .sheet(isPresented: $showingRemoteCatalog) {
+            MacRemoteCatalogSheet(model: model)
+        }
+    }
+}
+
+private struct MacRemoteCatalogSheet: View {
+    @ObservedObject var model: DashboardModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var catalogID = "primary"
+    @State private var endpointURL = ""
+    @State private var signingPublicKey = ""
+    @State private var adminToken = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Remote Catalogs")
+                    .font(.title2.bold())
+                Text("The app downloads signed catalog data directly from GitHub. GitHub credentials never enter the app.")
+                    .foregroundStyle(.secondary)
+            }
+
+            Form {
+                TextField("Catalog ID", text: $catalogID)
+                TextField("GitHub catalog URL", text: $endpointURL)
+                TextField("Ed25519 public key", text: $signingPublicKey, axis: .vertical)
+                    .lineLimit(2...4)
+                SecureField("Admin password", text: $adminToken)
+            }
+            .formStyle(.grouped)
+
+            Text("The User catalog is available by default. The Admin password is saved only to this device's Keychain. This is a simple app-level gate; signed catalogs preserve integrity. Sync changes managed profiles only; manually imported profiles stay intact.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Button("Save") {
+                    model.configureRemoteCatalog(
+                        catalogID: catalogID,
+                        endpointURL: endpointURL,
+                        signingPublicKey: signingPublicKey,
+                        adminPassword: adminToken
+                    )
+                }
+                Button("Sync User") { model.syncRemoteCatalog(role: .user) }
+                    .disabled(model.remoteCatalogIsSyncing)
+                Button("Unlock & Sync Admin") {
+                    model.syncRemoteCatalog(role: .admin, adminPassword: adminToken)
+                }
+                    .disabled(model.remoteCatalogIsSyncing)
+                Spacer()
+                Button("Done") { dismiss() }
+            }
+            Text(model.remoteCatalogStatus)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .padding(24)
+        .frame(width: 560)
+        .onAppear {
+            guard let configuration = model.remoteCatalogConfiguration else { return }
+            catalogID = configuration.catalogID
+            endpointURL = configuration.endpoint.baseURL.absoluteString
+            signingPublicKey = configuration.endpoint.signingPublicKey
         }
     }
 }

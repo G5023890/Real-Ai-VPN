@@ -8,13 +8,20 @@ index 5d15a1b..3299cf0 100644
  // The swift-tools-version declares the minimum version of Swift required to build this package.
 
  import PackageDescription
-@@ -34,7 +34,10 @@ let package = Package(
+@@ -34,7 +34,17 @@ let package = Package(
                  "Makefile"
              ],
              publicHeadersPath: ".",
 -            linkerSettings: [.linkedLibrary("wg-go")]
 +            linkerSettings: [
-+                .unsafeFlags(["-L", "Sources/WireGuardKitGo/out"]),
++                .unsafeFlags(
++                    ["-L", "Sources/WireGuardKitGo/out-macos"],
++                    .when(platforms: [.macOS])
++                ),
++                .unsafeFlags(
++                    ["-L", "Sources/WireGuardKitGo/out-ios"],
++                    .when(platforms: [.iOS])
++                ),
 +                .linkedLibrary("wg-go")
 +            ]
          )

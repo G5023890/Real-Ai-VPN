@@ -1,0 +1,15 @@
+{
+  "name": "real-ai-router-remote-catalog",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "issue-token": "node scripts/issue_catalog_token.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260801.1",
+    "wrangler": "^4.27.0"
+  }
+}

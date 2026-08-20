@@ -326,10 +326,12 @@ public final class RealVPNProfileManager: ObservableObject {
             "ipv6LeakProtectionEnabled": NSNumber(value: configuration.ipv6LeakProtectionEnabled),
             "ipv4OnlyCompatibilityEnabled": NSNumber(value: configuration.ipv4OnlyCompatibilityEnabled)
         ]
+        #if os(iOS)
         protocolConfiguration.excludeLocalNetworks = configuration.localNetworkAccessEnabled
-        if #available(iOS 17.4, macOS 14.4, *) {
+        if #available(iOS 17.4, *) {
             protocolConfiguration.excludeDeviceCommunication = configuration.localNetworkAccessEnabled
         }
+        #endif
 
         manager.localizedDescription = configuration.localizedDescription
         manager.protocolConfiguration = protocolConfiguration

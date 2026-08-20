@@ -1,9 +1,6 @@
 name: RealAiVPN
 options:
   createIntermediateGroups: true
-packages:
-  WireGuardKit:
-    path: third_party/wireguard-apple
 configs:
   Debug: debug
   Release: release
@@ -98,56 +95,6 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         IPHONEOS_DEPLOYMENT_TARGET: 17.0
-  RealAiVPNPacketTunnel:
-    type: app-extension
-    platform: macOS
-    deploymentTarget: "14.0"
-    sources:
-      - path: Sources/PacketTunnelProvider
-      - path: Resources/Routing
-        buildPhase: resources
-    dependencies:
-      - target: WireGuardConfig
-      - target: RealVPNCore
-      - package: WireGuardKit
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.PacketTunnel
-        PRODUCT_NAME: RealAiVPNPacketTunnel
-        INFOPLIST_FILE: Config/PacketTunnel-Info.plist
-        GENERATE_INFOPLIST_FILE: NO
-        CODE_SIGN_ENTITLEMENTS: Config/PacketTunnel.entitlements
-        SWIFT_VERSION: 5.0
-        CODE_SIGN_STYLE: Automatic
-        DEVELOPMENT_TEAM: 9FP39GTDT5
-        MACOSX_DEPLOYMENT_TARGET: 14.0
-        MARKETING_VERSION: 0.98
-        CURRENT_PROJECT_VERSION: 77
-  RealAiVPNPacketTunneliOS:
-    type: app-extension
-    platform: iOS
-    deploymentTarget: "17.0"
-    sources:
-      - path: Sources/PacketTunnelProvider
-      - path: Resources/Routing
-        buildPhase: resources
-    dependencies:
-      - target: WireGuardConfigiOS
-      - target: RealVPNCoreiOS
-      - package: WireGuardKit
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.iOS.PacketTunnel
-        PRODUCT_NAME: RealAiVPNPacketTunnel
-        INFOPLIST_FILE: Config/PacketTunnel-Info.plist
-        GENERATE_INFOPLIST_FILE: NO
-        CODE_SIGN_ENTITLEMENTS: Config/PacketTunnel-iOS.entitlements
-        SWIFT_VERSION: 5.0
-        CODE_SIGN_STYLE: Automatic
-        DEVELOPMENT_TEAM: 9FP39GTDT5
-        IPHONEOS_DEPLOYMENT_TARGET: 17.0
-        MARKETING_VERSION: 0.98
-        CURRENT_PROJECT_VERSION: 77
   RealAiVPNSingBoxPacketTunnel:
     type: app-extension
     platform: macOS
@@ -171,7 +118,7 @@ targets:
       - sdk: libresolv.tbd
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.SingBoxPacketTunnel
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.iOS.SingBoxPacketTunnel
         PRODUCT_NAME: RealAiVPNSingBoxPacketTunnel
         PRODUCT_MODULE_NAME: RealAiVPNSingBoxPacketTunnel
         INFOPLIST_FILE: Config/PacketTunnel-Info.plist
@@ -183,8 +130,9 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         MACOSX_DEPLOYMENT_TARGET: 14.0
-        MARKETING_VERSION: 0.98
-        CURRENT_PROJECT_VERSION: 77
+        MARKETING_VERSION: 0.98.5
+        CURRENT_PROJECT_VERSION: 87
+        ENABLE_HARDENED_RUNTIME: YES
   RealAiVPNSingBoxPacketTunneliOS:
     type: app-extension
     platform: iOS
@@ -219,8 +167,8 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         IPHONEOS_DEPLOYMENT_TARGET: 17.0
-        MARKETING_VERSION: 0.98
-        CURRENT_PROJECT_VERSION: 77
+        MARKETING_VERSION: 0.98.5
+        CURRENT_PROJECT_VERSION: 87
   RealAiVPN:
     type: application
     platform: macOS
@@ -239,11 +187,10 @@ targets:
       - target: WireGuardConfig
       - target: SmartServerSelection
       - target: RealVPNCore
-      - target: RealAiVPNPacketTunnel
       - target: RealAiVPNSingBoxPacketTunnel
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.iOS
         PRODUCT_NAME: Real Ai Router
         INFOPLIST_FILE: Config/RealAiVPN-Info.plist
         GENERATE_INFOPLIST_FILE: NO
@@ -252,8 +199,26 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 9FP39GTDT5
         MACOSX_DEPLOYMENT_TARGET: 14.0
-        MARKETING_VERSION: 0.98
-        CURRENT_PROJECT_VERSION: 77
+        MARKETING_VERSION: 0.98.5
+        CURRENT_PROJECT_VERSION: 87
+        ENABLE_HARDENED_RUNTIME: YES
+  RealAiVPNCatalogManager:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources/CatalogManagerApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codex.RealAiVPN.CatalogManager
+        PRODUCT_NAME: Real Ai Router Catalog Manager
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: 5.0
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 9FP39GTDT5
+        MACOSX_DEPLOYMENT_TARGET: 14.0
+        MARKETING_VERSION: 1.0
+        CURRENT_PROJECT_VERSION: 1
         ENABLE_HARDENED_RUNTIME: YES
   RealAiVPNiOS:
     type: application
@@ -273,7 +238,6 @@ targets:
       - target: WireGuardConfigiOS
       - target: SmartServerSelectioniOS
       - target: RealVPNCoreiOS
-      - target: RealAiVPNPacketTunneliOS
       - target: RealAiVPNSingBoxPacketTunneliOS
     settings:
       base:
@@ -287,5 +251,5 @@ targets:
         DEVELOPMENT_TEAM: 9FP39GTDT5
         IPHONEOS_DEPLOYMENT_TARGET: 17.0
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        MARKETING_VERSION: 0.98
-        CURRENT_PROJECT_VERSION: 77
+        MARKETING_VERSION: 0.98.5
+        CURRENT_PROJECT_VERSION: 87

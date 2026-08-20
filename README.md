@@ -1,12 +1,26 @@
 # Real Ai Router
 
-Current release: `0.98`.
+Current release: `0.98.5`.
 
-Current recovery point: `restore-0.98-wireguard-vless-xray-macos-profile-import`.
+Current recovery point: `restore-0.98.5-vless-remote-catalog`.
 
-Real Ai Router is a SwiftUI VPN client for iOS and macOS. It imports standard
-WireGuard profiles, VLESS Reality links/subscriptions, and Xray VLESS Reality
-JSON configurations, and runs them through Apple `NetworkExtension` packet tunnel providers.
+Real Ai Router is a SwiftUI VPN client for iOS and macOS. The current release
+imports VLESS Reality links/subscriptions and Xray VLESS Reality JSON
+configurations, then runs them through Apple `NetworkExtension` packet tunnel providers.
+
+## Remote profile catalogs
+
+The app can sync two signed remote categories: `User` and `Admin`. It downloads
+the signed envelopes directly from a public GitHub repository; no GitHub token,
+Cloudflare account, or server is required. The `User` catalog is available to
+everyone. `Admin` is hidden in the app until the locally stored Admin password
+matches the SHA-256 hash in `catalogs/admin-access.json`. This is deliberately a
+simple convenience gate, not a security boundary: a public repository is
+readable by anyone. The app verifies every manifest with an Ed25519 public key,
+uses ETag for refreshes, and atomically updates only profiles owned by that
+remote catalog. Manual VLESS and subscription imports are never
+deleted by a catalog refresh. Signing and catalog templates are in
+[RemoteCatalogServer](RemoteCatalogServer/README.md).
 
 The app uses Apple Liquid Glass style across iOS and macOS and targets the latest
 Apple beta SDKs through Xcode-beta. iOS builds are validated on a physically
@@ -14,19 +28,20 @@ connected iPhone, not in a simulator.
 
 ## Licensing
 
-Real Ai Router does not implement a proprietary VPN protocol. WireGuard support
-uses the MIT-licensed official WireGuard Apple adapter; VLESS Reality uses
-GPL-3.0-or-later sing-box Libbox. See [third-party notices](THIRD_PARTY_NOTICES.md)
+Real Ai Router does not implement a proprietary VPN protocol. The current
+release uses GPL-3.0-or-later sing-box Libbox for VLESS Reality. The WireGuard
+runtime and `libwg-go` are excluded from the shipped iOS and macOS targets;
+only the lightweight configuration parser remains available for import
+compatibility. See [third-party notices](THIRD_PARTY_NOTICES.md)
 for copyright, license, and corresponding-source information.
 
 ## Current Functionality
 
 - Platforms: native iOS and macOS apps with matched operational areas for Home,
   Profiles, Route, Settings, Stat, and About.
-- VPN engine: `NEPacketTunnelProvider` profiles for WireGuard and sing-box VLESS
-  Reality.
-- Imports: standard WireGuard `.conf` profiles, VLESS Reality URLs, direct HTTPS
-  subscriptions, base64 Shadowrocket subscription payloads, and Xray VLESS/Reality JSON.
+- VPN engine: `NEPacketTunnelProvider` profiles for sing-box VLESS Reality.
+- Imports: VLESS Reality URLs, direct HTTPS subscriptions, base64 Shadowrocket
+  subscription payloads, and Xray VLESS/Reality JSON.
 - Routing: user-managed `Bypass VPN` and `Through VPN` rules for exact domains,
   suffixes, IP addresses, and CIDR ranges.
 - Protected probe endpoints: provider and VPN health-check names/IPs cannot be
@@ -49,11 +64,9 @@ for copyright, license, and corresponding-source information.
 - Manual Disconnect disables NetworkExtension On Demand before stopping the
   tunnel, so user-initiated disconnects are not interrupted by automatic
   reconnect.
-- Profile switching: WireGuard and VLESS are serialized through one shared
-  NetworkExtension transition. The previous Real Ai Router tunnel must fully
-  disconnect before the selected profile is reloaded from system preferences
-  and started. This avoids stale-session races when switching protocols on
-  recent macOS and iOS releases.
+- Profile switching is serialized through one shared NetworkExtension
+  transition. The previous Real Ai Router tunnel must fully disconnect before
+  the selected VLESS profile is reloaded from system preferences and started.
 - Transition diagnostics: while a VPN is changing state, macOS and iOS show
   the current system-profile stage: stopping the old tunnel, loading and
   saving the selected profile, starting its provider, or a concrete failure.
@@ -71,23 +84,28 @@ for copyright, license, and corresponding-source information.
 - Diagnostics: packet tunnel stop reasons and provider errors are persisted for
   investigation after disconnects.
 
-## Recent 0.98 Changes
+## Recent 0.98.5 Changes
 
-- Replaced AmneziaWG with the official WireGuard userspace adapter on iOS and
-  macOS. Standard WireGuard `.conf` profiles are now the native WireGuard path;
-  AmneziaWG-only obfuscation fields are rejected with an explicit import error.
+- Version 0.98.5 temporarily excludes the WireGuard runtime, its extension
+  targets, and `libwg-go` from both iOS and macOS builds. VLESS Reality remains
+  the only shipped tunnel engine.
+
 - Added import of full Xray VLESS Reality JSON configurations alongside VLESS
   URLs and subscriptions. The app extracts the VLESS outbound and Reality
   parameters while retaining its own secure iOS/macOS tunnel routing and DNS policy.
 - Restored the macOS profile-add flow: the `+` menu is always available, and an
   empty profile list presents `Paste configuration` and `Choose file` actions
   instead of demonstration servers.
-- Matched the macOS and iOS profile workflow for WireGuard and VLESS Reality:
-  import, select, rename, delete, reconnect, diagnostics, failover, and security controls.
+- Matched the macOS and iOS VLESS Reality workflow: import, select, rename,
+  delete, reconnect, diagnostics, failover, and security controls.
+- Added signed GitHub User/Admin catalogs. User profiles sync automatically on
+  first launch; Admin profiles require the locally entered password. Catalog
+  updates never delete manually imported profiles.
+- Added non-destructive migration of profiles saved by releases before 0.98,
+  and automatic migration from the retired catalog signing bootstrap key.
 - Added in-app third-party license notices and a corresponding-source link for
-  the WireGuard and sing-box components used by the standard protocols.
-- Raised default app release version from `0.97` to `0.98` in XcodeGen and all
-  macOS/iOS build scripts.
+  the shipped sing-box component.
+- Raised the TestFlight release to `0.98.5 (87)` for iOS and macOS.
 
 ## Recent 0.97 Changes
 
@@ -131,10 +149,11 @@ for copyright, license, and corresponding-source information.
 
 ## Core Modules
 
-- `WireGuardConfig`: validates and normalizes standard WireGuard profiles.
+- `WireGuardConfig`: validates and normalizes standard WireGuard profiles for
+  import compatibility; the WireGuard runtime is not shipped in 0.98.5.
 - `RealVPNCore`: owns NetworkExtension profile creation, routing exception
   persistence, protected probe validation, and tunnel diagnostics.
-- `PacketTunnelProvider`: starts WireGuard or sing-box tunnels and compiles
+- `PacketTunnelProvider`: starts the sing-box VLESS Reality tunnel and compiles
   routing exceptions into tunnel configuration.
 - `SmartServerSelection`: ranks and selects profiles with deterministic and
   heuristic logic; this is the Core AI/CoreML scoring integration point.
@@ -143,9 +162,9 @@ for copyright, license, and corresponding-source information.
 
 ## Recovery Points
 
-- `restore-0.98-wireguard-vless-xray-macos-profile-import`: recovery point for
-  the WireGuard migration, Xray/VLESS Reality JSON import, and restored macOS
-  profile-add experience with iOS feature parity.
+- `restore-0.98.5-vless-remote-catalog`: recovery point for the VLESS-only
+  TestFlight build 87, automatic User catalog sync, Admin password gate,
+  profile migration, and macOS/iOS catalog and tunnel fixes.
 - `restore-0.97-macos-profile-switching`: recovery point for serialized WireGuard /
   VLESS system-profile transitions, refreshed NetworkExtension preferences,
   15-second teardown handling, and visible transition diagnostics on macOS and

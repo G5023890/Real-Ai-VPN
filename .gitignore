@@ -6,3 +6,5 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 third_party/sing-box/Libbox.xcframework/
+Sources/WireGuardKitGo/out-ios/
+Sources/WireGuardKitGo/out-macos/

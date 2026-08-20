@@ -48,9 +48,10 @@ public struct TunnelDiagnosticsStore: Sendable {
         if let sharedFileURL {
             try? data.write(to: sharedFileURL, options: [.atomic])
         }
-        #if !os(macOS)
+        // App Group storage is not always mounted for a macOS packet-tunnel
+        // extension while it is starting. Keep a local diagnostic fallback so
+        // a failed start can be diagnosed without exposing profile secrets.
         try? data.write(to: fallbackFileURL, options: [.atomic])
-        #endif
     }
 
     public func load() -> TunnelDiagnosticSnapshot? {
@@ -65,14 +66,10 @@ public struct TunnelDiagnosticsStore: Sendable {
            let snapshot = try? JSONDecoder().decode(TunnelDiagnosticSnapshot.self, from: data) {
             return snapshot
         }
-        #if os(macOS)
-        return nil
-        #else
         guard let data = try? Data(contentsOf: fallbackFileURL) else {
             return nil
         }
         return try? JSONDecoder().decode(TunnelDiagnosticSnapshot.self, from: data)
-        #endif
     }
 
     private var sharedFileURL: URL? {

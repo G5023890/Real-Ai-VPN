@@ -1,7 +1,7 @@
 # App Store Connect export-compliance questionnaire — draft
 
 Product: **Real Ai Router**  
-Version: **0.98**  
+Version: **0.98.5 (87)**
 Platform: **iOS / TestFlight**
 
 ## Proposed factual responses
@@ -9,9 +9,9 @@ Platform: **iOS / TestFlight**
 | Apple subject | Response | Basis |
 | --- | --- | --- |
 | Uses encryption | Yes | VPN tunnel functionality is present. |
-| Encryption limited to Apple's operating systems | No | The app ships WireGuard and sing-box components. |
+| Encryption limited to Apple's operating systems | No | The app ships the sing-box component. |
 | Proprietary or unpublished cryptography | No | The app uses standard, published VPN protocols; it does not implement a proprietary algorithm. |
-| Standard encryption algorithms / protocols | Yes | WireGuard and VLESS Reality configurations are supported. |
+| Standard encryption algorithms / protocols | Yes | VLESS Reality via sing-box Libbox is supported. |
 
 ## Documentation decision
 

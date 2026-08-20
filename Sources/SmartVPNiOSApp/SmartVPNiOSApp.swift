@@ -448,6 +448,8 @@ final class iOSDashboardModel: ObservableObject {
     @Published private(set) var lastProbeDate: Date?
     @Published private(set) var lastRecoveryDecisionLog = ""
     @Published private(set) var channelTesting = iOSChannelTestingState()
+    @Published private(set) var remoteCatalogStatus = "Remote catalog is not configured."
+    @Published private(set) var remoteCatalogIsSyncing = false
     @Published var automaticFailoverEnabled = UserDefaults.standard.object(forKey: "ios.automaticFailoverEnabled") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(automaticFailoverEnabled, forKey: "ios.automaticFailoverEnabled")
@@ -500,6 +502,10 @@ final class iOSDashboardModel: ObservableObject {
     private let decoder = WireGuardConfigDecoder()
     private let shadowrocketParser = ShadowrocketVLESSConfigParser()
     private let profileStore = VPNProfileStore(accessGroup: WireGuardConfigKeyStore.sharedAccessGroup)
+    private let remoteCatalogClient = RemoteCatalogClient()
+    private let remoteCatalogConfigurationStore = RemoteCatalogConfigurationStore()
+    private let remoteCatalogCredentialStore = RemoteCatalogAccessCredentialStore(accessGroup: WireGuardConfigKeyStore.sharedAccessGroup)
+    private let remoteCatalogSyncStateStore = RemoteCatalogSyncStateStore()
     private let routingExceptionStore = RoutingExceptionStore()
     private let tunnelDiagnosticsStore = TunnelDiagnosticsStore()
     private let tunnelTrafficStatsStore = TunnelTrafficStatsStore()
@@ -586,6 +592,13 @@ final class iOSDashboardModel: ObservableObject {
                 self.message = detail
             }
             .store(in: &cancellables)
+        do {
+            if case .migrated(let count) = try profileStore.migrateLegacyProfilesIfNeeded() {
+                message = "Restored \(count) profile\(count == 1 ? "" : "s") saved before version 0.98."
+            }
+        } catch {
+            message = "Could not restore saved profiles: \(error.localizedDescription)"
+        }
         reloadProfiles()
         reloadRoutingExceptions()
         loadQualityHistory()
@@ -597,6 +610,10 @@ final class iOSDashboardModel: ObservableObject {
             try? await Task.sleep(for: .milliseconds(900))
             await prepareVPNProfileIfNeeded()
             await connectOnStartIfNeeded()
+            // A clean install has only public bootstrap metadata. Fetch the
+            // User catalog automatically so it is immediately usable without
+            // opening Remote Catalogs or entering any credential.
+            syncRemoteCatalog(role: .user)
         }
     }
 
@@ -850,6 +867,98 @@ final class iOSDashboardModel: ObservableObject {
 
     func reportStatus(_ status: String) {
         message = status
+    }
+
+    var remoteCatalogConfiguration: RemoteCatalogConfiguration? {
+        remoteCatalogConfigurationStore.load()
+    }
+
+    func configureRemoteCatalog(
+        catalogID: String,
+        endpointURL: String,
+        signingPublicKey: String,
+        adminPassword: String
+    ) {
+        let trimmedCatalogID = catalogID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = signingPublicKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedCatalogID.isEmpty,
+              let url = URL(string: endpointURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+              url.scheme == "https",
+              url.host == "raw.githubusercontent.com",
+              !trimmedKey.isEmpty else {
+            remoteCatalogStatus = "Enter a catalog ID, raw.githubusercontent.com catalog URL, and Ed25519 public key."
+            return
+        }
+        do {
+            try remoteCatalogConfigurationStore.save(RemoteCatalogConfiguration(
+                catalogID: trimmedCatalogID,
+                endpoint: RemoteCatalogEndpoint(baseURL: url, signingPublicKey: trimmedKey)
+            ))
+            let admin = adminPassword.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !admin.isEmpty { try remoteCatalogCredentialStore.save(admin, catalogID: trimmedCatalogID, role: .admin) }
+            remoteCatalogStatus = "Remote catalog saved."
+            message = "Remote catalog is ready to sync."
+        } catch {
+            remoteCatalogStatus = "Could not save remote catalog: \(error.localizedDescription)"
+        }
+    }
+
+    func syncRemoteCatalog(role: RemoteCatalogRole, adminPassword: String? = nil) {
+        guard let configuration = remoteCatalogConfiguration else {
+            remoteCatalogStatus = "Configure the remote catalog first."
+            return
+        }
+        guard !remoteCatalogIsSyncing else { return }
+        if role == .admin, let adminPassword {
+            let password = adminPassword.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !password.isEmpty {
+                do {
+                    try remoteCatalogCredentialStore.save(password, catalogID: configuration.catalogID, role: .admin)
+                } catch {
+                    remoteCatalogStatus = "Could not save the Admin password: \(error.localizedDescription)"
+                    return
+                }
+            }
+        }
+        remoteCatalogIsSyncing = true
+        remoteCatalogStatus = "Syncing \(role.rawValue) catalog…"
+        Task {
+            defer { remoteCatalogIsSyncing = false }
+            do {
+                let token = try remoteCatalogCredentialStore.read(catalogID: configuration.catalogID, role: role)
+                if role == .admin, token?.isEmpty != false {
+                    throw RemoteCatalogError.adminPasswordRequired
+                }
+                let stateID = "\(configuration.catalogID).\(role.rawValue)"
+                let state = remoteCatalogSyncStateStore.load(catalogID: stateID)
+                let fetched = try await remoteCatalogClient.fetch(
+                    endpoint: configuration.endpoint, role: role, accessToken: token, eTag: state.eTag
+                )
+                if fetched.notModified {
+                    remoteCatalogStatus = "\(role.rawValue.capitalized) catalog is already current."
+                    message = remoteCatalogStatus
+                    return
+                }
+                guard let manifest = fetched.manifest else { throw RemoteCatalogError.invalidResponse }
+                guard manifest.catalogID == configuration.catalogID else { throw RemoteCatalogError.invalidResponse }
+                let result = try profileStore.synchronizeRemoteCatalog(
+                    catalogID: manifest.catalogID,
+                    role: manifest.role.rawValue,
+                    revision: manifest.revision,
+                    profiles: manifest.profiles.map { $0.storedProfile() }
+                )
+                remoteCatalogSyncStateStore.save(
+                    RemoteCatalogSyncState(eTag: fetched.eTag, lastSuccessfulSync: Date(), revision: manifest.revision),
+                    catalogID: stateID
+                )
+                reloadProfiles()
+                remoteCatalogStatus = "\(role.rawValue.capitalized): +\(result.inserted), updated \(result.updated), removed \(result.removed)."
+                message = "Remote catalog synchronized. Personal profiles were kept."
+            } catch {
+                remoteCatalogStatus = "Sync failed: \(error.localizedDescription)"
+                message = remoteCatalogStatus
+            }
+        }
     }
 
     func setStatisticsVisible(_ isVisible: Bool) {
@@ -4563,6 +4672,7 @@ private struct iOSProfilesScreen: View {
     @State private var importingJSONProfile = false
     @State private var renamingProfile: StoredVPNProfile?
     @State private var deletingProfile: StoredVPNProfile?
+    @State private var showingRemoteCatalog = false
 
     var body: some View {
         ScrollView {
@@ -4600,6 +4710,14 @@ private struct iOSProfilesScreen: View {
                     } label: {
                         Label("Import JSON", systemImage: "curlybraces.square")
                     }
+
+                    Divider()
+
+                    Button {
+                        showingRemoteCatalog = true
+                    } label: {
+                        Label("Remote catalogs", systemImage: "externaldrive.badge.icloud")
+                    }
                 } label: {
                     Image(systemName: "plus")
                         .font(.headline.weight(.bold))
@@ -4611,6 +4729,9 @@ private struct iOSProfilesScreen: View {
             iOSProfilePasteImportSheet { name, rawConfig in
                 model.importProfileFromPastedText(displayName: name, rawConfig: rawConfig)
             }
+        }
+        .sheet(isPresented: $showingRemoteCatalog) {
+            iOSRemoteCatalogSheet(model: model)
         }
         .sheet(item: $renamingProfile) { profile in
             iOSProfileRenameSheet(profile: profile) { newName in
@@ -4678,10 +4799,17 @@ private struct iOSProfilesScreen: View {
                         .foregroundStyle(AppTheme.accent)
 
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(profile.displayName)
-                            .font(.headline)
-                            .foregroundStyle(AppTheme.primaryText)
-                            .lineLimit(2)
+                        HStack(spacing: 6) {
+                            Text(profile.displayName)
+                                .font(.headline)
+                                .foregroundStyle(AppTheme.primaryText)
+                                .lineLimit(2)
+                            if profile.source == .remoteCatalog {
+                                Text(profile.remoteRole == RemoteCatalogRole.admin.rawValue ? "ADMIN" : "USER")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(.teal)
+                            }
+                        }
                         Text("\(profile.regionCode ?? "Unknown") · \(profile.endpointHost ?? "endpoint hidden")")
                             .font(.subheadline)
                             .foregroundStyle(AppTheme.secondaryText)
@@ -4754,6 +4882,78 @@ private struct iOSProfilesScreen: View {
             }
         case .failure(let error):
             model.reportStatus("Could not import config: \(error.localizedDescription)")
+        }
+    }
+}
+
+private struct iOSRemoteCatalogSheet: View {
+    @ObservedObject var model: iOSDashboardModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var catalogID = "primary"
+    @State private var endpointURL = ""
+    @State private var signingPublicKey = ""
+    @State private var adminToken = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Remote catalog") {
+                    TextField("Catalog ID", text: $catalogID)
+                        .textInputAutocapitalization(.never)
+                    TextField("GitHub catalog URL", text: $endpointURL)
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                    TextField("Ed25519 public key", text: $signingPublicKey, axis: .vertical)
+                        .textInputAutocapitalization(.never)
+                        .lineLimit(2...4)
+                }
+                Section("Administrator access") {
+                    SecureField("Admin password", text: $adminToken)
+                    Text("The User catalog is available by default. The Admin password is stored only in this device's Keychain. This is a simple app-level gate; signed catalogs preserve integrity.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Section("Synchronization") {
+                    Button {
+                        model.syncRemoteCatalog(role: .user)
+                    } label: {
+                        Label("Sync User catalog", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .disabled(model.remoteCatalogIsSyncing)
+                    Button {
+                        model.syncRemoteCatalog(role: .admin, adminPassword: adminToken)
+                    } label: {
+                        Label("Unlock & Sync Admin", systemImage: "lock.shield")
+                    }
+                    .disabled(model.remoteCatalogIsSyncing)
+                    Text(model.remoteCatalogStatus)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Remote Catalogs")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        model.configureRemoteCatalog(
+                            catalogID: catalogID,
+                            endpointURL: endpointURL,
+                            signingPublicKey: signingPublicKey,
+                            adminPassword: adminToken
+                        )
+                    }
+                }
+            }
+            .onAppear {
+                guard let configuration = model.remoteCatalogConfiguration else { return }
+                catalogID = configuration.catalogID
+                endpointURL = configuration.endpoint.baseURL.absoluteString
+                signingPublicKey = configuration.endpoint.signingPublicKey
+            }
         }
     }
 }

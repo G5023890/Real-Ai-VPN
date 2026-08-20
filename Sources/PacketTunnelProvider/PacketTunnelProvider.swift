@@ -115,7 +115,32 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 #endif
 
+    #if os(macOS)
+    override func startTunnel(
+        options: [String: NSObject]?,
+        completionHandler: @escaping (Error?) -> Void
+    ) {
+        Task { [weak self] in
+            guard let self else {
+                completionHandler(PacketTunnelProviderError.invalidConfiguration)
+                return
+            }
+
+            do {
+                try await startTunnelImplementation(options: options)
+                completionHandler(nil)
+            } catch {
+                completionHandler(error)
+            }
+        }
+    }
+    #else
     override func startTunnel(options: [String: NSObject]?) async throws {
+        try await startTunnelImplementation(options: options)
+    }
+    #endif
+
+    private func startTunnelImplementation(options: [String: NSObject]?) async throws {
         packetTunnelLogger.info("Starting Real Ai Router packet tunnel")
         saveDiagnostic(stage: "startTunnel", message: "PacketTunnelProvider entered startTunnel.")
         NSLog("RealAiVPN PacketTunnel startTunnel optionsHasConfig=%@",
@@ -424,14 +449,41 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             ipv6LeakProtectionEnabled: ipv6LeakProtectionEnabled,
             includeAppleServicesBypass: false
         )
+#if os(macOS)
+        // `route_exclude_address` is passed by libbox to
+        // NEPacketTunnelNetworkSettings.  The bundled Russia list contains
+        // thousands of CIDRs and makes macOS NetworkExtension time out while
+        // applying the settings.  Keep only the small, explicit exclusions on
+        // macOS; sing-box's domain rules still route `.ru` directly.
+        let ruRanges: [String] = []
+#else
         let ruRanges = subtract(forceHostRoutes: forceHostRoutes, from: loadBundledCIDRs(resource: "ru-aggregated", extension: "zone"))
+#endif
         overrides.systemRouteExcludeIPCIDRs = localProviderRanges + ruRanges + overrides.bypassVPNIPCIDRs
         packetTunnelLogger.info("Applying sing-box system route excludes: local=\(localProviderRanges.count, privacy: .public) ru=\(ruRanges.count, privacy: .public)")
 
         return overrides
     }
 
+    #if os(macOS)
+    override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        Task { [weak self] in
+            guard let self else {
+                completionHandler()
+                return
+            }
+
+            await stopTunnelImplementation(with: reason)
+            completionHandler()
+        }
+    }
+    #else
     override func stopTunnel(with reason: NEProviderStopReason) async {
+        await stopTunnelImplementation(with: reason)
+    }
+    #endif
+
+    private func stopTunnelImplementation(with reason: NEProviderStopReason) async {
         packetTunnelLogger.info("Stopping packet tunnel, reason: \(reason.rawValue)")
         saveDiagnostic(
             stage: "stopTunnel",

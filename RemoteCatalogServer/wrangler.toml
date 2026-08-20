@@ -1,0 +1,9 @@
+name = "real-ai-router-catalog"
+main = "src/index.ts"
+compatibility_date = "2026-08-07"
+
+[vars]
+GITHUB_REPOSITORY = "G5023890/Real-Ai-VPN-Catalog"
+GITHUB_BRANCH = "main"
+CATALOG_USER_PATH = "catalogs/user.signed.json"
+CATALOG_ADMIN_PATH = "catalogs/admin.signed.json"

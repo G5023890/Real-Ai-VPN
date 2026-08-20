@@ -1,0 +1,5 @@
+{
+  "schemaVersion": 1,
+  "catalogID": "primary",
+  "passwordSHA256": "PASTE_LOWERCASE_SHA256_OF_ADMIN_PASSWORD_HERE"
+}

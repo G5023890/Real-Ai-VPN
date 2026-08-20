@@ -55,6 +55,10 @@ let package = Package(
         .testTarget(
             name: "SmartServerSelectionTests",
             dependencies: ["SmartServerSelection"]
+        ),
+        .testTarget(
+            name: "RealVPNCoreTests",
+            dependencies: ["RealVPNCore"]
         )
     ]
 )

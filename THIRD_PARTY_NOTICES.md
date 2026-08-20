@@ -1,10 +1,11 @@
 # Third-Party Notices
 
-Real Ai Router implements no proprietary VPN protocol. It interoperates with
-standard WireGuard and VLESS Reality configurations using the following
-third-party components.
+Real Ai Router implements no proprietary VPN protocol. Version 0.98.5 ships
+the sing-box Libbox component for VLESS Reality. The WireGuard repository is
+retained as source/reference material, but its userspace runtime is excluded
+from the shipped products.
 
-## WireGuard Apple
+## WireGuard Apple (not shipped in 0.98.5)
 
 Copyright © 2018-2023 WireGuard LLC.
 

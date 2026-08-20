@@ -1,0 +1,4 @@
+node_modules/
+.wrangler/
+catalog-signing-private.key
+*.signed.json
